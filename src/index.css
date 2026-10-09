@@ -1,0 +1,30 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    background-color: #0b0d13;
+    color: #f8fafc;
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  }
+}
+
+/* Custom scrollbar for creative suite dark theme */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0e111a;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #242c3d;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #37445c;
+}

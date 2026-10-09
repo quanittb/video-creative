@@ -1,0 +1,76 @@
+# Dependencies
+node_modules/
+package-lock.json.bak
+
+# Build outputs
+dist/
+dist-ssr/
+*.local
+
+# Tauri / Rust compiler outputs & binaries
+src-tauri/target/
+target/
+*.exe
+*.pdb
+*.dll
+*.so
+*.dylib
+*.rlib
+
+# Python environments & cache
+venv/
+musetalk-venv/
+.venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+*.bak
+
+# External cloned models / runtime repos & junctions
+LivePortrait/
+musetalk/
+
+# Large model weights / checkpoints (>50MB, cannot be committed to standard git)
+runners/bundled-models/
+*.onnx
+*.safetensors
+*.pth
+*.pt
+*.bin
+*.ckpt
+*.weights
+
+# Local runtime data & caches
+data/tts_cache/
+output/
+temp/
+
+# Scratch & test media artifacts
+scratch_*
+template_*
+user_res_*
+official_d*.jpg
+asian_male_office_1080p.png
+modern_office_backdrop.jpg
+quick_test_result.mp4
+sample_script_1min.mp3
+test_pipe.mp4
+test_torso_result.mp4
+test_benchmark_torso_applied.mp4
+temp_test_kinematics.mp4
+test_vi.mp3
+
+# IDE / OS files
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+Thumbs.db

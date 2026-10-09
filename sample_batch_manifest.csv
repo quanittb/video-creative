@@ -1,0 +1,4 @@
+name,character,voice,multiplier,script,output_name
+"Bản tin Công nghệ AI #1","office","vi-VN-NamMinhNeural",0.55,"Xin chào quý vị và các bạn. Đây là bản tin công nghệ đầu tiên cập nhật về giải pháp trí tuệ nhân tạo và trợ lý ảo thời gian thực.","tap_01_tin_tuc_ai.mp4"
+"Bản tin Kinh tế Số #2","female","vi-VN-HoaiMyNeural",0.50,"Thị trường công nghệ số ghi nhận bước tăng trưởng ấn tượng với sự hỗ trợ của các hệ thống tự động hóa sản xuất nội dung video.","tap_02_kinh_te_so.mp4"
+"Hướng dẫn e-Learning #3","pixar","vi-VN-NamMinhNeural",0.60,"Bài học hôm nay sẽ hướng dẫn bạn các bước tích hợp pipeline xử lý video độ nét cao 1080p hoàn toàn tự động.","tap_03_huong_dan_elearning.mp4"

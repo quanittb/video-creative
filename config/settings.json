@@ -1,0 +1,64 @@
+{
+  "project_name": "video-creative-studio",
+  "version": "1.0.0",
+  "default_target_language": "es",
+  "video_presets": {
+    "resolution": {
+      "width": 1080,
+      "height": 1920
+    },
+    "fps": 30,
+    "pacing_seconds_min": 3.0,
+    "pacing_seconds_max": 6.0
+  },
+  "tts_voices": {
+    "es": {
+      "provider": "edge-tts",
+      "voice_male": "es-ES-AlvaroNeural",
+      "voice_female": "es-ES-ElviraNeural",
+      "voice_latam_male": "es-MX-JorgeNeural",
+      "voice_latam_female": "es-MX-DaliaNeural"
+    },
+    "en": {
+      "provider": "edge-tts",
+      "voice_male": "en-US-GuyNeural",
+      "voice_female": "en-US-JennyNeural"
+    },
+    "vi": {
+      "provider": "vieneu",
+      "voice_male": "vi-VN-NamMinhNeural",
+      "voice_female": "vi-VN-HoaiMyNeural"
+    },
+    "fr": {
+      "provider": "edge-tts",
+      "voice_male": "fr-FR-HenriNeural",
+      "voice_female": "fr-FR-DeniseNeural"
+    },
+    "de": {
+      "provider": "edge-tts",
+      "voice_male": "de-DE-ConradNeural",
+      "voice_female": "de-DE-KatjaNeural"
+    }
+  },
+  "lipsync_engine": {
+    "model": "liveportrait",
+    "fallback_model": "musetalk",
+    "face_enhancement": true,
+    "enhancer_model": "gfpgan_1.4",
+    "vad_silence_clamping": true,
+    "offset_ms": 0
+  },
+  "render_quality": {
+    "crf": 18,
+    "preset": "slow",
+    "audio_bitrate": "320k",
+    "pixel_format": "yuv420p"
+  },
+  "compositing": {
+    "bg_blur_radius": 15,
+    "color_matching": true,
+    "drop_shadow": true,
+    "bgm_volume": 0.12,
+    "bgm_duck_volume": 0.04
+  }
+}

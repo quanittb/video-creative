@@ -1,0 +1,4 @@
+task_0:
+  video_path: "D:/rustProject/video-creative-studio/temp/test_char_male.png"
+  audio_path: "D:/rustProject/video-creative-studio/temp/musetalk_audio.wav"
+  bbox_shift: 0
