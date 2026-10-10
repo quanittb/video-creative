@@ -134,6 +134,21 @@ def is_closed_donor(descriptor: Mapping[str, Any]) -> bool:
     return float(descriptor.get("inner_mouth_fraction", 1.0)) <= MAX_INNER_MOUTH_FRACTION
 
 
+def _exact_mapped_donor(
+    output_request: Mapping[str, Any],
+    donor_cache: Mapping[int, Tuple[np.ndarray, Dict[str, Any], Dict[str, Any]]],
+) -> Optional[Tuple[int, np.ndarray, Dict[str, Any], Dict[str, Any]]]:
+    """Return only the requested exact source-index donor; never search nearby frames."""
+    source_index = int(output_request.get("exact_source_frame_index", -1))
+    donor_index = int(output_request.get("donor_frame_index", -1))
+    if source_index < 0 or donor_index != source_index:
+        return None
+    donor = donor_cache.get(donor_index)
+    if donor is None:
+        return None
+    return donor_index, *donor
+
+
 def _face_mouth_geometry_deltas(
     target: Mapping[str, Any], donor: Mapping[str, Any], width: int, height: int,
 ) -> Dict[str, List[float] | float]:
@@ -358,22 +373,38 @@ def run_extraction(
     fps = int(request["fps"])
     width, height = int(request["width"]), int(request["height"])
     output_frame_count = int(request["output_frame_count"])
-    source_candidates = [int(index) for index in request["quiet_source_frame_indices"]]
+    donor_mode = str(request.get("donor_mode", "quiet-source"))
+    if donor_mode not in ("quiet-source", "silence-conditioned-exact-source"):
+        raise ValueError("Unsupported mouth donor mode: {}".format(donor_mode))
     requests = {int(item["output_frame_index"]): item for item in request["output_pause_frames"]}
+    if donor_mode == "quiet-source":
+        source_candidates = [int(index) for index in request.get("quiet_source_frame_indices", [])]
+    else:
+        source_candidates = sorted({int(item.get("donor_frame_index", -1)) for item in requests.values()})
     if fps < 1 or width < 1 or height < 1 or output_frame_count < 1:
         raise ValueError("Invalid frame geometry in mouth-mask request.")
     if not requests:
         raise ValueError("No output pause frames were supplied for mouth correction.")
     if not source_candidates:
-        raise ValueError("No verified quiet-source donor frames were supplied.")
+        raise ValueError("No eligible donor frames were supplied.")
     if any(index < 0 or index >= output_frame_count for index in requests):
         raise ValueError("Pause-frame index is outside the requested output timeline.")
+    donor_frame_count = int(request.get("donor_video_frame_count", output_frame_count))
+    if donor_frame_count < 1 or any(index < 0 or index >= donor_frame_count for index in source_candidates):
+        raise ValueError("Donor-frame index is outside the supplied donor video.")
+    if donor_mode == "silence-conditioned-exact-source":
+        for item in requests.values():
+            source_index = int(item.get("exact_source_frame_index", -1))
+            donor_index = int(item.get("donor_frame_index", -1))
+            if source_index < 0 or source_index != donor_index:
+                raise ValueError("Silence-conditioned mode requires donor_frame_index to equal the exact ping-pong source frame.")
 
     rendered_capture = cv2.VideoCapture(str(rendered_video))
     reference_capture = cv2.VideoCapture(str(reference_video))
     if not rendered_capture.isOpened() or not reference_capture.isOpened():
-        raise RuntimeError("Could not open rendered or quiet-source video for mask extraction.")
+        raise RuntimeError("Could not open rendered video or the selected mouth-donor video for mask extraction.")
     donor_cache: Dict[int, Tuple[np.ndarray, Dict[str, Any], Dict[str, Any]]] = {}
+    donor_validation: Dict[int, Dict[str, Any]] = {}
     reasons: Counter[str] = Counter()
     selected_donors: Counter[int] = Counter()
     mask_areas: List[int] = []
@@ -386,6 +417,9 @@ def run_extraction(
             "frame_interval_seconds": [round(output_index / float(fps), 6),
                                        round((output_index + 1) / float(fps), 6)],
             "exact_source_frame_index": int(item.get("exact_source_frame_index", -1)),
+            "source_frame_index": int(item.get("exact_source_frame_index", -1)),
+            "donor_frame_index_requested": int(item.get("donor_frame_index", -1)) if donor_mode != "quiet-source" else None,
+            "donor_frame_index": None,
             "patch_prepared": False,
             "status": "skipped",
             "skip_reason": "not_processed",
@@ -419,14 +453,35 @@ def run_extraction(
                 descriptor, reason = describe_face_and_mouth(labels)
             except Exception as error:
                 reasons["donor_parser_error:" + type(error).__name__] += 1
+                donor_validation[donor_index] = {
+                    "status": "skipped", "reason": "donor_parser_error:" + type(error).__name__,
+                    "closed_mouth_metric": None,
+                }
                 continue
             if descriptor is None:
                 reasons["donor_" + reason] += 1
+                donor_validation[donor_index] = {
+                    "status": "skipped", "reason": "donor_" + reason,
+                    "closed_mouth_metric": None,
+                }
                 continue
+            closed_metric = {
+                "name": "inner_mouth_fraction",
+                "value": round(float(descriptor.get("inner_mouth_fraction", 1.0)), 6),
+                "maximum_closed_threshold": MAX_INNER_MOUTH_FRACTION,
+                "passed": is_closed_donor(descriptor),
+            }
             if not is_closed_donor(descriptor):
-                reasons["quiet_donor_mouth_not_closed"] += 1
+                reasons["donor_mouth_not_confidently_closed"] += 1
+                donor_validation[donor_index] = {
+                    "status": "skipped", "reason": "donor_mouth_not_confidently_closed",
+                    "closed_mouth_metric": closed_metric,
+                }
                 continue
             donor_cache[donor_index] = (donor_frame, descriptor, labels)
+            donor_validation[donor_index] = {
+                "status": "available", "reason": None, "closed_mouth_metric": closed_metric,
+            }
 
         for output_index in range(output_frame_count):
             mask = zero_mask
@@ -450,7 +505,22 @@ def run_extraction(
                         diagnostic["mask_pixel_count"] = int(np.count_nonzero(target_mask))
                         best: Optional[Tuple[float, float, int, np.ndarray, Dict[str, Any], np.ndarray]] = None
                         alignment_rejections: Counter[str] = Counter()
-                        for donor_index, (donor_frame, donor_descriptor, donor_labels) in donor_cache.items():
+                        if donor_mode == "silence-conditioned-exact-source":
+                            exact_donor_index = int(requests[output_index]["donor_frame_index"])
+                            diagnostic["donor_frame_index_requested"] = exact_donor_index
+                            validation = donor_validation.get(exact_donor_index, {})
+                            diagnostic["donor_closed_mouth_metric"] = validation.get("closed_mouth_metric")
+                            exact_donor = _exact_mapped_donor(requests[output_index], donor_cache)
+                            candidates = [exact_donor] if exact_donor is not None else []
+                            if not candidates:
+                                reasons["exact_mapped_neutral_donor_not_confidently_closed"] += 1
+                                diagnostic["skip_reason"] = validation.get("reason") or "exact_mapped_neutral_donor_unavailable"
+                        else:
+                            candidates = [
+                                (donor_index, donor_frame, donor_descriptor, donor_labels)
+                                for donor_index, (donor_frame, donor_descriptor, donor_labels) in donor_cache.items()
+                            ]
+                        for donor_index, donor_frame, donor_descriptor, donor_labels in candidates:
                             allowed, score, rejection_reason = compare_face_geometry(
                                 target_descriptor, donor_descriptor, width, height,
                             )
@@ -466,14 +536,16 @@ def run_extraction(
                                 best = candidate
                         if best is None:
                             reasons["no_quiet_donor_with_confident_face_alignment"] += 1
-                            diagnostic["skip_reason"] = (
-                                "no_validated_closed_donor_frame_available" if not donor_cache
-                                else "no_donor_passed_face_geometry_gates"
-                            )
+                            if diagnostic["skip_reason"] in (None, "not_processed"):
+                                diagnostic["skip_reason"] = (
+                                    "no_validated_closed_donor_frame_available" if not donor_cache
+                                    else "no_donor_passed_face_geometry_gates"
+                                )
                             diagnostic["donor_alignment_rejection_reasons"] = dict(sorted(alignment_rejections.items()))
                         else:
                             geometry_score, _, donor_index, donor_frame, donor_descriptor, donor_labels = best
                             diagnostic["selected_donor_frame_index"] = donor_index
+                            diagnostic["donor_frame_index"] = donor_index
                             diagnostic["selected_donor_geometry_score"] = round(geometry_score, 6)
                             diagnostic["selected_donor_geometry"] = _geometry_report(donor_descriptor)
                             diagnostic["selected_donor_geometry_deltas"] = {
@@ -557,11 +629,20 @@ def run_extraction(
                    "partially_applied" if coverage_status == "partial" else
                    "no_confident_mouth_donor_alignment"),
         "coverage_status": coverage_status,
+        "donor_mode": donor_mode,
         "parser": "MuseTalk FaceParsing.net raw argmax; labels 11, 12, 13; no extra model",
         "mask_region": "semantic lip classes, 3x3 dilation, 5x5 Gaussian feather sigma=0.9 at native resolution",
         "mask_alignment": "face-box scale with mouth-center anchored translation; conservative face/mouth proxy gates reject visibly displaced candidates",
-        "donor_validation": "source frame lies fully within verified quiet-source interval and inner-mouth label 11 is <= {:.2f} of parsed lip mask".format(MAX_INNER_MOUTH_FRACTION),
-        "donor_selection_policy": "Require a quiet donor with inner_mouth_fraction <= {:.2f}; rank eligible donors by lowest face/mouth geometry score, then lowest inner_mouth_fraction.".format(MAX_INNER_MOUTH_FRACTION),
+        "donor_validation": (
+            "only the exact ping-pong-mapped frame from the silence-conditioned MuseTalk pass is eligible; inner-mouth label 11 must be <= {:.2f} of parsed lip mask; no fallback donor is permitted".format(MAX_INNER_MOUTH_FRACTION)
+            if donor_mode == "silence-conditioned-exact-source" else
+            "source frame lies fully within verified quiet-source interval and inner-mouth label 11 is <= {:.2f} of parsed lip mask".format(MAX_INNER_MOUTH_FRACTION)
+        ),
+        "donor_selection_policy": (
+            "Use only the exact mapped donor frame if inner_mouth_fraction <= {:.2f} and face/mouth geometry gates pass; never fall back to another frame.".format(MAX_INNER_MOUTH_FRACTION)
+            if donor_mode == "silence-conditioned-exact-source" else
+            "Require a quiet donor with inner_mouth_fraction <= {:.2f}; rank eligible donors by lowest face/mouth geometry score, then lowest inner_mouth_fraction.".format(MAX_INNER_MOUTH_FRACTION)
+        ),
         "face_mouth_alignment_gate": {
             "maximum_normalized_face_center_delta": 0.025,
             "maximum_face_scale_delta": 0.07,
@@ -579,7 +660,8 @@ def run_extraction(
         "corrected_pause_frame_fraction": round(corrected_frames / float(len(requests)), 6),
         "uncovered_output_pause_frame_count": len(requests) - corrected_frames,
         "selected_donor_by_output_frame": selected_donor_by_output_frame,
-        "quiet_source_candidate_frames": len(source_candidates),
+        "quiet_source_candidate_frames": len(source_candidates) if donor_mode == "quiet-source" else 0,
+        "exact_neutral_donor_candidate_frames": len(source_candidates) if donor_mode != "quiet-source" else 0,
         "valid_closed_donor_frames": donor_count,
         "selected_donor_frame_count": sum(selected_donors.values()),
         "selected_donor_frame_counts": {str(index): count for index, count in sorted(selected_donors.items())},
@@ -589,7 +671,11 @@ def run_extraction(
         "skipped_frame_reasons": dict(sorted(reasons.items())),
         "inference_wall_seconds": round(time.perf_counter() - started, 3),
         "experimental_pose_proxy": True,
-        "speech_and_nonmask_pixels_policy": "leave MuseTalk content unchanged; only nonzero semantic lip alpha may use a verified quiet-source donor",
+        "speech_and_nonmask_pixels_policy": (
+            "leave MuseTalk content unchanged; only nonzero semantic lip alpha may use the exact mapped silence-conditioned donor frame"
+            if donor_mode == "silence-conditioned-exact-source" else
+            "leave MuseTalk content unchanged; only nonzero semantic lip alpha may use a verified quiet-source donor"
+        ),
         "unshifted_output_audio_policy": "map MuseTalk input audio stream 0:a:0 with stream copy; do not gate or replace output audio",
     }
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

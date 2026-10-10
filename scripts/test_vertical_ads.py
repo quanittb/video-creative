@@ -595,6 +595,26 @@ def count_video_frames(path: Path, ffprobe: str) -> int:
     return frame_count
 
 
+def audio_packet_hashes(path: Path, ffprobe: str) -> List[str]:
+    """Return packet payload hashes so stream-copy preservation includes AAC tail packets."""
+    result = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "a:0", "-show_packets",
+         "-show_data_hash", "sha256", "-show_entries", "packet=data_hash", "-of", "json", str(path)],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace", check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("Could not hash audio packets for {}: {}".format(path, result.stderr.strip()))
+    try:
+        packets = json.loads(result.stdout).get("packets", [])
+        hashes = [str(packet["data_hash"]) for packet in packets]
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError("ffprobe did not return audio packet hashes for {}.".format(path)) from error
+    if not hashes:
+        raise ValueError("Audio stream has no packets: {}".format(path))
+    return hashes
+
+
 def _pause_alpha_expression(intervals: Sequence[Mapping[str, float]], transition_seconds: float, fps: int) -> str:
     if not intervals:
         return "0"
@@ -685,12 +705,20 @@ def apply_pause_mouth_closure(
     requested_policy: str = "auto",
     reference_source: str = "existing_motion_base_video",
     correction_region: str = "full-frame",
+    mouth_donor_mode: str = "quiet-source",
+    silence_conditioned_donor_video: Optional[Path] = None,
     musetalk_dir: Optional[str | Path] = None,
     musetalk_python: Optional[str | Path] = None,
     helper_log_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     if correction_region not in ("full-frame", "mouth-only"):
         raise ValueError("Pause correction region must be full-frame or mouth-only.")
+    if mouth_donor_mode not in ("quiet-source", "silence-conditioned"):
+        raise ValueError("Mouth donor mode must be quiet-source or silence-conditioned.")
+    if correction_region != "mouth-only" and mouth_donor_mode != "quiet-source":
+        raise ValueError("Silence-conditioned donor mode is available only with mouth-only correction.")
+    if mouth_donor_mode == "silence-conditioned" and silence_conditioned_donor_video is None:
+        raise ValueError("Silence-conditioned donor mode requires its MuseTalk donor video.")
     intervals = detect_silence_intervals(normalized_audio, min_duration_seconds=min_pause_seconds)
     reference_path = reference_audio or normalized_audio
     source_pause_intervals = detect_silence_intervals(reference_path, min_duration_seconds=1.0 / fps)
@@ -723,7 +751,7 @@ def apply_pause_mouth_closure(
         status = "no_qualifying_pauses"
     elif correction_region == "full-frame" and not aligned_intervals:
         status = "no_source_aligned_silent_frames"
-    elif correction_region == "mouth-only" and not source_donor_frames:
+    elif correction_region == "mouth-only" and mouth_donor_mode == "quiet-source" and not source_donor_frames:
         status = "no_verified_quiet_source_donor_frames"
     else:
         status = "applied"
@@ -764,6 +792,8 @@ def apply_pause_mouth_closure(
         "pingpong_mapping": (
             "MuseTalk frame_list + reversed frame_list modulo mapping; only exact output/source timestamp matches are eligible"
             if correction_region == "full-frame" else
+            "exact ping-pong source frame index is used to select the same frame from a silence-conditioned MuseTalk pass; no unrelated donor fallback is permitted"
+            if mouth_donor_mode == "silence-conditioned" else
             "MuseTalk frame_list + reversed frame_list records the exact source timestamp; among fully verified quiet-source donors passing unchanged face-geometry gates, select the smallest inner-mouth fraction, then the lowest geometry score"
         ),
         "requested_intervals": intervals,
@@ -787,6 +817,8 @@ def apply_pause_mouth_closure(
         "mapping_policy": (
             "Restore only the exact Echo frame already selected by MuseTalk's ordinary ping-pong sequence when both source and output frames are verified silent."
             if correction_region == "full-frame" else
+            "for each pause frame, use only its exact ping-pong-mapped frame from the same-motion-base silence-conditioned MuseTalk pass; parser/closure/alignment failure leaves that frame unchanged"
+            if mouth_donor_mode == "silence-conditioned" else
             "For each fully-silent output frame, choose only among verified quiet-source frames for the same character; use a conservative normalized face-box/mouth-geometry proxy to align a donor, else leave the frame unchanged."
         ),
         "speech_and_nonmask_policy": (
@@ -799,8 +831,10 @@ def apply_pause_mouth_closure(
             "cycle_frame_count": 2 * frame_count,
             "policy": (
                 "frame_list + frame_list[::-1], modulo 2N, including duplicated turn endpoints"
-                if correction_region == "full-frame" else
-                "donor bank contains only verified quiet-source frames; within existing face-geometry gates, lowest inner-mouth fraction wins, with geometry score as tie-breaker"
+            if correction_region == "full-frame" else
+            "frame_list + frame_list[::-1], modulo 2N, including duplicated turn endpoints; donor index equals mapped source index in a separately silence-conditioned N-frame MuseTalk pass"
+            if mouth_donor_mode == "silence-conditioned" else
+            "donor bank contains only verified quiet-source frames; within existing face-geometry gates, lowest inner-mouth fraction wins, with geometry score as tie-breaker"
             ),
         } if provenance_verified else {
             "status": "unavailable", "reason": "Echo manifest/source audio identity was not verified",
@@ -822,8 +856,9 @@ def apply_pause_mouth_closure(
     reference_video = stream_by_type(reference_info, "video")
     if reference_video is None:
         raise ValueError("Motion-base pause reference has no video stream.")
+    reference_dimensions = (int(reference_video.get("width", 0)), int(reference_video.get("height", 0)))
     reference_fps = echo.parse_fraction(str(reference_video.get("avg_frame_rate") or reference_video.get("r_frame_rate") or "0/1"))
-    if (int(reference_video.get("width", 0)), int(reference_video.get("height", 0))) != (
+    if reference_dimensions != (
             int(source_video.get("width", 0)), int(source_video.get("height", 0))):
         raise ValueError("Pause reference and MuseTalk output dimensions differ; refusing an unsynchronized blend.")
     if abs(reference_fps - fps) > 0.01:
@@ -840,15 +875,40 @@ def apply_pause_mouth_closure(
         if correction_region == "mouth-only":
             output_frame_count = int(rendered_frame_count or 0)
             pause_frame_set = set(output_pause_frames)
+            if mouth_donor_mode == "silence-conditioned":
+                donor_video = Path(silence_conditioned_donor_video).resolve()
+                donor_info = probe_media(donor_video, ffprobe)
+                donor_stream = stream_by_type(donor_info, "video")
+                donor_dimensions = ((int(donor_stream.get("width", 0)), int(donor_stream.get("height", 0)))
+                                    if donor_stream else (0, 0))
+                donor_fps = (echo.parse_fraction(str(donor_stream.get("avg_frame_rate") or "0/1"))
+                             if donor_stream else 0.0)
+                donor_frame_count = count_video_frames(donor_video, ffprobe)
+                if (donor_dimensions != reference_dimensions or abs(donor_fps - fps) > 0.01
+                        or donor_frame_count != frame_count):
+                    raise ValueError(
+                        "Silence-conditioned donor must match motion-base dimensions/FPS and contain exactly {} frames; got {}x{}, {:.3f} FPS, {} frames.".format(
+                            frame_count, donor_dimensions[0], donor_dimensions[1], donor_fps, donor_frame_count,
+                        )
+                    )
+                helper_donor_mode = "silence-conditioned-exact-source"
+            else:
+                donor_video = reference_motion_video
+                donor_frame_count = frame_count
+                helper_donor_mode = "quiet-source"
             request = {
                 "fps": fps,
                 "width": int(source_video.get("width", 0)),
                 "height": int(source_video.get("height", 0)),
                 "output_frame_count": output_frame_count,
-                "quiet_source_frame_indices": source_donor_frames,
+                "donor_mode": helper_donor_mode,
+                "donor_video_frame_count": donor_frame_count,
+                "quiet_source_frame_indices": source_donor_frames if helper_donor_mode == "quiet-source" else [],
                 "output_pause_frames": [
                     {"output_frame_index": index,
-                     "exact_source_frame_index": pingpong_frame_index(index, frame_count)}
+                     "exact_source_frame_index": pingpong_frame_index(index, frame_count),
+                     **({"donor_frame_index": pingpong_frame_index(index, frame_count)}
+                        if helper_donor_mode == "silence-conditioned-exact-source" else {})}
                     for index in sorted(pause_frame_set)
                 ],
             }
@@ -864,7 +924,7 @@ def apply_pause_mouth_closure(
             helper_command = [
                 str(paths.python), str(helper_path),
                 "--rendered-video", str(rendered_video.resolve()),
-                "--reference-video", str(reference_motion_video.resolve()),
+                "--reference-video", str(donor_video),
                 "--mask-directory", str(mask_directory),
                 "--donor-directory", str(donor_directory),
                 "--report", str(helper_report_path),
@@ -913,7 +973,9 @@ def apply_pause_mouth_closure(
             record["selected_donor_by_output_frame"] = mouth_report.get("selected_donor_by_output_frame", {})
             record["valid_closed_donor_frames"] = mouth_report.get("valid_closed_donor_frames", 0)
             record["selected_donor_frame_counts"] = mouth_report.get("selected_donor_frame_counts", {})
-            record["audio_unchanged"] = True
+            record["mouth_donor_mode"] = mouth_donor_mode
+            record["silence_conditioned_donor_video"] = str(donor_video) if mouth_donor_mode == "silence-conditioned" else None
+            record["audio_unchanged"] = None
             record["head_body_motion_policy"] = "donor pixels are confined to the per-frame semantic lip alpha; the MuseTalk head/body frame remains the base"
             if not corrected_frame_indices:
                 record["status"] = "no_confident_mouth_donor_alignment"
@@ -933,7 +995,7 @@ def apply_pause_mouth_closure(
                 "-framerate", str(fps), "-start_number", "0", "-i", str(donor_directory / frame_pattern),
                 "-framerate", str(fps), "-start_number", "0", "-i", str(mask_directory / frame_pattern),
                 "-filter_complex", graph, "-map", "[closed]", "-map", "0:a:0", "-map_metadata", "0",
-                "-t", "{:.6f}".format(duration_seconds), "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
                 "-pix_fmt", "yuv420p", "-fps_mode", "passthrough", "-video_track_timescale", "25000",
                 "-c:a", "copy", "-movflags", "+faststart", str(temporary),
             ]
@@ -981,6 +1043,19 @@ def apply_pause_mouth_closure(
             raise ValueError("Pause correction changed the MuseTalk audio codec despite stream-copy mode.")
         if abs(corrected_audio_duration - source_audio_duration) > 0.01:
             raise ValueError("Pause correction changed the MuseTalk audio duration unexpectedly.")
+        if correction_region == "mouth-only":
+            source_packet_hashes = audio_packet_hashes(rendered_video, ffprobe)
+            corrected_packet_hashes = audio_packet_hashes(temporary, ffprobe)
+            if corrected_packet_hashes != source_packet_hashes:
+                raise ValueError(
+                    "Mouth-only correction did not preserve every AAC/audio packet: source={} output={}.".format(
+                        len(source_packet_hashes), len(corrected_packet_hashes),
+                    )
+                )
+            record["source_audio_packet_count"] = len(source_packet_hashes)
+            record["corrected_audio_packet_count"] = len(corrected_packet_hashes)
+            record["audio_packet_payload_hashes_match"] = True
+            record["audio_unchanged"] = True
         os.replace(str(temporary), str(destination))
     except Exception:
         temporary.unlink(missing_ok=True)
@@ -1117,6 +1192,8 @@ def build_export_command(
     ffmpeg: str,
     source_frame_count: int,
 ) -> Tuple[List[str], str]:
+    if source_frame_count < 1:
+        raise ValueError("HD export requires a positive decoded source-frame count.")
     width = int(source_video.get("width", 0))
     height = int(source_video.get("height", 0))
     filter_option, filter_value, framing_mode = build_vertical_video_filter(width, height)
@@ -1132,7 +1209,7 @@ def build_export_command(
         command.extend(("-map", "0:v:0"))
     command.extend((
         "-map", "0:a:0", "-map_metadata", "0", "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-        "-pix_fmt", "yuv420p", "-fps_mode", "passthrough", "-frames:v", str(source_frame_count),
+        "-pix_fmt", "yuv420p", "-fps_mode", "passthrough",
         "-video_track_timescale", "25000",
     ))
     command.extend(audio_args)
@@ -1235,6 +1312,20 @@ def export_hd_video(
     }
     if not all(checks.values()):
         raise ValueError("ffprobe HD validation failed: {}".format(checks))
+    if audio_codec == "aac":
+        source_audio_hashes = audio_packet_hashes(source, ffprobe)
+        output_audio_hashes = audio_packet_hashes(temporary, ffprobe)
+        if output_audio_hashes != source_audio_hashes:
+            raise ValueError(
+                "HD export did not preserve all AAC packets: source={} output={}.".format(
+                    len(source_audio_hashes), len(output_audio_hashes),
+                )
+            )
+        checks["aac_packet_payload_hashes_match_source"] = True
+        record_audio_packets = len(output_audio_hashes)
+    else:
+        checks["aac_packet_payload_hashes_match_source"] = None
+        record_audio_packets = None
     os.replace(str(temporary), str(destination))
     record = {
         "path": str(destination.resolve()),
@@ -1252,6 +1343,8 @@ def export_hd_video(
         "output_decoded_frame_count": output_frame_count,
         "video_duration_seconds": round(video_seconds, 6),
         "audio_duration_seconds": round(audio_seconds, 6),
+        "audio_packet_count": record_audio_packets,
+        "audio_packet_payload_hashes_match_source": checks["aac_packet_payload_hashes_match_source"],
         "export_framing_mode": framing_mode,
         "quality": {"video": "libx264", "preset": "fast", "crf": 18, "audio": "AAC copy if source AAC; otherwise AAC 160 kbps"},
         "ffprobe_checks": checks,
