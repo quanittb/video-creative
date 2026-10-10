@@ -9,6 +9,7 @@ import datetime as _datetime
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -249,6 +250,55 @@ def align_pause_intervals_to_frames(
                             "duration_seconds": round(end - start, 6)})
             run_start = None
     return aligned
+
+
+def pause_frame_indices(
+    intervals: Sequence[Mapping[str, float]], duration_seconds: float, fps: int = FPS,
+) -> List[int]:
+    """Return only whole output frames enclosed by detected pause intervals."""
+    frame_count = int(math.ceil(duration_seconds * fps - 1e-9))
+    return [
+        frame_index for frame_index in range(frame_count)
+        if any(
+            float(interval["start_seconds"]) <= frame_index / float(fps) + 1e-9
+            and float(interval["end_seconds"]) >= min((frame_index + 1) / float(fps), duration_seconds) - 1e-9
+            for interval in intervals
+        )
+    ]
+
+
+def quiet_source_frame_indices(
+    intervals: Sequence[Mapping[str, float]], source_frame_count: int, fps: int = FPS,
+) -> List[int]:
+    """Return source frames fully enclosed by verified quiet intervals."""
+    return [
+        frame_index for frame_index in range(source_frame_count)
+        if any(
+            float(interval["start_seconds"]) <= frame_index / float(fps) + 1e-9
+            and float(interval["end_seconds"]) >= (frame_index + 1) / float(fps) - 1e-9
+            for interval in intervals
+        )
+    ]
+
+
+def frame_indices_to_intervals(
+    frame_indices: Sequence[int], duration_seconds: float, fps: int = FPS,
+) -> List[Dict[str, float]]:
+    """Coalesce corrected output frames into reportable pause coverage runs."""
+    indices = sorted(set(int(index) for index in frame_indices))
+    if not indices:
+        return []
+    intervals: List[Dict[str, float]] = []
+    run_start = previous = indices[0]
+    for index in indices[1:] + [indices[-1] + 2]:
+        if index != previous + 1:
+            start = run_start / float(fps)
+            end = min((previous + 1) / float(fps), duration_seconds)
+            intervals.append({"start_seconds": round(start, 6), "end_seconds": round(end, 6),
+                              "duration_seconds": round(max(0.0, end - start), 6)})
+            run_start = index
+        previous = index
+    return [item for item in intervals if item["duration_seconds"] > 0]
 
 
 def subtract_pause_intervals(
@@ -518,6 +568,19 @@ def build_pause_closure_filter(
              duration=duration_seconds, alpha=alpha)
 
 
+def build_mouth_only_pause_closure_filter(duration_seconds: float, fps: int = FPS) -> str:
+    """Use an output-timed donor/mask sequence so only parsed lips are replaced."""
+    if fps < 1 or not math.isfinite(duration_seconds) or duration_seconds <= 0:
+        raise ValueError("Mouth-only pause correction requires valid FPS and duration.")
+    frame_count = int(math.ceil(duration_seconds * fps - 1e-9))
+    return (
+        "[0:v]fps={fps},trim=end_frame={frames},setpts=N/({fps}*TB),format=rgb24[musetalk];"
+        "[1:v]fps={fps},trim=end_frame={frames},setpts=N/({fps}*TB),format=rgb24[closed_donor];"
+        "[2:v]fps={fps},trim=end_frame={frames},setpts=N/({fps}*TB),format=gray,format=rgb24[lip_alpha];"
+        "[musetalk][closed_donor][lip_alpha]maskedmerge=planes=7,setpts=PTS-STARTPTS[closed]"
+    ).format(fps=fps, frames=frame_count)
+
+
 def apply_pause_mouth_closure(
     rendered_video: Path,
     reference_motion_video: Path,
@@ -532,7 +595,13 @@ def apply_pause_mouth_closure(
     reference_audio_provenance: Optional[Mapping[str, Any]] = None,
     requested_policy: str = "auto",
     reference_source: str = "existing_motion_base_video",
+    correction_region: str = "full-frame",
+    musetalk_dir: Optional[str | Path] = None,
+    musetalk_python: Optional[str | Path] = None,
+    helper_log_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
+    if correction_region not in ("full-frame", "mouth-only"):
+        raise ValueError("Pause correction region must be full-frame or mouth-only.")
     intervals = detect_silence_intervals(normalized_audio, min_duration_seconds=min_pause_seconds)
     reference_path = reference_audio or normalized_audio
     source_pause_intervals = detect_silence_intervals(reference_path, min_duration_seconds=1.0 / fps)
@@ -540,6 +609,8 @@ def apply_pause_mouth_closure(
     aligned_intervals = source_aligned_pause_intervals(
         intervals, source_pause_intervals, duration_seconds, frame_count, fps,
     )
+    output_pause_frames = pause_frame_indices(intervals, duration_seconds, fps)
+    source_donor_frames = quiet_source_frame_indices(source_pause_intervals, frame_count, fps)
     manifest_hash = str((reference_audio_provenance or {}).get("manifest_audio_sha256") or "")
     source_hash = str((reference_audio_provenance or {}).get("source_sha256") or "")
     current_hash = str((reference_audio_provenance or {}).get("current_audio_sha256") or "")
@@ -553,17 +624,21 @@ def apply_pause_mouth_closure(
         status = "skipped_unverified_reference_audio"
     elif not intervals:
         status = "no_qualifying_pauses"
-    elif not aligned_intervals:
+    elif correction_region == "full-frame" and not aligned_intervals:
         status = "no_source_aligned_silent_frames"
+    elif correction_region == "mouth-only" and not source_donor_frames:
+        status = "no_verified_quiet_source_donor_frames"
     else:
         status = "applied"
     uncovered_reason = ("no_exact_pingpong_source_frame_is_verified_silent"
                         if status == "applied" else status)
+    initial_coverage = aligned_intervals if correction_region == "full-frame" and status == "applied" else []
     uncovered_intervals = subtract_pause_intervals(
-        intervals, aligned_intervals if status == "applied" else [], uncovered_reason,
+        intervals, initial_coverage, uncovered_reason,
     )
     record: Dict[str, Any] = {
         "status": status,
+        "correction_region": correction_region,
         "reference_source": reference_source,
         "reference_video": str(reference_motion_video.resolve()),
         "reference_sha256": musetalk.sha256_file(reference_motion_video),
@@ -580,18 +655,39 @@ def apply_pause_mouth_closure(
                             "transition_curve": "linear fade within matched source-silent runs",
                             "speech_frames_preserved": True,
                             "audio_policy": "unshifted output audio stream copied unchanged with FFmpeg -c:a copy"},
-        "pingpong_mapping": "MuseTalk frame_list + reversed frame_list modulo mapping; only exact output/source timestamp matches are eligible",
+        "pingpong_mapping": (
+            "MuseTalk frame_list + reversed frame_list modulo mapping; only exact output/source timestamp matches are eligible"
+            if correction_region == "full-frame" else
+            "MuseTalk frame_list + reversed frame_list is used only to identify a preferred exact donor; any fully verified quiet-source frame may be used when its conservative face geometry matches"
+        ),
         "requested_intervals": intervals,
         "reference_audio_pause_intervals": source_pause_intervals,
-        "intervals": aligned_intervals if status == "applied" else [],
+        "intervals": initial_coverage,
         "uncovered_intervals": uncovered_intervals,
         "uncovered_duration_seconds": round(sum(item["duration_seconds"] for item in uncovered_intervals), 6),
-        "covered_duration_seconds": round(sum(item["duration_seconds"] for item in aligned_intervals), 6) if status == "applied" else 0.0,
-        "mapping_policy": "Restore the exact Echo frame already selected by MuseTalk's ordinary ping-pong sequence only when both that source frame and the current output frame are fully inside verified pauses; other pauses remain unchanged.",
+        "covered_duration_seconds": round(sum(item["duration_seconds"] for item in initial_coverage), 6),
+        "requested_output_pause_frame_count": len(output_pause_frames),
+        "verified_quiet_source_frame_indices": source_donor_frames,
+        "verified_quiet_source_frame_count": len(source_donor_frames),
+        "verified_quiet_source_duration_seconds": round(len(source_donor_frames) / float(fps), 6),
+        "mapping_policy": (
+            "Restore only the exact Echo frame already selected by MuseTalk's ordinary ping-pong sequence when both source and output frames are verified silent."
+            if correction_region == "full-frame" else
+            "For each fully-silent output frame, choose only among verified quiet-source frames for the same character; use a conservative normalized face-box/mouth-geometry proxy to align a donor, else leave the frame unchanged."
+        ),
+        "speech_and_nonmask_policy": (
+            "full-frame reference restore is restricted to exact source-silent frames"
+            if correction_region == "full-frame" else
+            "MuseTalk speech frames and every pixel outside a nonzero parser-derived lip alpha mask remain sourced from the rendered MuseTalk frame"
+        ),
         "source_frame_mapping": ({
             "status": "verified", "source_frame_count": frame_count,
             "cycle_frame_count": 2 * frame_count,
-            "policy": "frame_list + frame_list[::-1], modulo 2N, including duplicated turn endpoints",
+            "policy": (
+                "frame_list + frame_list[::-1], modulo 2N, including duplicated turn endpoints"
+                if correction_region == "full-frame" else
+                "donor bank contains only source frames fully enclosed by verified source-audio pauses; exact ping-pong source frame wins when geometry also passes"
+            ),
         } if provenance_verified else {
             "status": "unavailable", "reason": "Echo manifest/source audio identity was not verified",
         }),
@@ -625,15 +721,98 @@ def apply_pause_mouth_closure(
     temporary = destination.with_name("." + destination.stem + ".partial.mp4")
     if temporary.exists():
         raise FileExistsError("Pause-correction temporary already exists: {}".format(temporary))
-    graph = build_pause_closure_filter(frame_count, duration_seconds, aligned_intervals, fps)
-    command = [
-        ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(rendered_video), "-i", str(reference_motion_video),
-        "-filter_complex", graph, "-map", "[closed]", "-map", "0:a:0", "-map_metadata", "0",
-        "-t", "{:.6f}".format(duration_seconds), "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-        "-pix_fmt", "yuv420p", "-fps_mode", "passthrough", "-video_track_timescale", "25000",
-        "-c:a", "copy", "-movflags", "+faststart", str(temporary),
-    ]
+    mouth_temp_root: Optional[Path] = None
     try:
+        if correction_region == "mouth-only":
+            output_frame_count = int(math.ceil(duration_seconds * fps - 1e-9))
+            pause_frame_set = set(output_pause_frames)
+            request = {
+                "fps": fps,
+                "width": int(source_video.get("width", 0)),
+                "height": int(source_video.get("height", 0)),
+                "output_frame_count": output_frame_count,
+                "quiet_source_frame_indices": source_donor_frames,
+                "output_pause_frames": [
+                    {"output_frame_index": index,
+                     "exact_source_frame_index": pingpong_frame_index(index, frame_count)}
+                    for index in sorted(pause_frame_set)
+                ],
+            }
+            mouth_temp_root = destination.parent / ("." + destination.stem + ".mouth-mask." + uuid.uuid4().hex)
+            mouth_temp_root.mkdir(parents=True, exist_ok=False)
+            mask_directory = mouth_temp_root / "alpha"
+            donor_directory = mouth_temp_root / "donors"
+            request_path = mouth_temp_root / "request.json"
+            helper_report_path = mouth_temp_root / "report.json"
+            request_path.write_text(json.dumps(request, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            paths = musetalk.discover_musetalk_paths(musetalk_dir, musetalk_python)
+            helper_path = SCRIPT_ROOT / "musetalk_mouth_masks.py"
+            helper_command = [
+                str(paths.python), str(helper_path),
+                "--rendered-video", str(rendered_video.resolve()),
+                "--reference-video", str(reference_motion_video.resolve()),
+                "--mask-directory", str(mask_directory),
+                "--donor-directory", str(donor_directory),
+                "--report", str(helper_report_path),
+                "--request", str(request_path),
+            ]
+            helper_environment = musetalk.build_backend_environment(ffmpeg, musetalk_root=paths.root)
+            helper_log = helper_log_path or destination.with_name(destination.stem + "_mouth_mask.log")
+            helper_return_code, helper_seconds = musetalk.run_backend_process(
+                helper_command, paths.root, helper_environment, helper_log,
+            )
+            if helper_return_code != 0 or not helper_report_path.is_file():
+                raise RuntimeError("MuseTalk lip parser helper failed; no frame fallback was applied. Log: {}".format(helper_log))
+            mouth_report = json.loads(helper_report_path.read_text(encoding="utf-8"))
+            mouth_report["helper_process_wall_seconds"] = round(helper_seconds, 3)
+            record["mouth_mask_extraction"] = mouth_report
+            corrected_frame_indices = [int(index) for index in mouth_report.get("corrected_output_frame_indices", [])]
+            mouth_coverage_intervals = frame_indices_to_intervals(corrected_frame_indices, duration_seconds, fps)
+            record["intervals"] = mouth_coverage_intervals
+            record["covered_duration_seconds"] = round(
+                sum(item["duration_seconds"] for item in mouth_coverage_intervals), 6,
+            )
+            record["uncovered_intervals"] = subtract_pause_intervals(
+                intervals, mouth_coverage_intervals, "mouth_mask_or_face_alignment_was_not_confident",
+            )
+            record["uncovered_duration_seconds"] = round(
+                sum(item["duration_seconds"] for item in record["uncovered_intervals"]), 6,
+            )
+            record["corrected_pause_frame_count"] = len(corrected_frame_indices)
+            record["corrected_pause_frame_fraction"] = mouth_report.get("corrected_pause_frame_fraction", 0.0)
+            record["uncorrected_output_pause_frame_indices"] = mouth_report.get(
+                "uncorrected_output_pause_frame_indices", [],
+            )
+            record["valid_closed_donor_frames"] = mouth_report.get("valid_closed_donor_frames", 0)
+            record["selected_donor_frame_counts"] = mouth_report.get("selected_donor_frame_counts", {})
+            record["audio_unchanged"] = True
+            record["head_body_motion_policy"] = "donor pixels are confined to the per-frame semantic lip alpha; the MuseTalk head/body frame remains the base"
+            if not corrected_frame_indices:
+                record["status"] = "no_confident_mouth_donor_alignment"
+                record["fallback"] = "none; all unaligned pause frames and all speech frames remain unchanged"
+                shutil.rmtree(mouth_temp_root, ignore_errors=True)
+                mouth_temp_root = None
+                return record
+            graph = build_mouth_only_pause_closure_filter(duration_seconds, fps)
+            frame_pattern = "%08d.png"
+            command = [
+                ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(rendered_video),
+                "-framerate", str(fps), "-start_number", "0", "-i", str(donor_directory / frame_pattern),
+                "-framerate", str(fps), "-start_number", "0", "-i", str(mask_directory / frame_pattern),
+                "-filter_complex", graph, "-map", "[closed]", "-map", "0:a:0", "-map_metadata", "0",
+                "-t", "{:.6f}".format(duration_seconds), "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                "-pix_fmt", "yuv420p", "-fps_mode", "passthrough", "-video_track_timescale", "25000",
+                "-c:a", "copy", "-movflags", "+faststart", str(temporary),
+            ]
+        else:
+            graph = build_pause_closure_filter(frame_count, duration_seconds, aligned_intervals, fps)
+            command = [
+                ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(rendered_video), "-i", str(reference_motion_video),
+                "-filter_complex", graph, "-map", "[closed]", "-map", "0:a:0", "-map_metadata", "0",
+                "-t", "{:.6f}".format(duration_seconds), "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                "-pix_fmt", "yuv420p", "-fps_mode", "passthrough", "-video_track_timescale", "25000",
+                "-c:a", "copy", "-movflags", "+faststart", str(temporary),
+            ]
         result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, encoding="utf-8", errors="replace", check=False)
         if result.returncode != 0:
@@ -660,6 +839,9 @@ def apply_pause_mouth_closure(
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
+    finally:
+        if mouth_temp_root is not None:
+            shutil.rmtree(mouth_temp_root, ignore_errors=True)
     record["output"] = str(destination.resolve())
     record["source_frame_count"] = frame_count
     record["output_audio_codec"] = str(corrected_audio.get("codec_name"))
@@ -961,6 +1143,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--parsing-mode", choices=("jaw", "raw"), default="jaw")
     parser.add_argument("--pause-mouth-closure", choices=("auto", "force", "off"), default="auto",
                         help="Gate PCM pause cho MuseTalk; chỉ khôi phục frame nếu đúng frame ping-pong nguồn cũng được xác minh im lặng. Pause không trùng nguồn giữ nguyên và ghi uncovered. auto từ 0.32s cần manifest speech + SHA khớp; force từ 0.16s vẫn cần audio nguồn xác minh; off tắt cả hai.")
+    parser.add_argument("--pause-correction-region", choices=("full-frame", "mouth-only"), default="full-frame",
+                        help="Vùng sửa pause sau MuseTalk. full-frame giữ hành vi cũ; mouth-only là thử nghiệm opt-in, chỉ ghép vùng môi từ donor im lặng đã xác minh bằng FaceParsing; frame không đạt kiểm tra sẽ giữ nguyên.")
     parser.add_argument("--audio-offset-ms", type=int, default=0,
                         help="Dịch audio chỉ cho MuseTalk conditioning theo bước 40ms, giới hạn ±160ms. Dương làm miệng trễ audio; âm làm miệng đi trước. Audio output vẫn không dịch.")
     parser.add_argument("--audio-offset-sweep", action="store_true",
@@ -1405,6 +1589,7 @@ def run_workflow(args: argparse.Namespace, job_dir: Path, report: Dict[str, Any]
     phase_csv_path = job_dir / "phase_timings.csv"
     report.update({"report_path": str(report_path), "phase_csv_path": str(phase_csv_path), "action": args.action,
                    "job_directory": str(job_dir), "status": "running", "requested_profile": args.profile,
+                   "pause_correction_region": args.pause_correction_region,
                    "target_export": {"width": EXPORT_WIDTH, "height": EXPORT_HEIGHT, "ratio": "9:16", "fps": FPS,
                                      "video": "libx264 CRF18 preset fast, yuv420p", "audio": "AAC copy if input AAC; otherwise 160 kbps"},
                    "motion_policy": "MuseTalk pingpong; source video frames reverse, audio remains forward"})
@@ -1539,7 +1724,9 @@ def run_workflow(args: argparse.Namespace, job_dir: Path, report: Dict[str, Any]
         "recommended_action": ("Regenerate an Echo speech motion base with the current audio before relying on head/shoulder gesture timing."
                                if motion_alignment_status != "verified_match" else
                                "Audio identity is verified; visual gesture quality still needs review."),
-        "scope_note": "MuseTalk pause gating alone does not stop generated head motion. A pause frame is restored only from its exact Echo source timestamp when that timestamp is also verified silent; other frames and speech motion stay as generated.",
+        "scope_note": ("MuseTalk pause gating alone does not stop generated head motion. Full-frame correction restores only an exact Echo source timestamp that is also verified silent."
+                       if args.pause_correction_region == "full-frame" else
+                       "MuseTalk pause gating alone does not stop generated head motion. Mouth-only correction samples only verified quiet-source frames and changes parser-defined lip pixels after face-geometry checks; all unaligned frames remain generated."),
     }
     report["motion_audio_alignment"] = motion_audio_alignment
     original_audio_info = _normalized_wav_info(unshifted_audio)
@@ -1566,6 +1753,7 @@ def run_workflow(args: argparse.Namespace, job_dir: Path, report: Dict[str, Any]
                   "Normalize output audio; gate reliable pauses in the MuseTalk conditioning copy, then create exact-length offset variants.")
     report["pause_mouth_closure_policy"] = {
         "requested": args.pause_mouth_closure,
+        "correction_region": args.pause_correction_region,
         "conditioning_audio_gate": pause_gate_record,
         "conditioning_gate_enabled": args.pause_mouth_closure != "off",
         "enabled_for_this_base": closure_enabled,
@@ -1578,14 +1766,22 @@ def run_workflow(args: argparse.Namespace, job_dir: Path, report: Dict[str, Any]
         "reference_audio": pause_reference_audio_record,
         "decision": closure_reason,
         "minimum_pause_seconds": closure_min_seconds,
-        "reference": "same approved motion-base frame selected by MuseTalk's exact ping-pong sequence; no neutral pass or extra model render",
-        "source_pause_guard": "Auto correction requires a speech-mode manifest and matching Echo conditioning-audio SHA-256; a frame is restored only if both the output pause and its exact mapped source frame are fully inside verified silence.",
+        "reference": ("same approved motion-base frame selected by MuseTalk's exact ping-pong sequence; no neutral pass or extra model render"
+                      if args.pause_correction_region == "full-frame" else
+                      "quiet-source donor frames from the same motion base; MuseTalk FaceParsing semantic lip mask and conservative face-geometry alignment; no additional model/checkpoint"),
+        "source_pause_guard": ("Auto correction requires a speech-mode manifest and matching Echo conditioning-audio SHA-256; a frame is restored only if both the output pause and its exact mapped source frame are fully inside verified silence."
+                               if args.pause_correction_region == "full-frame" else
+                               "Auto correction requires verified speech-mode/audio SHA provenance; donor frames must be fully inside a verified source silence, pass MuseTalk parser closed-mouth checks and pass the face-geometry alignment thresholds. Unmatched pause frames stay unchanged."),
         "fallback_if_correction_fails": "fail workflow and preserve intermediates; never mark output corrected",
         "note": ("The conditioning pause gate is independent of manifest identity and zeros only confidently detected pauses in the current audio. "
-                 "Post-render pause correction restores only the exact motion-base frame already mapped by MuseTalk when its source timestamp is also verified silent. "
-                 "Auto correction requires a speech-mode manifest and matching input-audio SHA-256. Non-matching pauses remain unchanged and are reported uncovered; AAC audio is preserved. "
+                 + ("Post-render full-frame correction restores only the exact motion-base frame already mapped by MuseTalk when its source timestamp is also verified silent. "
+                    "Other pauses remain unchanged and are reported uncovered. "
+                    if args.pause_correction_region == "full-frame" else
+                    "Post-render mouth-only correction uses the existing MuseTalk parser's semantic lip labels and verified quiet-source frames, matched by a conservative normalized face-box/mouth-geometry proxy. "
+                    "A parser/alignment failure leaves that output frame untouched; this mode is experimental and should be visually A/B checked on Windows. ")
+                 + "Auto correction requires a speech-mode manifest and matching input-audio SHA-256; unshifted output AAC is preserved. "
                  "Force uses a 0.16s gate/correction threshold and may use a different current audio only when the original Echo conditioning audio still matches its manifest. "
-                 "This source-aligned full-frame restore preserves the original head/body sequence but is not a mouth-only matte and does not guarantee perfect mouth closure."),
+                 "No mode guarantees perfect lip sync or mouth closure."),
     }
     print("MuseTalk pause conditioning gate: {} | {} interval(s), {} samples zeroed".format(
         pause_gate_record["status"], pause_gate_record["interval_count"], pause_gate_record["gated_sample_count"],
@@ -1676,6 +1872,7 @@ def run_workflow(args: argparse.Namespace, job_dir: Path, report: Dict[str, Any]
                 unshifted_audio, min_duration_seconds=closure_min_seconds,
             )
             closure_record = {"status": "skipped", "reason": closure_reason,
+                              "correction_region": args.pause_correction_region,
                               "reference_source": "existing_motion_base_video",
                               "reference_cache_state": "not_needed; reuses existing Echo motion base",
                               "requested_intervals": skipped_pause_intervals,
@@ -1688,6 +1885,7 @@ def run_workflow(args: argparse.Namespace, job_dir: Path, report: Dict[str, Any]
             )
             closure_record = {
                 "status": "skipped_no_verified_reference_audio",
+                "correction_region": args.pause_correction_region,
                 "reason": pause_reference_audio_record.get("reason", "Echo conditioning audio could not be verified."),
                 "reference_source": "existing_motion_base_video",
                 "reference_cache_state": "not_needed; reuses existing Echo motion base",
@@ -1707,6 +1905,10 @@ def run_workflow(args: argparse.Namespace, job_dir: Path, report: Dict[str, Any]
                 reference_audio=pause_reference_audio,
                 reference_audio_provenance=pause_reference_audio_record,
                 requested_policy=args.pause_mouth_closure,
+                correction_region=args.pause_correction_region,
+                musetalk_dir=args.musetalk_dir,
+                musetalk_python=args.musetalk_python,
+                helper_log_path=job_dir / "logs" / ("mouth_mask_extraction_video_{}.log".format(index)),
             )
             if closure_record["status"] == "applied":
                 muse_data["path"] = corrected_intermediate
@@ -1718,7 +1920,7 @@ def run_workflow(args: argparse.Namespace, job_dir: Path, report: Dict[str, Any]
         muse_meta["musetalk_intermediate_original"] = str(original_intermediate.resolve())
         muse_meta["intermediate_for_hd_export"] = str(muse_data["path"].resolve())
         _append_phase(report, "pause_mouth_closure_video_{}_wall".format(index), closure_wall,
-                      "Unshifted-WAV pause detection and exact ping-pong source-frame matching; unmatched pauses stay untouched and AAC is copied unchanged.",
+                      "Unshifted-WAV pause detection and verified quiet-source correction; parser/alignment failures stay untouched and AAC is copied unchanged.",
                       video_index=index)
         output_name = "vertical_ad_1080x1920.mp4" if video_count == 1 else "vertical_ad_1080x1920_{}.mp4".format(variant)
         final_output = job_dir / output_name

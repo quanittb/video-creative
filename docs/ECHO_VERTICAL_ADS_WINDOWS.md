@@ -56,11 +56,13 @@ MuseTalk upstream tạo Whisper audio features ở **50 Hz**, rồi lấy contex
 
 Offset `-40/0/+40 ms` được áp dụng **sau gate**, vì vậy khoảng pause trong conditioning audio dịch cùng lời nói. Final MP4 luôn nhận lại audio chuẩn hóa gốc, không gate và không dịch. Nếu gate làm thay đổi waveform hoặc chọn offset khác 0, pipeline remux audio gốc sau MuseTalk trước các bước correction/export.
 
-Sau inference, pause correction chỉ khôi phục đúng frame Echo mà MuseTalk đã chọn tại thời điểm đó bằng chu kỳ `frame_list + frame_list[::-1]`. Chỉ làm khi cả frame output và frame nguồn tương ứng nằm trọn trong các khoảng im lặng đã xác minh. Nhờ vậy thân, đầu và nền giữ đúng chuyển động của timestamp trong chu kỳ gốc. Các pause không trùng thời điểm nguồn im lặng được giữ nguyên và ghi vào `uncovered_intervals`. Fade ngắn chỉ áp dụng bên trong những run khớp nguồn; audio AAC được stream-copy. Đây là khôi phục frame toàn khung nhưng đúng timestamp gốc, không phải mask môi riêng. MuseTalk cache hiện giữ mặt nạ `jaw/raw` rộng và bounding box, không có matte môi/keypoint đủ để ghép donor môi đáng tin cậy. Nếu Echo/source audio không xác minh được thì không có correction.
+Theo mặc định, sau inference pause correction khôi phục đúng frame Echo mà MuseTalk đã chọn tại thời điểm đó bằng chu kỳ `frame_list + frame_list[::-1]`. Chỉ làm khi cả frame output và frame nguồn tương ứng nằm trọn trong các khoảng im lặng đã xác minh. Nhờ vậy thân, đầu và nền giữ đúng chuyển động của timestamp trong chu kỳ gốc. Các pause không trùng thời điểm nguồn im lặng được giữ nguyên và ghi vào `uncovered_intervals`. Fade ngắn chỉ áp dụng bên trong những run khớp nguồn; audio AAC được stream-copy. Đây là correction toàn khung và vẫn là mặc định để giữ tương thích.
+
+Có thêm chế độ **thử nghiệm** `mouth-only` để so A/B mà không thay toàn khung: dùng model FaceParsing và checkpoint đã có trong MuseTalk để đọc nhãn môi 11/12/13, chỉ lấy donor từ các frame của chính motion base nằm hoàn toàn trong khoảng im lặng và qua kiểm tra miệng khép, rồi warp theo bounding box khuôn mặt. Ở job đã phân tích trước đây bank có 18 frame (0,72 giây mẫu nguồn); có thể tái sử dụng donor gần pose cho nhiều frame pause đầu ra, nên đây không phải giới hạn tổng thời lượng pause. Thời lượng được sửa thực tế phụ thuộc mask/geometry và phải đọc từ report (`covered_duration_seconds`, `uncovered_duration_seconds`). Bộ so khớp tư thế chỉ là proxy hình học, chưa được kiểm chứng bằng video thật. Frame target, donor hoặc mask không đạt ngưỡng sẽ được bỏ qua và ghi lý do/coverage; không fallback sang khung hình đầy đủ. Audio giữ nguyên qua stream-copy. Vì kết quả cuối là H.264 4:2:0, vùng màu có thể sai khác nhẹ ở mép feather do nén/chroma subsampling; chế độ này chưa được nhìn A/B trên máy RTX 3060 và không đảm bảo khẩu hình 100%.
 
 Correction này không làm dịu đầu khi đang nói và không đảm bảo mọi pause được sửa: khi frame nguồn tại timestamp tương ứng đang nói, output được giữ nguyên. Kiểm tra `uncovered_intervals` và output trực quan; việc phát hiện silence không đảm bảo miệng khép tuyệt đối.
 
-Report `motion_audio_alignment` so SHA-256 audio Echo dùng để tạo cử chỉ với audio hiện tại. Khi mismatch hoặc không có manifest, auto bỏ qua pause correction; hãy tạo Echo speech base mới nếu cần cử chỉ bám audio. `--pause-mouth-closure off` tắt cả conditioning gate và khôi phục frame theo timestamp. Cách này chỉ phủ pause khớp frame nguồn, nên phần còn lại có thể vẫn mấp máy; report phải được xem cùng `uncovered_intervals`. Whisper context, giới hạn 25 FPS và sai số model vẫn khiến khẩu hình lệch; hãy nghe/xem A/B trước khi chạy dài.
+Report `motion_audio_alignment` so SHA-256 audio Echo dùng để tạo cử chỉ với audio hiện tại. Khi mismatch hoặc không có manifest, auto bỏ qua pause correction; hãy tạo Echo speech base mới nếu cần cử chỉ bám audio. `--pause-mouth-closure off` tắt cả conditioning gate và correction sau render. Full-frame chỉ phủ pause khớp frame nguồn, nên phần còn lại có thể vẫn mấp máy; report phải được xem cùng `uncovered_intervals`. Whisper context, giới hạn 25 FPS và sai số model vẫn khiến khẩu hình lệch; hãy nghe/xem A/B trước khi chạy dài.
 
 Tham chiếu upstream: [MuseTalk `audio_processor.py`](https://github.com/TMElyralab/MuseTalk/blob/main/musetalk/utils/audio_processor.py) (16 kHz input, 50 Hz Whisper features và cách ánh xạ sang FPS output).
 
@@ -113,6 +115,32 @@ Kết quả mới được ghi trong đúng job folder, không ghi đè file cũ
 - `pause_reprocess_report.json`: xác minh hash, exact-source coverage, `uncovered_intervals`, export và thời gian.
 
 Nếu tên job hoặc motion base khác, thay đường dẫn tương ứng. Lệnh chỉ reprocess được khi job cũ còn đủ intermediate, report, Echo reference WAV và motion base gốc đúng SHA.
+
+### A/B tùy chọn: thử ghép riêng vùng môi khi pause
+
+Chỉ chạy sau khi có một lần render/job hoàn chỉnh. Lệnh này không chạy Echo hoặc MuseTalk lip-sync lại; nó dùng Python và checkpoint FaceParsing đã cài cho MuseTalk, nạp parser để phân tích frame. Trong CMD đã vào thư mục dự án, đặt đúng job và motion base gốc. Đường dẫn bên dưới là đường dẫn trong job đã nêu ở trao đổi trước; nếu job của bạn trỏ tới base khác, sửa `ECHO_BASE`. Script xác minh SHA-256 với report và dừng nếu chọn nhầm file.
+
+```bat
+set "JOB=output\vertical_ads\job_20261010_125846_9dadea01"
+set "ECHO_BASE=C:\Users\Admin\Downloads\video-creative-studio\video-creative-studio\output\echo_flash\a10_0682611f141d\motion_base.mp4"
+dir "%JOB%\vertical_ad_report.json"
+dir "%ECHO_BASE%"
+```
+
+Sau khi cả hai lệnh `dir` tìm thấy file, chạy:
+
+```bat
+python -u scripts\reprocess_pause_correction.py --job-dir "%JOB%" --motion-base "%ECHO_BASE%" --pause-correction-region mouth-only
+```
+
+Nếu tự dò không chọn đúng MuseTalk Python/checkout, thêm `--musetalk-dir "C:\Users\Admin\Downloads\video-creative-studio\video-creative-studio\musetalk" --musetalk-python "C:\Program Files\Python310\python.exe"` trỏ tới đúng môi trường đang dùng cho MuseTalk. Đọc report trước khi xem video:
+
+- `pause_mouth_only_reprocess_report.json`: hash nguồn, mask coverage, số frame được sửa, donor được chọn, pause chưa sửa và lý do skip.
+- `intermediate\pause_mouth_only_reprocessed_video_1.mp4`: native 512×640.
+- `vertical_ad_1080x1920_pause_mouth_only_reprocessed.mp4`: bản xem 9:16.
+- `logs\mouth_mask_extraction_reprocess.log`: log parser/helper.
+
+So bản này với `vertical_ad_1080x1920.mp4` gốc của job. Chuyển động đầu/vai ngoài vùng môi phải tiếp tục chạy. Nếu report báo coverage thấp hoặc không có donor đạt kiểm tra, đó là skip có chủ ý; không hạ ngưỡng bằng tay. Report và test hiện tại chỉ xác nhận hợp đồng dữ liệu/compositing trên synthetic clip; chưa xác nhận chất lượng hình ảnh hay thời gian trên RTX 3060. Giữ `--pause-correction-region` mặc định `full-frame` cho các lệnh `test_vertical_ads.bat` cho đến khi xem xong A/B.
 
 Offset mặc định là 0ms và không tự đoán. Nếu khẩu hình có vẻ sớm/trễ, dùng preview A/B quanh 0 bằng jaw mask:
 

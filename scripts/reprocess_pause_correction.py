@@ -104,15 +104,23 @@ def _verified_job_inputs(job_dir: Path, motion_base: Optional[Path]) -> Dict[str
     }
 
 
-def reprocess(job_dir: Path, motion_base: Optional[Path], ffmpeg_arg: str, ffprobe_arg: str) -> Dict[str, Any]:
+def reprocess(
+    job_dir: Path, motion_base: Optional[Path], ffmpeg_arg: str, ffprobe_arg: str,
+    correction_region: str = "full-frame", musetalk_dir: Optional[str] = None,
+    musetalk_python: Optional[str] = None,
+) -> Dict[str, Any]:
+    if correction_region not in ("full-frame", "mouth-only"):
+        raise ValueError("--pause-correction-region must be full-frame or mouth-only.")
     job_dir = _required_file(job_dir / "vertical_ad_report.json", "vertical_ad_report.json").parent
     inputs = _verified_job_inputs(job_dir, motion_base)
     ffmpeg, ffprobe = echo.resolve_tools(ffmpeg_arg, ffprobe_arg)
     intermediate = job_dir / "intermediate"
     logs = job_dir / "logs"
-    corrected = intermediate / "pause_source_aligned_reprocessed_video_1.mp4"
-    final_video = job_dir / "vertical_ad_1080x1920_pause_source_aligned_reprocessed.mp4"
-    report_path = job_dir / "pause_reprocess_report.json"
+    suffix = "source_aligned" if correction_region == "full-frame" else "mouth_only"
+    corrected = intermediate / "pause_{}_reprocessed_video_1.mp4".format(suffix)
+    final_video = job_dir / "vertical_ad_1080x1920_pause_{}_reprocessed.mp4".format(suffix)
+    report_path = (job_dir / "pause_reprocess_report.json" if correction_region == "full-frame"
+                   else job_dir / "pause_mouth_only_reprocess_report.json")
     if corrected.exists() or final_video.exists() or report_path.exists():
         raise FileExistsError("Output reprocess đã tồn tại; không ghi đè: {}".format(job_dir))
     unshifted_video = inputs["rendered_video"]
@@ -154,27 +162,35 @@ def reprocess(job_dir: Path, motion_base: Optional[Path], ffmpeg_arg: str, ffpro
         reference_audio=inputs["echo_reference_audio"],
         reference_audio_provenance=inputs["provenance"],
         requested_policy="auto",
-        reference_source="exact_pingpong_source_frame_mapping",
+        reference_source=("exact_pingpong_source_frame_mapping" if correction_region == "full-frame"
+                          else "verified_quiet_source_mouth_donor_bank"),
+        correction_region=correction_region,
+        musetalk_dir=musetalk_dir,
+        musetalk_python=musetalk_python,
+        helper_log_path=job_dir / "logs" / "mouth_mask_extraction_reprocess.log",
     )
     if correction["status"] != "applied":
         report = {
             "status": "skipped",
             "reason": correction["status"],
+            "correction_region": correction_region,
             "job_directory": str(job_dir),
             "motion_base": str(inputs["motion_base"] or inputs["report"].get("motion_base", {}).get("path")),
-            "reference_policy": inputs["reference_policy"],
+            "reference_policy": (inputs["reference_policy"] if correction_region == "full-frame"
+                                 else "verified_quiet_source_mouth_donor_bank"),
             "pause_correction": correction,
-            "note": "Không tạo final đã sửa vì không có frame nguồn im lặng khớp ping-pong; MuseTalk/Echo không được chạy lại.",
+            "note": "Không tạo final đã sửa vì pause correction không có đủ frame/donor đạt kiểm tra; MuseTalk/Echo không được chạy lại.",
         }
         echo.write_json_atomic(report_path, report)
         raise RuntimeError("Pause correction bị bỏ qua: {}. Report: {}".format(correction["status"], report_path))
 
     export_seconds, exported = ads.export_hd_video(
         corrected, final_video, ffmpeg, ffprobe, duration,
-        logs / "hd_export_pause_source_aligned_reprocessed.log",
+        logs / "hd_export_pause_{}_reprocessed.log".format(suffix),
     )
     report = {
         "status": "complete",
+        "correction_region": correction_region,
         "job_directory": str(job_dir),
         "source_video": str(inputs["rendered_video"]),
         "input_audio_restoration": reencoded_audio_restore,
@@ -184,7 +200,8 @@ def reprocess(job_dir: Path, motion_base: Optional[Path], ffmpeg_arg: str, ffpro
         "motion_base": str(inputs["motion_base"] or inputs["report"].get("motion_base", {}).get("path")),
         "motion_base_sha256": inputs["motion_metadata"]["sha256"],
         "source_frame_reference_video": str(inputs["reference_video"]),
-        "reference_policy": inputs["reference_policy"],
+        "reference_policy": (inputs["reference_policy"] if correction_region == "full-frame"
+                             else "verified_quiet_source_mouth_donor_bank"),
         "manifest_audio_identity": {
             "status": "verified_match",
             "manifest_audio_sha256": (inputs["report"].get("pause_mouth_closure_policy") or {}).get("manifest_audio_sha256"),
@@ -198,7 +215,9 @@ def reprocess(job_dir: Path, motion_base: Optional[Path], ffmpeg_arg: str, ffpro
         "postprocess_wall_seconds": round(time.perf_counter() - started, 3),
         "models_rerun": False,
         "audio_policy": "use the job's unshifted audio; AAC stream is copied through correction and HD export",
-        "scope_note": "Only output pauses whose exact MuseTalk ping-pong source frame is also verified silent are restored. Other pause frames remain unchanged and are reported uncovered; visual closure still requires human review.",
+        "scope_note": ("Only output pauses whose exact MuseTalk ping-pong source frame is also verified silent are restored. Other pause frames remain unchanged and are reported uncovered; visual closure still requires human review."
+                       if correction_region == "full-frame" else
+                       "Only parser-validated lip pixels in output pause frames are replaced from a verified quiet-source frame with confident normalized face geometry. All other pixels/audio remain from the MuseTalk intermediate; this experimental path requires human A/B review."),
     }
     echo.write_json_atomic(report_path, report)
     return report
@@ -206,10 +225,14 @@ def reprocess(job_dir: Path, motion_base: Optional[Path], ffmpeg_arg: str, ffpro
 
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Offline reprocess a completed Echo/MuseTalk job using exact ping-pong source frames at matching verified pauses; no model inference runs.",
+        description="Offline reprocess a completed Echo/MuseTalk job at verified pauses; mouth-only mode uses the existing MuseTalk FaceParsing model, and neither mode reruns Echo/MuseTalk lip-sync.",
     )
     parser.add_argument("--job-dir", required=True, type=Path, help="Completed output\\vertical_ads\\job_... folder.")
     parser.add_argument("--motion-base", required=True, type=Path, help="Original Echo motion_base.mp4 whose SHA-256 is in the job report; required for exact ping-pong frame mapping.")
+    parser.add_argument("--pause-correction-region", choices=("full-frame", "mouth-only"), default="full-frame",
+                        help="full-frame preserves the prior reprocess behavior; mouth-only is an opt-in MuseTalk FaceParsing mask experiment.")
+    parser.add_argument("--musetalk-dir", default=None, help="MuseTalk checkout containing existing FaceParsing code and weights; omit for automatic discovery.")
+    parser.add_argument("--musetalk-python", default=None, help="Python executable of the installed MuseTalk runtime; omit for automatic discovery.")
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--ffprobe", default="ffprobe")
     return parser
@@ -218,14 +241,18 @@ def make_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = make_parser().parse_args(argv)
     try:
-        report = reprocess(args.job_dir, args.motion_base, args.ffmpeg, args.ffprobe)
+        report = reprocess(
+            args.job_dir, args.motion_base, args.ffmpeg, args.ffprobe,
+            args.pause_correction_region, args.musetalk_dir, args.musetalk_python,
+        )
     except Exception as error:
         print("ERROR: {}".format(error), file=sys.stderr)
         return 1
     print("Reprocess thành công, không chạy lại Echo/MuseTalk (mapping: {}).".format(report["reference_policy"]))
     print("Native: {}".format(report["corrected_intermediate"]))
     print("Final: {}".format(report["final_output"]))
-    print("Report: {}".format(Path(report["job_directory"]) / "pause_reprocess_report.json"))
+    report_name = "pause_mouth_only_reprocess_report.json" if report.get("correction_region") == "mouth-only" else "pause_reprocess_report.json"
+    print("Report: {}".format(Path(report["job_directory"]) / report_name))
     return 0
 
 

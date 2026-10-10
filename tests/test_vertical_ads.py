@@ -16,6 +16,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import test_vertical_ads as ads
 import reprocess_pause_correction as reprocess_pause
+import musetalk_mouth_masks as mouth_masks
 from tests import test_cached_musetalk as cached_fixture
 
 FFMPEG = shutil.which("ffmpeg")
@@ -27,6 +28,7 @@ class VerticalAdsTests(unittest.TestCase):
         args = ads.make_parser().parse_args(["run"])
         self.assertEqual((args.profile, args.mouth_mode), ("A10", "speech"))
         self.assertEqual(args.pause_mouth_closure, "auto")
+        self.assertEqual(args.pause_correction_region, "full-frame")
         self.assertEqual(args.audio_offset_ms, 0)
         help_text = " ".join(ads.make_parser().format_help().split())
         self.assertIn("speech dùng audio thật để sinh chuyển động", help_text)
@@ -184,6 +186,210 @@ class VerticalAdsTests(unittest.TestCase):
         self.assertIn("trim=end_frame=4", graph)
         self.assertIn("[source_aligned_reference]", graph)
         self.assertIn("[0:v]fps=25,setpts=N/(25*TB)[musetalk]", graph)
+
+    def test_mouth_only_parser_mask_and_donor_checks_are_conservative(self):
+        if mouth_masks.cv2 is None or mouth_masks.np is None:
+            self.skipTest("OpenCV/NumPy from the MuseTalk runtime are required for parser-mask checks")
+        cv2, np = mouth_masks.cv2, mouth_masks.np
+        labels = np.zeros((200, 200), dtype=np.uint8)
+        cv2.ellipse(labels, (100, 90), (45, 60), 0, 0, 360, 1, -1)
+        labels[121:125, 87:98] = 12
+        labels[121:125, 98:113] = 13
+        labels[122:124, 98:102] = 11
+        alpha, descriptor, reason = mouth_masks.build_feathered_mouth_mask(labels)
+        self.assertEqual(reason, "ok")
+        self.assertIsNotNone(descriptor)
+        self.assertTrue(mouth_masks.is_closed_donor(descriptor))
+        self.assertEqual(alpha.shape, labels.shape)
+        self.assertGreater(np.count_nonzero(alpha), 0)
+        self.assertLess(np.count_nonzero(alpha), labels.size * 0.02)
+
+        open_labels = labels.copy()
+        open_labels[120:130, 87:113] = 11
+        _, open_descriptor, reason = mouth_masks.build_feathered_mouth_mask(open_labels)
+        self.assertEqual(reason, "ok")
+        self.assertIsNotNone(open_descriptor)
+        self.assertFalse(mouth_masks.is_closed_donor(open_descriptor))
+
+        invalid, invalid_descriptor, reason = mouth_masks.build_feathered_mouth_mask(np.zeros((200, 200), dtype=np.uint8))
+        self.assertIsNone(invalid)
+        self.assertIsNone(invalid_descriptor)
+        self.assertEqual(reason, "face_skin_not_detected")
+
+    def test_mouth_only_geometry_rejects_pose_proxy_mismatch(self):
+        if mouth_masks.cv2 is None or mouth_masks.np is None:
+            self.skipTest("OpenCV/NumPy from the MuseTalk runtime are required for parser geometry checks")
+        cv2, np = mouth_masks.cv2, mouth_masks.np
+        labels = np.zeros((200, 200), dtype=np.uint8)
+        cv2.ellipse(labels, (100, 90), (45, 60), 0, 0, 360, 1, -1)
+        labels[121:125, 87:113] = 12
+        target, reason = mouth_masks.describe_face_and_mouth(labels)
+        self.assertEqual(reason, "ok")
+        shifted = np.zeros_like(labels)
+        cv2.ellipse(shifted, (145, 90), (45, 60), 0, 0, 360, 1, -1)
+        shifted[121:125, 132:158] = 12
+        donor, reason = mouth_masks.describe_face_and_mouth(shifted)
+        self.assertEqual(reason, "ok")
+        allowed, _, reason = mouth_masks.compare_face_geometry(target, donor, 200, 200)
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "face_center_mismatch")
+
+    def test_mouth_only_extractor_writes_masks_only_for_confident_pause_frames(self):
+        if mouth_masks.cv2 is None or mouth_masks.np is None:
+            self.skipTest("OpenCV/NumPy from the MuseTalk runtime are required for donor extraction checks")
+        cv2, np = mouth_masks.cv2, mouth_masks.np
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reference_video = root / "reference.avi"
+            rendered_video = root / "rendered.avi"
+            width = height = 200
+            fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+
+            def write_video(path: Path, colors: tuple[tuple[int, int, int], ...]) -> None:
+                writer = cv2.VideoWriter(str(path), fourcc, 25.0, (width, height))
+                self.assertTrue(writer.isOpened(), "OpenCV must open the test AVI writer")
+                try:
+                    for color in colors:
+                        writer.write(np.full((height, width, 3), color, dtype=np.uint8))
+                finally:
+                    writer.release()
+
+            write_video(reference_video, ((20, 40, 220), (20, 40, 220)))
+            write_video(rendered_video, ((80, 100, 120), (80, 100, 120)))
+
+            closed_labels = np.zeros((height, width), dtype=np.uint8)
+            cv2.ellipse(closed_labels, (100, 90), (45, 60), 0, 0, 360, 1, -1)
+            closed_labels[121:125, 87:98] = 12
+            closed_labels[121:125, 98:113] = 13
+            closed_labels[122:124, 98:102] = 11
+            target_labels = closed_labels.copy()
+            target_labels[120:130, 87:113] = 11
+            request_path = root / "request.json"
+            request_path.write_text(json.dumps({
+                "fps": 25,
+                "width": width,
+                "height": height,
+                "output_frame_count": 2,
+                "quiet_source_frame_indices": [0],
+                "output_pause_frames": [{"output_frame_index": 1, "exact_source_frame_index": 1}],
+            }), encoding="utf-8")
+            mask_dir, donor_dir = root / "masks", root / "donors"
+            report_path = root / "report.json"
+            with mock.patch.object(mouth_masks, "_raw_label_map", side_effect=[closed_labels, target_labels]):
+                report = mouth_masks.run_extraction(
+                    rendered_video, reference_video, mask_dir, donor_dir, report_path, request_path,
+                    parser=object(), torch=object(),
+                )
+
+            self.assertEqual(report["status"], "applied")
+            self.assertEqual(report["corrected_output_frame_indices"], [1])
+            self.assertEqual(report["selected_donor_frame_counts"], {"0": 1})
+            self.assertEqual(np.count_nonzero(cv2.imread(str(mask_dir / "00000000.png"), cv2.IMREAD_GRAYSCALE)), 0)
+            self.assertGreater(np.count_nonzero(cv2.imread(str(mask_dir / "00000001.png"), cv2.IMREAD_GRAYSCALE)), 0)
+            donor = cv2.imread(str(donor_dir / "00000001.png"), cv2.IMREAD_COLOR)
+            self.assertIsNotNone(donor)
+            self.assertLess(int(donor[40, 40, 0]), 50,
+                            "the output-timed patch should be sourced from the selected quiet donor")
+
+    def test_mouth_only_filter_changes_only_masked_pixels_and_copies_audio(self):
+        if not FFMPEG or not FFPROBE:
+            self.skipTest("FFmpeg/ffprobe are required for the synthetic media test")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_raw = root / "source.rgb"
+            source = root / "source.mp4"
+            lossless_output = root / "output_lossless.mkv"
+            lossy_output = root / "output_lossy.mp4"
+            donor_dir, alpha_dir = root / "donors", root / "alpha"
+            donor_dir.mkdir()
+            alpha_dir.mkdir()
+            source_frame = bytearray()
+            for y in range(64):
+                for x in range(64):
+                    source_frame.extend((150 + x // 8, 120 + y // 8, 100 + (x + y) // 16))
+            source_raw.write_bytes(bytes(source_frame) * 4)
+            subprocess.run([
+                FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo",
+                "-pixel_format", "rgb24", "-video_size", "64x64", "-framerate", "25",
+                "-i", str(source_raw), "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000:duration=0.16",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "0", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "64k", "-shortest", str(source),
+            ], check=True)
+            for index in range(4):
+                donor = donor_dir / ("{:08d}.ppm".format(index))
+                donor.write_bytes(b"P6\n64 64\n255\n" + bytes((185, 150, 130)) * (64 * 64))
+                alpha = bytearray(64 * 64)
+                if index == 1:
+                    for y in range(27, 37):
+                        for x in range(27, 37):
+                            alpha[y * 64 + x] = 255
+                (alpha_dir / ("{:08d}.pgm".format(index))).write_bytes(b"P5\n64 64\n255\n" + alpha)
+            graph = ads.build_mouth_only_pause_closure_filter(0.16, 25)
+            common_command = [
+                FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
+                "-framerate", "25", "-start_number", "0", "-i", str(donor_dir / "%08d.ppm"),
+                "-framerate", "25", "-start_number", "0", "-i", str(alpha_dir / "%08d.pgm"),
+                "-filter_complex", graph, "-map", "[closed]", "-map", "0:a:0", "-t", "0.16",
+                "-c:a", "copy",
+            ]
+            result = subprocess.run(
+                common_command + ["-c:v", "ffv1", "-pix_fmt", "rgb24", str(lossless_output)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            result = subprocess.run(
+                common_command + ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+                                  "-pix_fmt", "yuv420p", str(lossy_output)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            def decode_rgb(path: Path) -> np.ndarray:
+                raw = subprocess.check_output([FFMPEG, "-v", "error", "-i", str(path), "-map", "0:v:0",
+                                               "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+                return raw
+
+            source_frames = decode_rgb(source)
+            lossless_frames = decode_rgb(lossless_output)
+            lossy_frames = decode_rgb(lossy_output)
+            frame_bytes = 64 * 64 * 3
+            mask_indices = {y * 64 + x for y in range(27, 37) for x in range(27, 37)}
+            changed_inside = False
+            maximum_outside_error = 0
+            for frame_index in range(4):
+                frame_start = frame_index * frame_bytes
+                for pixel in range(64 * 64):
+                    start = frame_start + pixel * 3
+                    source_pixel = source_frames[start:start + 3]
+                    lossless_pixel = lossless_frames[start:start + 3]
+                    output_pixel = lossy_frames[start:start + 3]
+                    if frame_index == 1 and pixel in mask_indices:
+                        if source_pixel != output_pixel:
+                            changed_inside = True
+                    else:
+                        self.assertEqual(source_pixel, lossless_pixel,
+                                         "lossless RGB output must preserve every unmasked pixel")
+                    if pixel not in mask_indices:
+                        maximum_outside_error = max(
+                            maximum_outside_error,
+                            *(abs(left - right) for left, right in zip(source_pixel, output_pixel)),
+                        )
+            self.assertTrue(changed_inside, "donor content should be visible inside the lip alpha only")
+            self.assertLessEqual(maximum_outside_error, 12,
+                                 "lossy 4:2:0 output may vary outside the mask, but only within codec tolerance")
+            source_audio = subprocess.check_output([FFMPEG, "-v", "error", "-i", str(source), "-map", "0:a:0", "-f", "s16le", "-"])
+            output_audio = subprocess.check_output([FFMPEG, "-v", "error", "-i", str(lossy_output), "-map", "0:a:0", "-f", "s16le", "-"])
+            self.assertEqual(source_audio, output_audio)
+
+            def audio_packet_hashes(path: Path) -> list[str]:
+                data = subprocess.check_output([
+                    FFPROBE, "-v", "error", "-select_streams", "a:0", "-show_packets",
+                    "-show_data_hash", "sha256", "-show_entries", "packet=data_hash", "-of", "json", str(path),
+                ])
+                return [packet["data_hash"] for packet in json.loads(data)["packets"]]
+
+            self.assertEqual(audio_packet_hashes(source), audio_packet_hashes(lossy_output))
 
     def test_pause_correction_only_matches_exact_pingpong_source_silence(self):
         source_pauses = [{"start_seconds": 0.4, "end_seconds": 0.8, "duration_seconds": 0.4}]
