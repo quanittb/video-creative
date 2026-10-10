@@ -187,6 +187,99 @@ class VerticalAdsTests(unittest.TestCase):
         self.assertIn("[source_aligned_reference]", graph)
         self.assertIn("[0:v]fps=25,setpts=N/(25*TB)[musetalk]", graph)
 
+    def test_mouth_only_pause_frames_and_filter_are_bounded_by_decoded_video_frames(self):
+        audio_duration = 55.584
+        decoded_video_frames = 1388
+        pause = [{"start_seconds": 55.48, "end_seconds": audio_duration,
+                  "duration_seconds": audio_duration - 55.48}]
+
+        audio_timeline_frames = ads.pause_frame_indices(pause, audio_duration, 25)
+        video_timeline_frames = ads.pause_frame_indices(
+            pause, audio_duration, 25, frame_count=decoded_video_frames,
+        )
+        self.assertEqual(audio_timeline_frames, [1387, 1388, 1389])
+        self.assertEqual(video_timeline_frames, [1387])
+        audio_aligned = ads.source_aligned_pause_intervals(
+            pause, [{"start_seconds": 55.48, "end_seconds": 55.60}], audio_duration,
+            source_frame_count=2000, fps=25,
+        )
+        video_aligned = ads.source_aligned_pause_intervals(
+            pause, [{"start_seconds": 55.48, "end_seconds": 55.60}], audio_duration,
+            source_frame_count=2000, fps=25, output_frame_count=decoded_video_frames,
+        )
+        self.assertEqual(audio_aligned, [{"start_seconds": 55.48, "end_seconds": 55.584,
+                                          "duration_seconds": 0.104}])
+        self.assertEqual(video_aligned, [{"start_seconds": 55.48, "end_seconds": 55.52,
+                                          "duration_seconds": 0.04}])
+
+        graph = ads.build_mouth_only_pause_closure_filter(
+            audio_duration, 25, frame_count=decoded_video_frames,
+        )
+        self.assertEqual(graph.count("trim=end_frame=1388"), 3)
+        self.assertNotIn("trim=end_frame=1390", graph)
+        covered = ads.frame_indices_to_intervals(
+            [1387], audio_duration, 25, frame_count=decoded_video_frames,
+        )
+        self.assertEqual(covered, [{"start_seconds": 55.48, "end_seconds": 55.52,
+                                    "duration_seconds": 0.04}])
+        classified = ads.classify_uncovered_by_video_duration([{
+            "start_seconds": 55.48, "end_seconds": audio_duration,
+            "duration_seconds": audio_duration - 55.48, "reason": "mouth_mask_or_face_alignment_was_not_confident",
+        }], decoded_video_frames / 25.0)
+        self.assertEqual(classified, [
+            {"start_seconds": 55.48, "end_seconds": 55.52, "duration_seconds": 0.04,
+             "reason": "mouth_mask_or_face_alignment_was_not_confident"},
+            {"start_seconds": 55.52, "end_seconds": 55.584, "duration_seconds": 0.064,
+             "reason": "audio_pause_after_end_of_rendered_video"},
+        ])
+
+    def test_job_pause_frame_set_matches_decoded_video_timeline(self):
+        audio_duration = 55.584
+        decoded_video_frames = 1388
+        requested_intervals = [
+            (1.94, 2.86), (7.02, 7.90), (13.20, 14.08), (20.90, 21.80),
+            (30.88, 31.74), (39.64, 40.56), (47.88, 48.72), (50.74, 51.62),
+            (54.84, 55.584),
+        ]
+        intervals = [
+            {"start_seconds": start, "end_seconds": end, "duration_seconds": end - start}
+            for start, end in requested_intervals
+        ]
+
+        pause_frames = ads.pause_frame_indices(
+            intervals, audio_duration, 25, frame_count=decoded_video_frames,
+        )
+
+        self.assertEqual(len(pause_frames), 190)
+        self.assertIn(782, pause_frames)  # 31.28 seconds, within the 30.88–31.74 pause.
+        self.assertEqual(pause_frames[-1], 1387)
+        self.assertNotIn(1388, pause_frames)
+        self.assertNotIn(1389, pause_frames)
+
+        covered_intervals = ads.frame_indices_to_intervals(
+            pause_frames, audio_duration, 25, frame_count=decoded_video_frames,
+        )
+        coverage = ads.summarize_pause_coverage(
+            intervals, covered_intervals, decoded_video_frames / 25.0,
+            pause_frames, pause_frames,
+        )
+        self.assertEqual(coverage["pause_coverage_status"], "full")
+        self.assertEqual(coverage["uncorrected_output_pause_frame_indices"], [])
+        self.assertAlmostEqual(coverage["audio_tail_duration_seconds"], 0.064, places=6)
+        self.assertEqual(coverage["audio_tail_pause_intervals"], [{
+            "start_seconds": 55.52, "end_seconds": 55.584, "duration_seconds": 0.064,
+            "reason": "audio_pause_after_end_of_rendered_video",
+        }])
+        self.assertAlmostEqual(coverage["uncovered_duration_seconds"], 0.16, places=6)
+        self.assertAlmostEqual(
+            coverage["uncovered_duration_seconds"],
+            sum(item["duration_seconds"] for item in coverage["video_uncovered_intervals"]), places=6,
+        )
+        self.assertTrue(all(
+            item["reason"] != "audio_pause_after_end_of_rendered_video"
+            for item in coverage["video_uncovered_intervals"]
+        ))
+
     def test_mouth_only_parser_mask_and_donor_checks_are_conservative(self):
         if mouth_masks.cv2 is None or mouth_masks.np is None:
             self.skipTest("OpenCV/NumPy from the MuseTalk runtime are required for parser-mask checks")
@@ -234,7 +327,7 @@ class VerticalAdsTests(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertEqual(reason, "face_center_mismatch")
 
-    def test_mouth_only_extractor_writes_masks_only_for_confident_pause_frames(self):
+    def test_mouth_only_extractor_prefers_tighter_donor_and_reports_frame_diagnostics(self):
         if mouth_masks.cv2 is None or mouth_masks.np is None:
             self.skipTest("OpenCV/NumPy from the MuseTalk runtime are required for donor extraction checks")
         cv2, np = mouth_masks.cv2, mouth_masks.np
@@ -254,38 +347,88 @@ class VerticalAdsTests(unittest.TestCase):
                 finally:
                     writer.release()
 
-            write_video(reference_video, ((20, 40, 220), (20, 40, 220)))
-            write_video(rendered_video, ((80, 100, 120), (80, 100, 120)))
+            write_video(reference_video, ((20, 40, 220), (20, 40, 220), (20, 40, 220)))
+            write_video(rendered_video, ((80, 100, 120), (80, 100, 120), (80, 100, 120)))
 
-            closed_labels = np.zeros((height, width), dtype=np.uint8)
-            cv2.ellipse(closed_labels, (100, 90), (45, 60), 0, 0, 360, 1, -1)
-            closed_labels[121:125, 87:98] = 12
-            closed_labels[121:125, 98:113] = 13
-            closed_labels[122:124, 98:102] = 11
-            target_labels = closed_labels.copy()
+            tight_labels = np.zeros((height, width), dtype=np.uint8)
+            cv2.ellipse(tight_labels, (100, 90), (45, 60), 0, 0, 360, 1, -1)
+            tight_labels[121:125, 87:98] = 12
+            tight_labels[121:125, 98:113] = 13
+            more_open_labels = tight_labels.copy()
+            more_open_labels[121:124, 98:108] = 11
+            target_labels = tight_labels.copy()
             target_labels[120:130, 87:113] = 11
+            target_mask, target_geometry, _ = mouth_masks.build_feathered_mouth_mask(target_labels)
+            self.assertIsNotNone(target_mask)
+            tight_donor, _ = mouth_masks.describe_face_and_mouth(tight_labels)
+            open_donor, _ = mouth_masks.describe_face_and_mouth(more_open_labels)
+            self.assertIsNotNone(tight_donor)
+            self.assertIsNotNone(open_donor)
+            tight_allowed, tight_score, _ = mouth_masks.compare_face_geometry(target_geometry, tight_donor, width, height)
+            open_allowed, open_score, _ = mouth_masks.compare_face_geometry(target_geometry, open_donor, width, height)
+            self.assertTrue(tight_allowed)
+            self.assertTrue(open_allowed)
+            self.assertLess(tight_donor["inner_mouth_fraction"], open_donor["inner_mouth_fraction"])
+            self.assertLessEqual(open_donor["inner_mouth_fraction"], mouth_masks.MAX_INNER_MOUTH_FRACTION)
+            self.assertAlmostEqual(tight_score, open_score, places=6)
             request_path = root / "request.json"
             request_path.write_text(json.dumps({
                 "fps": 25,
                 "width": width,
                 "height": height,
-                "output_frame_count": 2,
-                "quiet_source_frame_indices": [0],
-                "output_pause_frames": [{"output_frame_index": 1, "exact_source_frame_index": 1}],
+                "output_frame_count": 3,
+                "quiet_source_frame_indices": [0, 1],
+                "output_pause_frames": [
+                    {"output_frame_index": 1, "exact_source_frame_index": 1},
+                    {"output_frame_index": 2, "exact_source_frame_index": 2},
+                ],
             }), encoding="utf-8")
             mask_dir, donor_dir = root / "masks", root / "donors"
             report_path = root / "report.json"
-            with mock.patch.object(mouth_masks, "_raw_label_map", side_effect=[closed_labels, target_labels]):
+            with mock.patch.object(
+                mouth_masks, "_raw_label_map", side_effect=[tight_labels, more_open_labels, target_labels, np.zeros_like(tight_labels)],
+            ):
                 report = mouth_masks.run_extraction(
                     rendered_video, reference_video, mask_dir, donor_dir, report_path, request_path,
                     parser=object(), torch=object(),
                 )
 
-            self.assertEqual(report["status"], "applied")
+            self.assertEqual(report["status"], "partially_applied")
+            self.assertEqual(report["coverage_status"], "partial")
             self.assertEqual(report["corrected_output_frame_indices"], [1])
+            self.assertEqual(report["uncorrected_output_pause_frame_indices"], [2])
+            self.assertEqual(report["uncovered_output_pause_frame_count"], 1)
+            self.assertEqual(report["selected_donor_by_output_frame"], {"1": 0})
             self.assertEqual(report["selected_donor_frame_counts"], {"0": 1})
+            self.assertIn("patch preparation only", report["diagnostic_scope"])
+            prepared, skipped = report["frame_diagnostics"]
+            self.assertEqual(prepared["output_frame_index"], 1)
+            self.assertEqual(prepared["exact_source_frame_index"], 1)
+            self.assertEqual(prepared["timestamp_seconds"], 0.04)
+            self.assertEqual(prepared["frame_interval_seconds"], [0.04, 0.08])
+            self.assertEqual(prepared["status"], "patch_prepared")
+            self.assertTrue(prepared["patch_prepared"])
+            self.assertIsNone(prepared["skip_reason"])
+            self.assertIsNotNone(prepared["target_geometry"]["face_bbox"])
+            self.assertIsNotNone(prepared["target_geometry"]["mouth_bbox"])
+            self.assertGreater(prepared["mask_pixel_count"], 0)
+            self.assertEqual(prepared["alpha_written_pixel_count"], prepared["mask_pixel_count"])
+            self.assertEqual(prepared["selected_donor_frame_index"], 0)
+            donor_metric = prepared["selected_donor_closed_mouth_metric"]
+            self.assertEqual(donor_metric["name"], "inner_mouth_fraction")
+            self.assertTrue(donor_metric["passed"])
+            self.assertLessEqual(donor_metric["value"], donor_metric["maximum_closed_threshold"])
+            self.assertEqual(prepared["selected_donor_geometry_score"], round(tight_score, 6))
+            self.assertEqual(skipped["output_frame_index"], 2)
+            self.assertEqual(skipped["exact_source_frame_index"], 2)
+            self.assertEqual(skipped["timestamp_seconds"], 0.08)
+            self.assertFalse(skipped["patch_prepared"])
+            self.assertEqual(skipped["skip_reason"], "target_face_skin_not_detected")
+            self.assertIsNone(skipped["target_geometry"])
+            self.assertEqual(skipped["mask_pixel_count"], 0)
             self.assertEqual(np.count_nonzero(cv2.imread(str(mask_dir / "00000000.png"), cv2.IMREAD_GRAYSCALE)), 0)
             self.assertGreater(np.count_nonzero(cv2.imread(str(mask_dir / "00000001.png"), cv2.IMREAD_GRAYSCALE)), 0)
+            self.assertEqual(np.count_nonzero(cv2.imread(str(mask_dir / "00000002.png"), cv2.IMREAD_GRAYSCALE)), 0)
             donor = cv2.imread(str(donor_dir / "00000001.png"), cv2.IMREAD_COLOR)
             self.assertIsNotNone(donor)
             self.assertLess(int(donor[40, 40, 0]), 50,
@@ -311,9 +454,9 @@ class VerticalAdsTests(unittest.TestCase):
             subprocess.run([
                 FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo",
                 "-pixel_format", "rgb24", "-video_size", "64x64", "-framerate", "25",
-                "-i", str(source_raw), "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000:duration=0.16",
+                "-i", str(source_raw), "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000:duration=0.20",
                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "0", "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "64k", "-shortest", str(source),
+                "-c:a", "aac", "-b:a", "64k", str(source),
             ], check=True)
             for index in range(4):
                 donor = donor_dir / ("{:08d}.ppm".format(index))
@@ -324,12 +467,12 @@ class VerticalAdsTests(unittest.TestCase):
                         for x in range(27, 37):
                             alpha[y * 64 + x] = 255
                 (alpha_dir / ("{:08d}.pgm".format(index))).write_bytes(b"P5\n64 64\n255\n" + alpha)
-            graph = ads.build_mouth_only_pause_closure_filter(0.16, 25)
+            graph = ads.build_mouth_only_pause_closure_filter(0.20, 25, frame_count=4)
             common_command = [
                 FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
                 "-framerate", "25", "-start_number", "0", "-i", str(donor_dir / "%08d.ppm"),
                 "-framerate", "25", "-start_number", "0", "-i", str(alpha_dir / "%08d.pgm"),
-                "-filter_complex", graph, "-map", "[closed]", "-map", "0:a:0", "-t", "0.16",
+                "-filter_complex", graph, "-map", "[closed]", "-map", "0:a:0", "-t", "0.20",
                 "-c:a", "copy",
             ]
             result = subprocess.run(
@@ -337,6 +480,27 @@ class VerticalAdsTests(unittest.TestCase):
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(ads.count_video_frames(lossless_output, FFPROBE), 4,
+                             "output video must stop at the four decoded source frames, not grow to match longer audio")
+            source_info = ads.probe_media(source, FFPROBE)
+            source_audio = ads.stream_by_type(source_info, "audio")
+            lossless_info = ads.probe_media(lossless_output, FFPROBE)
+            lossless_audio = ads.stream_by_type(lossless_info, "audio")
+            self.assertIsNotNone(source_audio)
+            self.assertIsNotNone(lossless_audio)
+
+            def audio_packet_hashes(path: Path) -> list[str]:
+                payload = json.loads(subprocess.check_output([
+                    FFPROBE, "-v", "error", "-select_streams", "a:0", "-show_packets",
+                    "-show_data_hash", "sha256", "-show_entries", "packet=data_hash", "-of", "json", str(path),
+                ], text=True))
+                return [packet["data_hash"] for packet in payload["packets"]]
+
+            self.assertEqual(audio_packet_hashes(lossless_output), audio_packet_hashes(source),
+                             "stream-copy must preserve every AAC packet, even when Matroska rounds its duration")
+            self.assertLessEqual(abs(ads.media_duration(lossless_info, lossless_audio)
+                                     - ads.media_duration(source_info, source_audio)), 0.07,
+                                 "container duration may round to the next AAC packet boundary")
 
             result = subprocess.run(
                 common_command + ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
@@ -443,6 +607,56 @@ class VerticalAdsTests(unittest.TestCase):
             audio.write_bytes(b"tampered output wav")
             with self.assertRaisesRegex(ValueError, "WAV unshifted"):
                 reprocess_pause._verified_job_inputs(job, base)
+
+    def test_reprocess_cli_reports_partial_pause_coverage_and_uncovered_frames(self):
+        partial_result = {
+            "reference_policy": "verified_quiet_source_mouth_donor_bank",
+            "correction_region": "mouth-only",
+            "job_directory": ".",
+            "corrected_intermediate": "native.mp4",
+            "final_output": "final.mp4",
+            "pause_correction": {
+                "status": "partially_applied",
+                "pause_coverage_status": "partial",
+                "corrected_pause_frame_count": 189,
+                "requested_output_pause_frame_count": 190,
+                "pause_frame_coverage_ratio": 189 / 190,
+                "covered_duration_seconds": 7.56,
+                "uncovered_duration_seconds": 0.04,
+                "audio_tail_duration_seconds": 0.064,
+                "video_uncovered_intervals": [{
+                    "start_seconds": 31.28, "end_seconds": 31.32, "duration_seconds": 0.04,
+                    "reason": "mouth_mask_or_face_alignment_was_not_confident",
+                }],
+                "audio_tail_pause_intervals": [{
+                    "start_seconds": 55.52, "end_seconds": 55.584, "duration_seconds": 0.064,
+                    "reason": "audio_pause_after_end_of_rendered_video",
+                }],
+                "uncovered_intervals": [{
+                    "start_seconds": 31.28, "end_seconds": 31.32, "duration_seconds": 0.04,
+                    "reason": "mouth_mask_or_face_alignment_was_not_confident",
+                }, {
+                    "start_seconds": 55.52, "end_seconds": 55.584, "duration_seconds": 0.064,
+                    "reason": "audio_pause_after_end_of_rendered_video",
+                }],
+                "uncorrected_output_pause_frame_indices": [782],
+                "pause_frame_indices_outside_rendered_video": [1388, 1389],
+            },
+        }
+        stdout = io.StringIO()
+        with mock.patch.object(reprocess_pause, "reprocess", return_value=partial_result), contextlib.redirect_stdout(stdout):
+            status = reprocess_pause.main([
+                "--job-dir", "job", "--motion-base", "motion.mp4", "--pause-correction-region", "mouth-only",
+            ])
+        self.assertEqual(status, 0)
+        output = stdout.getvalue()
+        self.assertIn("độ phủ frame pause trong video một phần. Frame có patch đã composite: 189/190 (99.5%)", output)
+        self.assertIn("chưa xác nhận trực quan miệng đã khép tự nhiên", output)
+        self.assertIn("Pause-time bên trong video nằm ngoài patch frame đầy đủ: 0.040s", output)
+        self.assertIn("31.280–31.320s", output)
+        self.assertIn("[782]", output)
+        self.assertIn("[1388, 1389]", output)
+        self.assertIn("Audio pause nằm sau frame video cuối: 0.064s qua 1 đoạn", output)
 
     def test_offline_reprocess_refuses_old_full_frame_donor_without_original_motion_base(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -931,6 +1145,27 @@ class VerticalAdsTests(unittest.TestCase):
             self._video(bad, .5, fps=30)
             with self.assertRaisesRegex(ValueError, "25 FPS"):
                 ads.export_hd_video(bad, root / "bad_hd.mp4", FFMPEG, FFPROBE, .5, root / "bad.log")
+
+    @unittest.skipUnless(FFMPEG and FFPROBE, "FFmpeg unavailable")
+    def test_hd_export_keeps_decoded_video_frames_when_audio_runs_longer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, output = root / "short_video_long_audio.mp4", root / "short_video_long_audio_hd.mp4"
+            self._ffmpeg([
+                "-f", "lavfi", "-i", "testsrc=size=64x80:rate=25:duration=0.16",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000:duration=0.20",
+                "-frames:v", "4", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "64k", "-t", "0.20", str(source),
+            ])
+            self.assertEqual(ads.count_video_frames(source, FFPROBE), 4)
+            with contextlib.redirect_stdout(io.StringIO()):
+                _, record = ads.export_hd_video(
+                    source, output, FFMPEG, FFPROBE, 0.20, root / "short_video_long_audio.log",
+                )
+            self.assertEqual(ads.count_video_frames(output, FFPROBE), 4)
+            self.assertEqual(record["source_decoded_frame_count"], 4)
+            self.assertEqual(record["output_decoded_frame_count"], 4)
+            self.assertTrue(record["ffprobe_checks"]["decoded_frame_count_preserved"])
 
     @unittest.skipUnless(FFMPEG and FFPROBE, "FFmpeg unavailable")
     def test_real_cached_controller_stub_backend_benchmark_and_calibration(self):

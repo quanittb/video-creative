@@ -184,15 +184,20 @@ def source_aligned_pause_intervals(
     output_duration_seconds: float,
     source_frame_count: int,
     fps: int = FPS,
+    output_frame_count: Optional[int] = None,
 ) -> List[Dict[str, float]]:
     """Find output pause frames whose exact MuseTalk ping-pong source frame is also silent."""
     if source_frame_count < 1 or fps < 1 or not math.isfinite(output_duration_seconds) or output_duration_seconds <= 0:
         raise ValueError("Source-aligned pauses require valid source frames, FPS and duration.")
-    output_frame_count = int(math.ceil(output_duration_seconds * fps - 1e-9))
+    if output_frame_count is None:
+        output_frame_count = int(math.ceil(output_duration_seconds * fps - 1e-9))
+    elif output_frame_count < 0:
+        raise ValueError("Output video frame count cannot be negative.")
+    timeline_duration = min(output_duration_seconds, output_frame_count / float(fps))
     aligned_mask: List[bool] = []
     for output_index in range(output_frame_count):
         output_start = output_index / float(fps)
-        output_end = min((output_index + 1) / float(fps), output_duration_seconds)
+        output_end = min((output_index + 1) / float(fps), timeline_duration)
         output_is_pause = any(
             float(interval["start_seconds"]) <= output_start + 1e-9
             and float(interval["end_seconds"]) >= output_end - 1e-9
@@ -215,7 +220,7 @@ def source_aligned_pause_intervals(
             run_start = output_index
         elif not is_aligned and run_start is not None:
             start = run_start / float(fps)
-            end = min(output_index / float(fps), output_duration_seconds)
+            end = min(output_index / float(fps), timeline_duration)
             aligned.append({"start_seconds": round(start, 6), "end_seconds": round(end, 6),
                             "duration_seconds": round(end - start, 6)})
             run_start = None
@@ -224,15 +229,20 @@ def source_aligned_pause_intervals(
 
 def align_pause_intervals_to_frames(
     intervals: Sequence[Mapping[str, float]], duration_seconds: float, fps: int = FPS,
+    frame_count: Optional[int] = None,
 ) -> List[Dict[str, float]]:
     """Keep only output frames fully enclosed by detected pauses; speech-edge frames stay untouched."""
     if fps < 1 or not math.isfinite(duration_seconds) or duration_seconds <= 0:
         raise ValueError("Pause frame alignment requires valid FPS and duration.")
-    frame_count = int(math.ceil(duration_seconds * fps - 1e-9))
+    if frame_count is None:
+        frame_count = int(math.ceil(duration_seconds * fps - 1e-9))
+    elif frame_count < 0:
+        raise ValueError("Video frame count cannot be negative.")
+    timeline_duration = min(duration_seconds, frame_count / float(fps))
     mask = []
     for frame_index in range(frame_count):
         start = frame_index / float(fps)
-        end = min((frame_index + 1) / float(fps), duration_seconds)
+        end = min((frame_index + 1) / float(fps), timeline_duration)
         mask.append(end > start and any(
             float(interval["start_seconds"]) <= start + 1e-9
             and float(interval["end_seconds"]) >= end - 1e-9
@@ -245,7 +255,7 @@ def align_pause_intervals_to_frames(
             run_start = frame_index
         elif not is_pause and run_start is not None:
             start = run_start / float(fps)
-            end = min(frame_index / float(fps), duration_seconds)
+            end = min(frame_index / float(fps), timeline_duration)
             aligned.append({"start_seconds": round(start, 6), "end_seconds": round(end, 6),
                             "duration_seconds": round(end - start, 6)})
             run_start = None
@@ -254,14 +264,19 @@ def align_pause_intervals_to_frames(
 
 def pause_frame_indices(
     intervals: Sequence[Mapping[str, float]], duration_seconds: float, fps: int = FPS,
+    frame_count: Optional[int] = None,
 ) -> List[int]:
     """Return only whole output frames enclosed by detected pause intervals."""
-    frame_count = int(math.ceil(duration_seconds * fps - 1e-9))
+    if frame_count is None:
+        frame_count = int(math.ceil(duration_seconds * fps - 1e-9))
+    elif frame_count < 0:
+        raise ValueError("Video frame count cannot be negative.")
+    timeline_duration = min(duration_seconds, frame_count / float(fps))
     return [
         frame_index for frame_index in range(frame_count)
         if any(
             float(interval["start_seconds"]) <= frame_index / float(fps) + 1e-9
-            and float(interval["end_seconds"]) >= min((frame_index + 1) / float(fps), duration_seconds) - 1e-9
+            and float(interval["end_seconds"]) >= min((frame_index + 1) / float(fps), timeline_duration) - 1e-9
             for interval in intervals
         )
     ]
@@ -283,17 +298,20 @@ def quiet_source_frame_indices(
 
 def frame_indices_to_intervals(
     frame_indices: Sequence[int], duration_seconds: float, fps: int = FPS,
+    frame_count: Optional[int] = None,
 ) -> List[Dict[str, float]]:
     """Coalesce corrected output frames into reportable pause coverage runs."""
     indices = sorted(set(int(index) for index in frame_indices))
     if not indices:
         return []
+    timeline_duration = (min(duration_seconds, frame_count / float(fps))
+                         if frame_count is not None else duration_seconds)
     intervals: List[Dict[str, float]] = []
     run_start = previous = indices[0]
     for index in indices[1:] + [indices[-1] + 2]:
         if index != previous + 1:
             start = run_start / float(fps)
-            end = min((previous + 1) / float(fps), duration_seconds)
+            end = min((previous + 1) / float(fps), timeline_duration)
             intervals.append({"start_seconds": round(start, 6), "end_seconds": round(end, 6),
                               "duration_seconds": round(max(0.0, end - start), 6)})
             run_start = index
@@ -324,6 +342,74 @@ def subtract_pause_intervals(
             remainders.append({"start_seconds": round(cursor, 6), "end_seconds": round(end, 6),
                                "duration_seconds": round(end - cursor, 6), "reason": reason})
     return remainders
+
+
+def classify_uncovered_by_video_duration(
+    intervals: Sequence[Mapping[str, Any]], video_duration_seconds: float,
+) -> List[Dict[str, Any]]:
+    """Separate uncorrected pause time from audio that has no corresponding video frame."""
+    classified: List[Dict[str, Any]] = []
+    for item in intervals:
+        start = float(item["start_seconds"])
+        end = float(item["end_seconds"])
+        boundary = min(max(0.0, video_duration_seconds), end)
+        if start < boundary:
+            in_video = dict(item)
+            in_video["end_seconds"] = round(boundary, 6)
+            in_video["duration_seconds"] = round(boundary - start, 6)
+            classified.append(in_video)
+        if end > max(start, video_duration_seconds):
+            beyond_video = dict(item)
+            beyond_video.update({
+                "start_seconds": round(max(start, video_duration_seconds), 6),
+                "duration_seconds": round(end - max(start, video_duration_seconds), 6),
+                "reason": "audio_pause_after_end_of_rendered_video",
+            })
+            classified.append(beyond_video)
+    return classified
+
+
+def summarize_pause_coverage(
+    requested_intervals: Sequence[Mapping[str, float]],
+    covered_intervals: Sequence[Mapping[str, float]],
+    video_duration_seconds: float,
+    requested_frame_indices: Sequence[int],
+    corrected_frame_indices: Sequence[int],
+) -> Dict[str, Any]:
+    """Keep audio-only tail diagnostics separate from frame-backed video coverage."""
+    uncovered = classify_uncovered_by_video_duration(
+        subtract_pause_intervals(
+            requested_intervals, covered_intervals, "mouth_mask_or_face_alignment_was_not_confident",
+        ),
+        video_duration_seconds,
+    )
+    video_uncovered = [
+        item for item in uncovered if item.get("reason") != "audio_pause_after_end_of_rendered_video"
+    ]
+    audio_tail = [
+        item for item in uncovered if item.get("reason") == "audio_pause_after_end_of_rendered_video"
+    ]
+    requested_frames = set(requested_frame_indices)
+    corrected_frames = set(corrected_frame_indices)
+    missing_frames = sorted(requested_frames - corrected_frames)
+    if not requested_frames:
+        frame_status = "none"
+    elif not missing_frames:
+        frame_status = "full"
+    elif len(missing_frames) == len(requested_frames):
+        frame_status = "none"
+    else:
+        frame_status = "partial"
+    return {
+        "uncovered_intervals": uncovered,
+        "video_uncovered_intervals": video_uncovered,
+        "audio_tail_pause_intervals": audio_tail,
+        "video_uncovered_duration_seconds": round(sum(item["duration_seconds"] for item in video_uncovered), 6),
+        "uncovered_duration_seconds": round(sum(item["duration_seconds"] for item in video_uncovered), 6),
+        "audio_tail_duration_seconds": round(sum(item["duration_seconds"] for item in audio_tail), 6),
+        "pause_coverage_status": frame_status,
+        "uncorrected_output_pause_frame_indices": missing_frames,
+    }
 
 
 def validate_audio_offset_ms(value: int) -> int:
@@ -505,7 +591,7 @@ def count_video_frames(path: Path, ffprobe: str) -> int:
     except ValueError as error:
         raise RuntimeError("ffprobe did not return a decoded frame count for {}.".format(path)) from error
     if frame_count < 2:
-        raise ValueError("Motion base needs at least two decoded frames for ping-pong mapping.")
+        raise ValueError("Video needs at least two decoded frames for pause correction.")
     return frame_count
 
 
@@ -568,11 +654,14 @@ def build_pause_closure_filter(
              duration=duration_seconds, alpha=alpha)
 
 
-def build_mouth_only_pause_closure_filter(duration_seconds: float, fps: int = FPS) -> str:
+def build_mouth_only_pause_closure_filter(
+    duration_seconds: float, fps: int = FPS, *, frame_count: int,
+) -> str:
     """Use an output-timed donor/mask sequence so only parsed lips are replaced."""
     if fps < 1 or not math.isfinite(duration_seconds) or duration_seconds <= 0:
         raise ValueError("Mouth-only pause correction requires valid FPS and duration.")
-    frame_count = int(math.ceil(duration_seconds * fps - 1e-9))
+    if frame_count < 1:
+        raise ValueError("Mouth-only pause correction requires at least one video frame.")
     return (
         "[0:v]fps={fps},trim=end_frame={frames},setpts=N/({fps}*TB),format=rgb24[musetalk];"
         "[1:v]fps={fps},trim=end_frame={frames},setpts=N/({fps}*TB),format=rgb24[closed_donor];"
@@ -606,10 +695,18 @@ def apply_pause_mouth_closure(
     reference_path = reference_audio or normalized_audio
     source_pause_intervals = detect_silence_intervals(reference_path, min_duration_seconds=1.0 / fps)
     frame_count = count_video_frames(reference_motion_video, ffprobe)
+    rendered_frame_count = count_video_frames(rendered_video, ffprobe)
     aligned_intervals = source_aligned_pause_intervals(
         intervals, source_pause_intervals, duration_seconds, frame_count, fps,
+        output_frame_count=rendered_frame_count,
     )
-    output_pause_frames = pause_frame_indices(intervals, duration_seconds, fps)
+    output_pause_frames = pause_frame_indices(
+        intervals, duration_seconds, fps, frame_count=rendered_frame_count,
+    )
+    # Audio-duration-based indices are retained only to report pause frames
+    # whose audio extends past the decoded visual stream; never process them.
+    audio_pause_frames = pause_frame_indices(intervals, duration_seconds, fps)
+    pause_frames_beyond_video = sorted(set(audio_pause_frames) - set(output_pause_frames))
     source_donor_frames = quiet_source_frame_indices(source_pause_intervals, frame_count, fps)
     manifest_hash = str((reference_audio_provenance or {}).get("manifest_audio_sha256") or "")
     source_hash = str((reference_audio_provenance or {}).get("source_sha256") or "")
@@ -636,6 +733,15 @@ def apply_pause_mouth_closure(
     uncovered_intervals = subtract_pause_intervals(
         intervals, initial_coverage, uncovered_reason,
     )
+    uncovered_intervals = classify_uncovered_by_video_duration(
+        uncovered_intervals, min(duration_seconds, rendered_frame_count / float(fps)),
+    )
+    video_uncovered_intervals = [
+        item for item in uncovered_intervals if item.get("reason") != "audio_pause_after_end_of_rendered_video"
+    ]
+    audio_tail_pause_intervals = [
+        item for item in uncovered_intervals if item.get("reason") == "audio_pause_after_end_of_rendered_video"
+    ]
     record: Dict[str, Any] = {
         "status": status,
         "correction_region": correction_region,
@@ -658,15 +764,23 @@ def apply_pause_mouth_closure(
         "pingpong_mapping": (
             "MuseTalk frame_list + reversed frame_list modulo mapping; only exact output/source timestamp matches are eligible"
             if correction_region == "full-frame" else
-            "MuseTalk frame_list + reversed frame_list is used only to identify a preferred exact donor; any fully verified quiet-source frame may be used when its conservative face geometry matches"
+            "MuseTalk frame_list + reversed frame_list records the exact source timestamp; among fully verified quiet-source donors passing unchanged face-geometry gates, select the smallest inner-mouth fraction, then the lowest geometry score"
         ),
         "requested_intervals": intervals,
         "reference_audio_pause_intervals": source_pause_intervals,
         "intervals": initial_coverage,
         "uncovered_intervals": uncovered_intervals,
-        "uncovered_duration_seconds": round(sum(item["duration_seconds"] for item in uncovered_intervals), 6),
+        "video_uncovered_intervals": video_uncovered_intervals,
+        "audio_tail_pause_intervals": audio_tail_pause_intervals,
+        "video_uncovered_duration_seconds": round(sum(item["duration_seconds"] for item in video_uncovered_intervals), 6),
+        "uncovered_duration_seconds": round(sum(item["duration_seconds"] for item in video_uncovered_intervals), 6),
+        "audio_tail_duration_seconds": round(sum(item["duration_seconds"] for item in audio_tail_pause_intervals), 6),
         "covered_duration_seconds": round(sum(item["duration_seconds"] for item in initial_coverage), 6),
         "requested_output_pause_frame_count": len(output_pause_frames),
+        "rendered_video_frame_count": rendered_frame_count,
+        "rendered_video_frame_duration_seconds": round(rendered_frame_count / float(fps), 6),
+        "pause_frame_indices_outside_rendered_video": pause_frames_beyond_video,
+        "pause_frame_count_outside_rendered_video": len(pause_frames_beyond_video),
         "verified_quiet_source_frame_indices": source_donor_frames,
         "verified_quiet_source_frame_count": len(source_donor_frames),
         "verified_quiet_source_duration_seconds": round(len(source_donor_frames) / float(fps), 6),
@@ -686,7 +800,7 @@ def apply_pause_mouth_closure(
             "policy": (
                 "frame_list + frame_list[::-1], modulo 2N, including duplicated turn endpoints"
                 if correction_region == "full-frame" else
-                "donor bank contains only source frames fully enclosed by verified source-audio pauses; exact ping-pong source frame wins when geometry also passes"
+                "donor bank contains only verified quiet-source frames; within existing face-geometry gates, lowest inner-mouth fraction wins, with geometry score as tie-breaker"
             ),
         } if provenance_verified else {
             "status": "unavailable", "reason": "Echo manifest/source audio identity was not verified",
@@ -724,7 +838,7 @@ def apply_pause_mouth_closure(
     mouth_temp_root: Optional[Path] = None
     try:
         if correction_region == "mouth-only":
-            output_frame_count = int(math.ceil(duration_seconds * fps - 1e-9))
+            output_frame_count = int(rendered_frame_count or 0)
             pause_frame_set = set(output_pause_frames)
             request = {
                 "fps": fps,
@@ -767,33 +881,52 @@ def apply_pause_mouth_closure(
             mouth_report["helper_process_wall_seconds"] = round(helper_seconds, 3)
             record["mouth_mask_extraction"] = mouth_report
             corrected_frame_indices = [int(index) for index in mouth_report.get("corrected_output_frame_indices", [])]
-            mouth_coverage_intervals = frame_indices_to_intervals(corrected_frame_indices, duration_seconds, fps)
+            mouth_coverage_intervals = frame_indices_to_intervals(
+                corrected_frame_indices, duration_seconds, fps, frame_count=output_frame_count,
+            )
             record["intervals"] = mouth_coverage_intervals
             record["covered_duration_seconds"] = round(
                 sum(item["duration_seconds"] for item in mouth_coverage_intervals), 6,
             )
-            record["uncovered_intervals"] = subtract_pause_intervals(
-                intervals, mouth_coverage_intervals, "mouth_mask_or_face_alignment_was_not_confident",
+            coverage = summarize_pause_coverage(
+                intervals, mouth_coverage_intervals,
+                min(duration_seconds, output_frame_count / float(fps)),
+                output_pause_frames, corrected_frame_indices,
             )
-            record["uncovered_duration_seconds"] = round(
-                sum(item["duration_seconds"] for item in record["uncovered_intervals"]), 6,
+            record.update(coverage)
+            record["video_pause_frame_coverage_status"] = coverage["pause_coverage_status"]
+            record["pause_coverage_basis"] = (
+                "all requested whole pause frames have a prepared and composited donor/mask patch; "
+                "audio-only tail is reported separately and does not count against video-frame coverage"
             )
             record["corrected_pause_frame_count"] = len(corrected_frame_indices)
             record["corrected_pause_frame_fraction"] = mouth_report.get("corrected_pause_frame_fraction", 0.0)
+            record["status"] = mouth_report.get("status", record["status"])
+            record["pause_frame_coverage_status"] = mouth_report.get("coverage_status", "unknown")
+            record["pause_frame_coverage_ratio"] = mouth_report.get("corrected_pause_frame_fraction", 0.0)
+            record["uncovered_output_pause_frame_count"] = mouth_report.get(
+                "uncovered_output_pause_frame_count", len(output_pause_frames) - len(corrected_frame_indices),
+            )
             record["uncorrected_output_pause_frame_indices"] = mouth_report.get(
                 "uncorrected_output_pause_frame_indices", [],
             )
+            record["selected_donor_by_output_frame"] = mouth_report.get("selected_donor_by_output_frame", {})
             record["valid_closed_donor_frames"] = mouth_report.get("valid_closed_donor_frames", 0)
             record["selected_donor_frame_counts"] = mouth_report.get("selected_donor_frame_counts", {})
             record["audio_unchanged"] = True
             record["head_body_motion_policy"] = "donor pixels are confined to the per-frame semantic lip alpha; the MuseTalk head/body frame remains the base"
             if not corrected_frame_indices:
                 record["status"] = "no_confident_mouth_donor_alignment"
+                record["pause_coverage_status"] = "none"
+                record["video_pause_frame_coverage_status"] = "none"
+                record["pause_frame_coverage_status"] = "none"
                 record["fallback"] = "none; all unaligned pause frames and all speech frames remain unchanged"
                 shutil.rmtree(mouth_temp_root, ignore_errors=True)
                 mouth_temp_root = None
                 return record
-            graph = build_mouth_only_pause_closure_filter(duration_seconds, fps)
+            graph = build_mouth_only_pause_closure_filter(
+                duration_seconds, fps, frame_count=output_frame_count,
+            )
             frame_pattern = "%08d.png"
             command = [
                 ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(rendered_video),
@@ -829,8 +962,21 @@ def apply_pause_mouth_closure(
         actual_fps = echo.parse_fraction(str(corrected_video.get("avg_frame_rate") or "0/1"))
         source_audio_duration = media_duration(rendered_info, source_audio)
         corrected_audio_duration = media_duration(corrected_info, corrected_audio)
+        record["input_video_stream_duration_seconds"] = round(media_duration(rendered_info, source_video), 6)
+        record["input_audio_video_duration_delta_seconds"] = round(
+            source_audio_duration - media_duration(rendered_info, source_video), 6,
+        )
         if corrected_dims != video_dims or abs(actual_fps - fps) > 0.01:
             raise ValueError("Pause-corrected video changed dimensions or FPS unexpectedly.")
+        if correction_region == "mouth-only":
+            corrected_frame_count = count_video_frames(temporary, ffprobe)
+            if corrected_frame_count != rendered_frame_count:
+                raise ValueError(
+                    "Mouth-only correction changed decoded video frame count: source={} output={}.".format(
+                        rendered_frame_count, corrected_frame_count,
+                    )
+                )
+            record["corrected_video_frame_count"] = corrected_frame_count
         if str(corrected_audio.get("codec_name")) != str(source_audio.get("codec_name")):
             raise ValueError("Pause correction changed the MuseTalk audio codec despite stream-copy mode.")
         if abs(corrected_audio_duration - source_audio_duration) > 0.01:
@@ -969,6 +1115,7 @@ def build_export_command(
     source_video: Mapping[str, Any],
     source_audio: Mapping[str, Any],
     ffmpeg: str,
+    source_frame_count: int,
 ) -> Tuple[List[str], str]:
     width = int(source_video.get("width", 0))
     height = int(source_video.get("height", 0))
@@ -985,7 +1132,8 @@ def build_export_command(
         command.extend(("-map", "0:v:0"))
     command.extend((
         "-map", "0:a:0", "-map_metadata", "0", "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-        "-pix_fmt", "yuv420p", "-fps_mode", "passthrough", "-video_track_timescale", "25000",
+        "-pix_fmt", "yuv420p", "-fps_mode", "passthrough", "-frames:v", str(source_frame_count),
+        "-video_track_timescale", "25000",
     ))
     command.extend(audio_args)
     command.extend(("-movflags", "+faststart", str(destination)))
@@ -1037,6 +1185,7 @@ def export_hd_video(
     source_audio = stream_by_type(source_data, "audio")
     if source_video is None or source_audio is None:
         raise ValueError("MuseTalk intermediate phải có cả video và audio trước khi xuất HD.")
+    source_frame_count = count_video_frames(source, ffprobe)
     source_fps = echo.parse_fraction(str(source_video.get("avg_frame_rate") or "0/1"))
     if abs(source_fps - FPS) > 0.01:
         raise ValueError("Intermediate không phải 25 FPS; không tự đổi FPS để che lỗi đồng bộ.")
@@ -1049,7 +1198,9 @@ def export_hd_video(
     temporary = destination.with_name("." + destination.stem + ".partial.mp4")
     if destination.exists() or temporary.exists():
         raise FileExistsError("Không ghi đè output/file tạm đã có: {}".format(destination))
-    command, framing_mode = build_export_command(source, temporary, source_video, source_audio, ffmpeg)
+    command, framing_mode = build_export_command(
+        source, temporary, source_video, source_audio, ffmpeg, source_frame_count,
+    )
     code, encoder_seconds = run_live_command(command, job_log)
     if code != 0:
         raise RuntimeError("FFmpeg HD export thoát với mã {}; file tạm được giữ tại {}.".format(code, temporary))
@@ -1063,6 +1214,7 @@ def export_hd_video(
     video_seconds = media_duration(output_data, video)
     audio_seconds = media_duration(output_data, audio)
     actual_fps = echo.parse_fraction(str(video.get("avg_frame_rate") or video.get("r_frame_rate") or "0/1"))
+    output_frame_count = count_video_frames(temporary, ffprobe)
     video_codec = str(video.get("codec_name") or "")
     audio_codec = str(audio.get("codec_name") or "")
     sar = str(video.get("sample_aspect_ratio") or "")
@@ -1079,6 +1231,7 @@ def export_hd_video(
         "audio_duration": abs(audio_seconds - expected_duration) <= 0.16,
         "audio_video_aligned": abs(video_seconds - audio_seconds) <= 0.12,
         "duration_within_cap": video_seconds <= expected_duration + 0.16,
+        "decoded_frame_count_preserved": output_frame_count == source_frame_count,
     }
     if not all(checks.values()):
         raise ValueError("ffprobe HD validation failed: {}".format(checks))
@@ -1095,6 +1248,8 @@ def export_hd_video(
         "video_codec": video_codec,
         "pixel_format": pix_fmt,
         "audio_codec": audio_codec,
+        "source_decoded_frame_count": source_frame_count,
+        "output_decoded_frame_count": output_frame_count,
         "video_duration_seconds": round(video_seconds, 6),
         "audio_duration_seconds": round(audio_seconds, 6),
         "export_framing_mode": framing_mode,
@@ -1910,8 +2065,32 @@ def run_workflow(args: argparse.Namespace, job_dir: Path, report: Dict[str, Any]
                 musetalk_python=args.musetalk_python,
                 helper_log_path=job_dir / "logs" / ("mouth_mask_extraction_video_{}.log".format(index)),
             )
-            if closure_record["status"] == "applied":
+            if closure_record["status"] in ("applied", "partially_applied"):
                 muse_data["path"] = corrected_intermediate
+            if closure_record.get("correction_region") == "mouth-only":
+                coverage = closure_record.get("pause_coverage_status", "unknown")
+                corrected_count = closure_record.get("corrected_pause_frame_count", 0)
+                requested_count = closure_record.get("requested_output_pause_frame_count", 0)
+                fraction = closure_record.get("pause_frame_coverage_ratio", 0.0)
+                print("Mouth-only pause patches composited: {} ({}/{} in-video pause frames, {:.1%}); this does not visually validate mouth closure.".format(
+                    coverage.upper(), corrected_count, requested_count, fraction,
+                ))
+                video_gaps = closure_record.get("video_uncovered_intervals", [])
+                audio_tail = closure_record.get("audio_tail_pause_intervals", [])
+                print("Pause time inside the video outside composite patches: {:.3f}s across {} interval(s), including partial-frame boundaries.".format(
+                    closure_record.get("uncovered_duration_seconds", 0.0), len(video_gaps),
+                ))
+                print("Audio pause after video end: {:.3f}s across {} interval(s); audio remains unchanged.".format(
+                    closure_record.get("audio_tail_duration_seconds", 0.0), len(audio_tail),
+                ))
+                if closure_record.get("uncorrected_output_pause_frame_indices"):
+                    print("In-video pause frames without a prepared patch: {}".format(
+                        closure_record["uncorrected_output_pause_frame_indices"],
+                    ))
+                if closure_record.get("pause_frame_indices_outside_rendered_video"):
+                    print("Pause frame indices beyond rendered video (audio kept intact): {}".format(
+                        closure_record["pause_frame_indices_outside_rendered_video"],
+                    ))
         closure_wall = time.perf_counter() - closure_started
         closure_record["requested_policy"] = args.pause_mouth_closure
         closure_record["source_mouth_mode"] = source_mouth_mode or "unknown"

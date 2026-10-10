@@ -169,7 +169,7 @@ def reprocess(
         musetalk_python=musetalk_python,
         helper_log_path=job_dir / "logs" / "mouth_mask_extraction_reprocess.log",
     )
-    if correction["status"] != "applied":
+    if correction["status"] not in ("applied", "partially_applied"):
         report = {
             "status": "skipped",
             "reason": correction["status"],
@@ -189,7 +189,9 @@ def reprocess(
         logs / "hd_export_pause_{}_reprocessed.log".format(suffix),
     )
     report = {
-        "status": "complete",
+        "status": ("complete_with_partial_pause_coverage"
+                   if correction.get("pause_coverage_status") == "partial"
+                   or correction["status"] == "partially_applied" else "complete"),
         "correction_region": correction_region,
         "job_directory": str(job_dir),
         "source_video": str(inputs["rendered_video"]),
@@ -248,7 +250,63 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except Exception as error:
         print("ERROR: {}".format(error), file=sys.stderr)
         return 1
-    print("Reprocess thành công, không chạy lại Echo/MuseTalk (mapping: {}).".format(report["reference_policy"]))
+    correction = report["pause_correction"]
+    coverage = correction.get("pause_coverage_status")
+    if coverage is not None:
+        coverage_label = "đầy đủ" if coverage == "full" else "một phần" if coverage == "partial" else "không có frame nào"
+        corrected_count = int(correction.get("corrected_pause_frame_count", 0))
+        requested_count = int(correction.get("requested_output_pause_frame_count", 0))
+        ratio = float(correction.get("pause_frame_coverage_ratio", 0.0))
+        print("Reprocess xong, không chạy lại Echo/MuseTalk; độ phủ frame pause trong video {}. Frame có patch đã composite: {}/{} ({:.1%}); chưa xác nhận trực quan miệng đã khép tự nhiên.".format(
+            coverage_label, corrected_count, requested_count, ratio,
+        ))
+    else:
+        print("Reprocess thành công, không chạy lại Echo/MuseTalk (mapping: {}).".format(report["reference_policy"]))
+    all_uncovered = correction.get("uncovered_intervals") or []
+    video_uncovered = correction.get("video_uncovered_intervals")
+    if video_uncovered is None:
+        video_uncovered = [
+            item for item in all_uncovered
+            if item.get("reason") != "audio_pause_after_end_of_rendered_video"
+        ]
+    tail_intervals = correction.get("audio_tail_pause_intervals")
+    if tail_intervals is None:
+        tail_intervals = [
+            item for item in all_uncovered
+            if item.get("reason") == "audio_pause_after_end_of_rendered_video"
+        ]
+    classified_video_uncovered_seconds = sum(
+        float(item["duration_seconds"]) for item in video_uncovered
+    )
+    video_uncovered_seconds = float(correction.get(
+        "video_uncovered_duration_seconds", classified_video_uncovered_seconds,
+    ))
+    audio_tail_seconds = float(correction.get(
+        "audio_tail_duration_seconds",
+        sum(float(item["duration_seconds"]) for item in tail_intervals),
+    ))
+    print("Pause-time bên trong video nằm ngoài patch frame đầy đủ: {:.3f}s qua {} đoạn (có thể gồm biên pause ngắn hơn một frame).".format(
+        video_uncovered_seconds, len(video_uncovered),
+    ))
+    for interval in video_uncovered:
+        print("  {:.3f}–{:.3f}s ({:.3f}s): {}".format(
+            float(interval["start_seconds"]), float(interval["end_seconds"]),
+            float(interval["duration_seconds"]), interval.get("reason", "uncovered"),
+        ))
+    print("Audio pause nằm sau frame video cuối: {:.3f}s qua {} đoạn; audio được giữ nguyên.".format(
+        audio_tail_seconds, len(tail_intervals),
+    ))
+    for interval in tail_intervals:
+        print("  {:.3f}–{:.3f}s ({:.3f}s)".format(
+            float(interval["start_seconds"]), float(interval["end_seconds"]),
+            float(interval["duration_seconds"]),
+        ))
+    outside_video = correction.get("pause_frame_indices_outside_rendered_video") or []
+    if outside_video:
+        print("Pause frame index vượt số frame video (được giữ nguyên audio): {}".format(outside_video))
+    uncorrected_frames = correction.get("uncorrected_output_pause_frame_indices") or []
+    if uncorrected_frames:
+        print("In-video pause frame chưa có patch mask/donor: {}".format(uncorrected_frames))
     print("Native: {}".format(report["corrected_intermediate"]))
     print("Final: {}".format(report["final_output"]))
     report_name = "pause_mouth_only_reprocess_report.json" if report.get("correction_region") == "mouth-only" else "pause_reprocess_report.json"

@@ -206,6 +206,16 @@ def _read_frame(capture: Any, frame_index: int) -> Optional[np.ndarray]:
     return frame if ok and frame is not None else None
 
 
+def _geometry_report(descriptor: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+    if descriptor is None:
+        return None
+    keys = (
+        "face_bbox", "face_bbox_normalized", "mouth_bbox", "mouth_center_relative_to_face",
+        "mouth_size_relative_to_face", "mouth_area_pixels", "inner_mouth_fraction",
+    )
+    return {key: descriptor[key] for key in keys if key in descriptor}
+
+
 def _warp_donor_to_target(
     donor_frame: np.ndarray, donor_bbox: Sequence[int], target_bbox: Sequence[int],
 ) -> np.ndarray:
@@ -253,6 +263,27 @@ def run_extraction(
     selected_donors: Counter[int] = Counter()
     mask_areas: List[int] = []
     corrected_indices: List[int] = []
+    selected_donor_by_output_frame: Dict[str, int] = {}
+    frame_diagnostics: Dict[int, Dict[str, Any]] = {
+        output_index: {
+            "output_frame_index": output_index,
+            "timestamp_seconds": round(output_index / float(fps), 6),
+            "frame_interval_seconds": [round(output_index / float(fps), 6),
+                                       round((output_index + 1) / float(fps), 6)],
+            "exact_source_frame_index": int(item.get("exact_source_frame_index", -1)),
+            "patch_prepared": False,
+            "status": "skipped",
+            "skip_reason": "not_processed",
+            "target_geometry": None,
+            "mask_pixel_count": 0,
+            "alpha_written_pixel_count": 0,
+            "donor_alignment_rejection_reasons": {},
+            "selected_donor_frame_index": None,
+            "selected_donor_closed_mouth_metric": None,
+            "selected_donor_geometry_score": None,
+        }
+        for output_index, item in requests.items()
+    }
     corrected_frames = 0
     started = time.perf_counter()
     mask_directory.mkdir(parents=True, exist_ok=False)
@@ -282,38 +313,54 @@ def run_extraction(
         for output_index in range(output_frame_count):
             mask = zero_mask
             if output_index in requests:
+                diagnostic = frame_diagnostics[output_index]
                 target_frame = _read_frame(rendered_capture, output_index)
                 if target_frame is None or target_frame.shape[:2] != (height, width):
                     reasons["pause_output_frame_unreadable_or_wrong_size"] += 1
+                    diagnostic["skip_reason"] = "pause_output_frame_unreadable_or_wrong_size"
                 else:
                     try:
                         labels = _raw_label_map(parser, target_frame, torch)
                         target_mask, target_descriptor, reason = build_feathered_mouth_mask(labels)
                     except Exception as error:
-                        reasons["target_parser_error:" + type(error).__name__] += 1
-                        target_mask, target_descriptor, reason = None, None, "parser_error"
+                        target_mask, target_descriptor, reason = None, None, "parser_error:" + type(error).__name__
                     if target_mask is None or target_descriptor is None:
                         reasons["target_" + reason] += 1
+                        diagnostic["skip_reason"] = "target_" + reason
                     else:
-                        best: Optional[Tuple[float, int, np.ndarray, Dict[str, Any]]] = None
+                        diagnostic["target_geometry"] = _geometry_report(target_descriptor)
+                        diagnostic["mask_pixel_count"] = int(np.count_nonzero(target_mask))
+                        best: Optional[Tuple[float, float, int, np.ndarray, Dict[str, Any]]] = None
+                        alignment_rejections: Counter[str] = Counter()
                         for donor_index, (donor_frame, donor_descriptor) in donor_cache.items():
-                            # MuseTalk's native ping-pong frame is preferred when it
-                            # is itself a verified quiet/closed donor.
-                            exact_index = int(requests[output_index].get("exact_source_frame_index", -1))
-                            allowed, score, _ = compare_face_geometry(
+                            allowed, score, rejection_reason = compare_face_geometry(
                                 target_descriptor, donor_descriptor, width, height,
                             )
                             if not allowed:
+                                alignment_rejections[rejection_reason] += 1
                                 continue
-                            if donor_index == exact_index:
-                                score -= 1.0
-                            candidate = (score, donor_index, donor_frame, donor_descriptor)
-                            if best is None or candidate[0] < best[0]:
+                            inner_fraction = float(donor_descriptor.get("inner_mouth_fraction", 1.0))
+                            candidate = (inner_fraction, score, donor_index, donor_frame, donor_descriptor)
+                            if best is None or candidate[:3] < best[:3]:
                                 best = candidate
                         if best is None:
                             reasons["no_quiet_donor_with_confident_face_alignment"] += 1
+                            diagnostic["skip_reason"] = (
+                                "no_validated_closed_donor_frame_available" if not donor_cache
+                                else "no_donor_passed_face_geometry_gates"
+                            )
+                            diagnostic["donor_alignment_rejection_reasons"] = dict(sorted(alignment_rejections.items()))
                         else:
-                            _, donor_index, donor_frame, donor_descriptor = best
+                            _, geometry_score, donor_index, donor_frame, donor_descriptor = best
+                            diagnostic["selected_donor_frame_index"] = donor_index
+                            diagnostic["selected_donor_geometry_score"] = round(geometry_score, 6)
+                            donor_inner_fraction = float(donor_descriptor.get("inner_mouth_fraction", 1.0))
+                            diagnostic["selected_donor_closed_mouth_metric"] = {
+                                "name": "inner_mouth_fraction",
+                                "value": round(donor_inner_fraction, 6),
+                                "maximum_closed_threshold": MAX_INNER_MOUTH_FRACTION,
+                                "passed": is_closed_donor(donor_descriptor),
+                            }
                             aligned_donor = _warp_donor_to_target(
                                 donor_frame, donor_descriptor["face_bbox"], target_descriptor["face_bbox"],
                             )
@@ -331,13 +378,19 @@ def run_extraction(
                             if not cv2.imwrite(str(donor_path), aligned_donor):
                                 reasons["donor_patch_write_failed"] += 1
                                 mask = zero_mask
+                                diagnostic["skip_reason"] = "donor_patch_write_failed"
                                 if not cv2.imwrite(str(target_frame_path), zero_mask):
                                     raise RuntimeError("Could not write zero lip alpha after donor failure.")
                             else:
                                 corrected_frames += 1
                                 corrected_indices.append(output_index)
                                 selected_donors[donor_index] += 1
+                                selected_donor_by_output_frame[str(output_index)] = donor_index
                                 mask_areas.append(int(np.count_nonzero(mask)))
+                                diagnostic["patch_prepared"] = True
+                                diagnostic["status"] = "patch_prepared"
+                                diagnostic["skip_reason"] = None
+                                diagnostic["alpha_written_pixel_count"] = int(np.count_nonzero(mask))
             if output_index not in requests or not np.any(mask):
                 mask = zero_mask
                 path = mask_directory / ("{:08d}.png".format(output_index))
@@ -353,16 +406,27 @@ def run_extraction(
         reference_capture.release()
 
     donor_count = len(donor_cache)
+    coverage_status = ("none" if not corrected_frames else
+                       "full" if corrected_frames == len(requests) else "partial")
     report = {
-        "status": "applied" if corrected_frames else "no_confident_mouth_donor_alignment",
+        "status": ("applied" if coverage_status == "full" else
+                   "partially_applied" if coverage_status == "partial" else
+                   "no_confident_mouth_donor_alignment"),
+        "coverage_status": coverage_status,
         "parser": "MuseTalk FaceParsing.net raw argmax; labels 11, 12, 13; no extra model",
         "mask_region": "semantic lip classes, 3x3 dilation, 5x5 Gaussian feather sigma=0.9 at native resolution",
         "mask_alignment": "normalized face-box scale/translation plus mouth-center/width proxy; rejected above conservative thresholds",
         "donor_validation": "source frame lies fully within verified quiet-source interval and inner-mouth label 11 is <= {:.2f} of parsed lip mask".format(MAX_INNER_MOUTH_FRACTION),
+        "donor_selection_policy": "Keep the existing closed-mouth and face-geometry gates; rank geometry-valid quiet donors by lowest inner_mouth_fraction, then lowest normalized face-geometry score.",
+        "diagnostic_scope": "Per-frame records describe parser/donor patch preparation only; they do not visually validate that the output mouth appears closed or natural.",
+        "frame_time_basis": "timestamp_seconds is the output video frame start: output_frame_index / FPS; frame_interval_seconds gives its full 1/FPS interval.",
+        "frame_diagnostics": [frame_diagnostics[index] for index in sorted(frame_diagnostics)],
         "requested_output_pause_frames": len(requests),
         "corrected_output_pause_frames": corrected_frames,
         "corrected_output_frame_indices": corrected_indices,
         "corrected_pause_frame_fraction": round(corrected_frames / float(len(requests)), 6),
+        "uncovered_output_pause_frame_count": len(requests) - corrected_frames,
+        "selected_donor_by_output_frame": selected_donor_by_output_frame,
         "quiet_source_candidate_frames": len(source_candidates),
         "valid_closed_donor_frames": donor_count,
         "selected_donor_frame_count": sum(selected_donors.values()),
