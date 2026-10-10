@@ -56,9 +56,11 @@ MuseTalk upstream tạo Whisper audio features ở **50 Hz**, rồi lấy contex
 
 Offset `-40/0/+40 ms` được áp dụng **sau gate**, vì vậy khoảng pause trong conditioning audio dịch cùng lời nói. Final MP4 luôn nhận lại audio chuẩn hóa gốc, không gate và không dịch. Nếu gate làm thay đổi waveform hoặc chọn offset khác 0, pipeline remux audio gốc sau MuseTalk trước các bước correction/export.
 
-Sau inference, bước correction bằng frame motion base vẫn là lớp phụ: chỉ crossfade khi **cả** frame output lẫn thời điểm nguồn của frame được ánh xạ đều nằm trong pause. Cách này giữ chuyển động đầu/vai liên tục và không chạy inference thêm. `auto` correction cần Echo manifest xác nhận mode `speech` cùng SHA-256 audio trùng; `force` bỏ qua cổng mode/hash nhưng vẫn cần xác minh source-time pause. Motion base 5,16 giây được lặp tiến/lùi trong chu kỳ khoảng 10,32 giây, nên pause muộn có thể không có frame nguồn im lặng tương ứng. Report tách các pause được yêu cầu, được correction và chưa được correction.
+Sau inference, correction dùng **quiet-motion bank** lấy từ đoạn liên tục dài nhất trong motion base mà từng frame nằm trọn trong khoảng im lặng của audio Echo đã xác minh. Bank được lặp tiến/lùi và dùng cho mọi khoảng pause đạt ngưỡng, kể cả pause muộn không trùng thời điểm ping-pong bình thường. Các frame speech giữ nguyên; fade ngắn nằm bên trong mép pause và AAC được stream-copy. Cách này tái dùng pixel toàn khung thật để giảm mấp máy và chuyển động đầu/vai theo speech lúc đang nghỉ, không warp quần áo hoặc hình thể và không chạy inference thêm. Với job RTX hiện tại, quiet bank dài khoảng 0,94 giây, đủ phủ hầu hết pause 0,84–0,92 giây. Nếu source audio không được xác minh hoặc không có frame quiet đủ điều kiện, correction ghi `uncovered_intervals` và không tự nhận đã sửa.
 
-Report `motion_audio_alignment` so SHA-256 audio Echo dùng để tạo cử chỉ với audio hiện tại. Khi mismatch hoặc không có manifest, cảnh báo rằng gate/correction chỉ tác động khẩu hình, không đồng bộ lại gesture đầu/vai; hãy tạo Echo speech base mới nếu cần cử chỉ theo đúng kịch bản. `--pause-mouth-closure off` tắt cả gate và post-render correction. Không thể cam kết lip-sync hoàn hảo bằng ngưỡng pause: Whisper context, giới hạn 25 FPS và sai số của model vẫn có thể làm khẩu hình lệch; phải nghe/xem A/B video thật trước khi chạy dài.
+Quiet bank không thay đổi đoạn đang nói: nếu đầu vẫn lắc trong speech thì cần tạo motion base mới với prompt/ảnh khác. Phần frame bank có thể vẫn hé miệng hoặc có nhịp chuyển động nhẹ; kiểm tra output trực quan trước khi dùng production, không coi việc phát hiện silence là bảo đảm miệng khép tuyệt đối.
+
+Report `motion_audio_alignment` so SHA-256 audio Echo dùng để tạo cử chỉ với audio hiện tại. Khi mismatch hoặc không có manifest, auto sẽ bỏ qua quiet-bank correction; hãy tạo Echo speech base mới nếu cần cử chỉ bám audio. `--pause-mouth-closure off` tắt cả conditioning gate và quiet-bank correction. Không thể cam kết lip-sync hoàn hảo bằng ngưỡng pause: Whisper context, giới hạn 25 FPS và sai số của model vẫn có thể làm khẩu hình lệch; phải nghe/xem A/B video thật trước khi chạy dài.
 
 Tham chiếu upstream: [MuseTalk `audio_processor.py`](https://github.com/TMElyralab/MuseTalk/blob/main/musetalk/utils/audio_processor.py) (16 kHz input, 50 Hz Whisper features và cách ánh xạ sang FPS output).
 
@@ -92,9 +94,27 @@ set "LIP_MASK=jaw"
 
 Nếu baseline tốt hơn, giữ `LIP_MASK=jaw`. Nếu clip `raw_mask` khớp môi hơn, đổi `LIP_MASK=raw`. Nếu cả hai chưa đạt, gửi các clip ngắn để đánh giá tiếp; chưa chạy video dài.
 
-Để `--pause-mouth-closure auto` mặc định cho preview và render. Gate conditioning `auto` chạy trên audio hiện tại, kể cả khi base được tái sử dụng; riêng correction frame sau render yêu cầu manifest Echo có mode `speech` và SHA-256 audio trùng file hiện tại. Base neutral, khác audio, thiếu hash hoặc không tìm được manifest sẽ bỏ qua correction an toàn. Kể cả khi khớp, chỉ frame nguồn nằm trong pause của audio conditioning mới được dùng; các pause muộn không có frame nguồn tương ứng được ghi là chưa xử lý.
+Để `--pause-mouth-closure auto` mặc định cho preview và render. Gate conditioning `auto` chạy trên audio hiện tại, kể cả khi base được tái sử dụng; quiet-bank correction yêu cầu manifest Echo có mode `speech`, SHA-256 audio trùng file hiện tại và có ít nhất một đoạn source im lặng đủ dài để lấy frame. Khi khớp, đoạn source quiet dài nhất được dùng lại cho mọi pause đầu ra; report ghi bank, thời lượng được phủ và mọi pause chưa xử lý.
 
-`force` đặt ngưỡng gate/correction xuống pause từ 0,16 giây. Nó bỏ qua cổng mode/hash của correction, ví dụ khi audio đầu ra khác audio đã dùng tạo base, nhưng vẫn **không** lấy frame nguồn tại thời điểm Echo đang nghe lời nói: cần đọc và xác minh được file `source_audio` cùng SHA-256 trong manifest; nếu thiếu thì report ghi các pause chưa xử lý và không blend frame nào. `off` tắt gate conditioning lẫn correction frame sau render.
+`force` đặt ngưỡng gate/correction xuống pause từ 0,16 giây. Nó bỏ qua cổng mode/hash với audio đầu ra khác, nhưng vẫn cần đọc và xác minh được file `source_audio` cùng SHA-256 trong manifest để tạo quiet bank; nếu thiếu, report ghi các pause chưa xử lý và không blend frame nào. `off` tắt gate conditioning lẫn correction frame sau render.
+
+### Reprocess job đã render mà không chạy lại model
+
+Nếu job đã có MuseTalk intermediate và các WAV trung gian, dùng script offline dưới đây. Script xác minh SHA-256 motion base, normalized output audio, Echo reference WAV và danh tính audio trong report trước khi ghi file; nó không chạy Echo hoặc MuseTalk. Nếu có `audio_unshifted_video_1.mp4`, script dùng file đó; nếu thiếu, nó ghép WAV unshifted vào MuseTalk intermediate trước khi sửa. Ưu tiên truyền `--motion-base` gốc. Nếu máy hiện tại không có file đó, có thể bỏ tham số này: fallback chỉ dùng `pause_closed_video_1.mp4` sau khi xác minh old correction là `applied`, SHA-256 nguồn trùng motion base trong report, audio provenance hợp lệ, kích thước/FPS khớp; donor frame phải nằm trong giao source silence và interval cũ sau khi bỏ transition ở cả hai đầu.
+
+```bat
+python -u scripts\reprocess_pause_correction.py --job-dir "output\vertical_ads\job_20261010_125846_9dadea01"
+```
+
+Nếu có bản gốc đúng hash, thêm `--motion-base "output\echo_flash\a10_0682611f141d\motion_base.mp4"` để lấy quiet bank trực tiếp từ motion base.
+
+Kết quả mới được ghi trong đúng job folder, không ghi đè file cũ:
+
+- `intermediate\pause_quietbank_reprocessed_video_1.mp4`: intermediate 512×640 đã dùng quiet bank.
+- `vertical_ad_1080x1920_pause_quietbank_reprocessed.mp4`: output 9:16 1080×1920.
+- `pause_reprocess_report.json`: xác minh hash, quiet-bank coverage, lệnh export và thời gian.
+
+Nếu tên job hoặc motion base khác, thay đường dẫn tương ứng. Lệnh chỉ reprocess được khi job cũ còn đủ intermediate, report và Echo reference WAV; fallback cần thêm video old correction hợp lệ.
 
 Offset mặc định là 0ms và không tự đoán. Nếu khẩu hình có vẻ sớm/trễ, dùng preview A/B quanh 0 bằng jaw mask:
 

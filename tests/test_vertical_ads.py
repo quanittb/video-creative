@@ -15,6 +15,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import test_vertical_ads as ads
+import reprocess_pause_correction as reprocess_pause
 from tests import test_cached_musetalk as cached_fixture
 
 FFMPEG = shutil.which("ffmpeg")
@@ -30,8 +31,8 @@ class VerticalAdsTests(unittest.TestCase):
         help_text = " ".join(ads.make_parser().format_help().split())
         self.assertIn("speech dùng audio thật để sinh chuyển động", help_text)
         self.assertIn("không khuyến nghị làm motion base chuyển động", help_text)
-        self.assertIn("auto mute pause >=0.32s", help_text)
-        self.assertIn("off tắt cả gate lẫn correction", help_text)
+        self.assertIn("quiet-motion bank", help_text)
+        self.assertIn("off tắt cả hai", help_text)
         self.assertIn("Dương làm miệng trễ audio", help_text)
         echo_help = " ".join(ads.echo.make_parser().format_help().split())
         self.assertIn("speech dùng audio thật để sinh chuyển động", echo_help)
@@ -177,20 +178,212 @@ class VerticalAdsTests(unittest.TestCase):
         expected = [0, 1, 2, 3, 3, 2, 1, 0, 0, 1, 2]
         actual = [ads.pingpong_frame_index(index, 4) for index in range(len(expected))]
         self.assertEqual(actual, expected)
-        graph = ads.build_pause_closure_filter(4, 1.0, [{"start_seconds": 0.1, "end_seconds": 0.7}])
+        graph = ads.build_pause_closure_filter([10, 11, 12, 13], 1.0, [{"start_seconds": 0.1, "end_seconds": 0.7}])
         self.assertIn("loop=loop=-1:size=8:start=0", graph)
         self.assertIn("concat=n=2:v=1:a=0", graph)
-        self.assertIn("[1:v]fps=25,setpts=PTS-STARTPTS", graph)
+        self.assertIn("select='eq(n\\,10)+eq(n\\,11)+eq(n\\,12)+eq(n\\,13)'", graph)
+        self.assertIn("[0:v]fps=25,setpts=N/(25*TB)[musetalk]", graph)
 
-    def test_only_closes_when_mapped_source_time_was_also_silent(self):
-        safe, uncovered = ads.split_pause_intervals_by_reference_audio(
-            [{"start_seconds": 0.4, "end_seconds": 0.8}, {"start_seconds": 10.4, "end_seconds": 10.8}],
-            [{"start_seconds": 0.4, "end_seconds": 0.8}],
-            source_frame_count=129, duration_seconds=10.8,
+    def test_quiet_bank_uses_longest_contiguous_verified_source_silence(self):
+        indices = ads.quiet_bank_frame_indices([
+            {"start_seconds": 0.0, "end_seconds": 0.16},
+            {"start_seconds": 0.4, "end_seconds": 0.8},
+            {"start_seconds": 1.0, "end_seconds": 1.2},
+        ], source_frame_count=30)
+        self.assertEqual(indices, list(range(10, 20)))
+        requested = [{"start_seconds": 0.41, "end_seconds": 0.79}]
+        aligned = ads.align_pause_intervals_to_frames(requested, 1.2)
+        self.assertEqual(aligned, [{"start_seconds": 0.44, "end_seconds": 0.76, "duration_seconds": 0.32}])
+        residual = ads.subtract_pause_intervals(requested, aligned, "frame-edge")
+        self.assertEqual([item["duration_seconds"] for item in residual], [0.03, 0.03])
+
+    def test_offline_reprocess_requires_report_audio_and_motion_base_hashes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            job = Path(directory) / "job"
+            intermediate = job / "intermediate"
+            intermediate.mkdir(parents=True)
+            base = Path(directory) / "motion_base.mp4"
+            base.write_bytes(b"verified base")
+            audio = intermediate / "audio_unshifted_16k_mono.wav"
+            audio.write_bytes(b"verified output wav")
+            echo_audio = intermediate / "echo_reference_audio_16k_mono.wav"
+            echo_audio.write_bytes(b"verified Echo reference wav")
+            unshifted_video = intermediate / "audio_unshifted_video_1.mp4"
+            unshifted_video.write_bytes(b"audio-restored video")
+            digest = "a" * 64
+            report = {
+                "pause_mouth_closure_policy": {
+                    "source_mouth_mode": "speech", "manifest_audio_sha256": digest,
+                    "current_input_audio_sha256": digest, "audio_identity_matches": True,
+                },
+                "motion_audio_alignment": {"status": "verified_match", "sha256_matches": True},
+                "motion_base": {"sha256": ads.musetalk.sha256_file(base)},
+                "audio_alignment": {"unshifted_normalized_audio_sha256": ads.musetalk.sha256_file(audio)},
+                "videos": [{"pause_mouth_closure": {
+                    "reference_audio_sha256": ads.musetalk.sha256_file(echo_audio),
+                    "reference_audio_provenance": {
+                        "status": "verified", "manifest_audio_sha256": digest,
+                        "source_sha256": digest, "current_audio_sha256": digest,
+                    },
+                }}],
+            }
+            (job / "vertical_ad_report.json").write_text(json.dumps(report), encoding="utf-8")
+            verified = reprocess_pause._verified_job_inputs(job, base)
+            self.assertEqual(verified["rendered_video"], unshifted_video.resolve())
+            self.assertFalse(verified["restore_audio"])
+            audio.write_bytes(b"tampered output wav")
+            with self.assertRaisesRegex(ValueError, "WAV unshifted"):
+                reprocess_pause._verified_job_inputs(job, base)
+
+    def test_offline_reprocess_fallback_requires_verified_prior_closure_and_trims_both_edges(self):
+        with tempfile.TemporaryDirectory() as directory:
+            job = Path(directory) / "job"
+            intermediate = job / "intermediate"
+            intermediate.mkdir(parents=True)
+            digest = "a" * 64
+            audio = intermediate / "audio_unshifted_16k_mono.wav"
+            samples = ads.array("h")
+            for duration, amplitude in ((0.8, 4000), (0.8, 0), (1.6, 4000)):
+                count = int(duration * 16000)
+                for index in range(count):
+                    samples.append(int(amplitude * math.sin(2.0 * math.pi * 440.0 * (len(samples) + index) / 16000))
+                                   if amplitude else 0)
+            with wave.open(str(audio), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(16000)
+                output.writeframes(samples.tobytes())
+            echo_audio = intermediate / "echo_reference_audio_16k_mono.wav"
+            shutil.copyfile(audio, echo_audio)
+            (intermediate / "pause_closed_video_1.mp4").write_bytes(b"prior closure donor")
+            (intermediate / "audio_unshifted_video_1.mp4").write_bytes(b"prior MuseTalk video")
+            (job / "vertical_ad_report.json").write_text(json.dumps({
+                "effective_audio_duration_seconds": 3.2,
+                "pause_mouth_closure_policy": {
+                    "source_mouth_mode": "speech", "manifest_audio_sha256": digest,
+                    "current_input_audio_sha256": digest, "audio_identity_matches": True,
+                },
+                "motion_audio_alignment": {"status": "verified_match", "sha256_matches": True},
+                "motion_base": {"path": "C:\\old-machine\\motion_base.mp4", "sha256": digest,
+                                "width": 512, "height": 640, "fps": 25.0},
+                "audio_alignment": {"unshifted_normalized_audio_sha256": ads.musetalk.sha256_file(audio)},
+                "videos": [{"pause_mouth_closure": {
+                    "status": "applied", "reference_source": "existing_motion_base_video",
+                    "reference_sha256": digest,
+                    "reference_audio_sha256": ads.musetalk.sha256_file(echo_audio),
+                    "reference_audio_provenance": {
+                        "status": "verified", "manifest_audio_sha256": digest,
+                        "source_sha256": digest, "current_audio_sha256": digest,
+                    },
+                    "output": "C:\\old-job\\intermediate\\pause_closed_video_1.mp4",
+                    "pause_detection": {"transition_seconds": 0.08},
+                    "intervals": [{"start_seconds": 0.8, "end_seconds": 1.6, "duration_seconds": 0.8}],
+                }}],
+            }), encoding="utf-8")
+
+            inputs = reprocess_pause._verified_job_inputs(job, None)
+
+            self.assertEqual(inputs["reference_policy"], "previous_pause_closed_video_safe_quiet_overlap")
+            self.assertEqual(inputs["reference_video"], (intermediate / "pause_closed_video_1.mp4").resolve())
+            self.assertEqual(len(inputs["quiet_bank_intervals"]), 1)
+            self.assertAlmostEqual(inputs["quiet_bank_intervals"][0]["start_seconds"], 0.88, delta=0.02)
+            self.assertAlmostEqual(inputs["quiet_bank_intervals"][0]["end_seconds"], 1.52, delta=0.02)
+            indices = ads.quiet_bank_frame_indices(inputs["quiet_bank_intervals"], source_frame_count=80)
+            self.assertEqual(indices[0], 22)
+            self.assertEqual(indices[-1], 37)
+
+            report_path = job / "vertical_ad_report.json"
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            report["videos"][0]["pause_mouth_closure"]["reference_sha256"] = "b" * 64
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "SHA-256 nguồn"):
+                reprocess_pause._verified_job_inputs(job, None)
+
+    @unittest.skipUnless(FFMPEG and FFPROBE, "FFmpeg unavailable")
+    def test_offline_reprocess_writes_corrected_native_and_hd_without_model_rerun(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            job = root / "job"
+            intermediate = job / "intermediate"
+            intermediate.mkdir(parents=True)
+            (job / "logs").mkdir()
+            audio = intermediate / "audio_unshifted_16k_mono.wav"
+            sample_rate = 16000
+            pcm = ads.array("h")
+            for start, end, amplitude in ((0.0, 0.8, 4000), (0.8, 1.6, 0), (1.6, 3.2, 4000)):
+                count = int((end - start) * sample_rate)
+                for index in range(count):
+                    value = (int(amplitude * math.sin(2.0 * math.pi * 440.0 * (len(pcm) + index) / sample_rate))
+                             if amplitude else 0)
+                    pcm.append(value)
+            with wave.open(str(audio), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(sample_rate)
+                output.writeframes(pcm.tobytes())
+            echo_audio = intermediate / "echo_reference_audio_16k_mono.wav"
+            shutil.copyfile(audio, echo_audio)
+
+            base = root / "motion_base.mp4"
+            self._ffmpeg([
+                "-f", "lavfi", "-i", "color=c=red:s=64x80:r=25:d=3.2",
+                "-vf", "drawbox=x=0:y=0:w=iw:h=ih:color=green:t=fill:enable='between(n,20,39)'",
+                "-frames:v", "80", "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "0",
+                "-pix_fmt", "yuv420p", str(base),
+            ])
+            rendered = intermediate / "audio_unshifted_video_1.mp4"
+            self._ffmpeg([
+                "-f", "lavfi", "-i", "color=c=magenta:s=64x80:r=25:d=3.2", "-i", str(audio),
+                "-map", "0:v:0", "-map", "1:a:0", "-t", "3.2", "-c:v", "libx264", "-crf", "0",
+                "-pix_fmt", "yuv420p", "-c:a", "aac", str(rendered),
+            ])
+
+            digest = ads.musetalk.sha256_file(audio)
+            report = {
+                "effective_audio_duration_seconds": 3.2,
+                "pause_mouth_closure_policy": {
+                    "source_mouth_mode": "speech", "manifest_audio_sha256": digest,
+                    "current_input_audio_sha256": digest, "audio_identity_matches": True,
+                    "minimum_pause_seconds": 0.32,
+                },
+                "motion_audio_alignment": {"status": "verified_match", "sha256_matches": True},
+                "motion_base": {"sha256": ads.musetalk.sha256_file(base)},
+                "audio_alignment": {"unshifted_normalized_audio_sha256": digest},
+                "videos": [{"pause_mouth_closure": {
+                    "reference_audio_sha256": ads.musetalk.sha256_file(echo_audio),
+                    "reference_audio_provenance": {
+                        "status": "verified", "manifest_audio_sha256": digest,
+                        "source_sha256": digest, "current_audio_sha256": digest,
+                    },
+                }}],
+            }
+            (job / "vertical_ad_report.json").write_text(json.dumps(report), encoding="utf-8")
+
+            result = reprocess_pause.reprocess(job, base, FFMPEG, FFPROBE)
+
+            corrected = Path(result["corrected_intermediate"])
+            final_video = Path(result["final_output"])
+            self.assertTrue(corrected.is_file())
+            self.assertTrue(final_video.is_file())
+            self.assertEqual(result["models_rerun"], False)
+            self.assertEqual(result["pause_correction"]["status"], "applied")
+            self.assertEqual(result["pause_correction"]["quiet_source_bank"]["frame_count"], 20)
+            final_data = ads.probe_media(final_video, FFPROBE)
+            final_stream = ads.stream_by_type(final_data, "video")
+            self.assertEqual((int(final_stream["width"]), int(final_stream["height"])), (1080, 1920))
+            self.assertTrue((job / "pause_reprocess_report.json").is_file())
+
+    def test_late_pause_frames_are_correctable_without_matching_pingpong_source_time(self):
+        source_bank = ads.quiet_bank_frame_indices(
+            [{"start_seconds": 0.4, "end_seconds": 0.8}], source_frame_count=129,
         )
-        self.assertEqual(safe[0], {"start_seconds": 0.4, "end_seconds": 0.8, "duration_seconds": 0.4})
-        self.assertEqual(safe[1], {"start_seconds": 10.72, "end_seconds": 10.8, "duration_seconds": 0.08})
-        self.assertEqual(uncovered[0], {"start_seconds": 10.4, "end_seconds": 10.72, "duration_seconds": 0.32})
+        output_pauses = ads.align_pause_intervals_to_frames(
+            [{"start_seconds": 10.4, "end_seconds": 10.8}], duration_seconds=10.8,
+        )
+        self.assertEqual(source_bank, list(range(10, 20)))
+        self.assertEqual(output_pauses, [{"start_seconds": 10.4, "end_seconds": 10.8, "duration_seconds": 0.4}])
+        normal_source_index = ads.pingpong_frame_index(int(10.4 * ads.FPS), 129)
+        self.assertNotIn(normal_source_index, source_bank)
 
     def test_rms_pauses_protect_quiet_speech_merge_short_interruptions_and_cover_edges(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -232,42 +425,50 @@ class VerticalAdsTests(unittest.TestCase):
             self.assertAlmostEqual(forced_intervals[2]["duration_seconds"], 0.24, delta=0.02)
 
     @unittest.skipUnless(FFMPEG and FFPROBE, "FFmpeg unavailable")
-    def test_ffmpeg_pause_detection_preserves_speech_and_restores_moving_pingpong_frames(self):
+    def test_ffmpeg_pause_reuses_quiet_bank_for_repeated_pauses_and_preserves_speech_audio(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            audio = root / "speech_pause_quiet_speech.wav"
+            audio = root / "speech_two_pauses.wav"
             self._ffmpeg([
-                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000:duration=0.4",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000:duration=0.8",
                 "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono:d=0.4",
-                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000:duration=0.4,volume=0.1",
-                "-filter_complex", "[0:a][1:a][2:a]concat=n=3:v=0:a=1[a]", "-map", "[a]",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000:duration=0.76,volume=0.1",
+                "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono:d=0.44",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000:duration=0.8,volume=0.1",
+                "-filter_complex", "[0:a][1:a][2:a][3:a][4:a]concat=n=5:v=0:a=1[a]", "-map", "[a]",
                 "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(audio),
             ])
             intervals = ads.detect_silence_intervals(audio)
-            self.assertEqual(len(intervals), 1)
-            self.assertAlmostEqual(intervals[0]["start_seconds"], 0.4, delta=0.02)
-            self.assertAlmostEqual(intervals[0]["end_seconds"], 0.8, delta=0.02)
+            self.assertEqual(len(intervals), 2)
+            self.assertAlmostEqual(intervals[0]["start_seconds"], 0.8, delta=0.02)
+            self.assertAlmostEqual(intervals[1]["start_seconds"], 1.96, delta=0.02)
 
             base = root / "motion_reference.mp4"
             self._ffmpeg([
-                "-f", "lavfi", "-i", "color=c=black:s=64x80:r=25:d=1.2",
-                "-vf", "drawbox=x=0:y=0:w=iw:h=ih:color=red:t=fill:enable='eq(mod(n,4),0)',"
-                      "drawbox=x=0:y=0:w=iw:h=ih:color=green:t=fill:enable='eq(mod(n,4),1)',"
-                      "drawbox=x=0:y=0:w=iw:h=ih:color=blue:t=fill:enable='eq(mod(n,4),2)',"
-                      "drawbox=x=0:y=0:w=iw:h=ih:color=yellow:t=fill:enable='eq(mod(n,4),3)'",
+                "-f", "lavfi", "-i", "color=c=red:s=64x80:r=25:d=1.2",
+                "-vf", "drawbox=x=0:y=0:w=iw:h=ih:color=blue:t=fill:enable='between(n,10,19)',"
+                      "drawbox=x=0:y=0:w=iw:h=ih:color=green:t=fill:enable='gte(n,20)'",
                 "-frames:v", "30", "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "0",
                 "-pix_fmt", "yuv420p", str(base),
             ])
             rendered = root / "musetalk.mp4"
             self._ffmpeg([
-                "-f", "lavfi", "-i", "color=c=magenta:s=64x80:r=25:d=1.2", "-i", str(audio),
-                "-map", "0:v:0", "-map", "1:a:0", "-t", "1.2", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-f", "lavfi", "-i", "color=c=magenta:s=64x80:r=25:d=3.2", "-i", str(audio),
+                "-map", "0:v:0", "-map", "1:a:0", "-t", "3.2", "-c:v", "libx264", "-crf", "0", "-pix_fmt", "yuv420p",
                 "-c:a", "aac", str(rendered),
             ])
-            corrected = root / "pause_closed.mp4"
-            record = ads.apply_pause_mouth_closure(rendered, base, audio, corrected, FFMPEG, FFPROBE, 1.2)
+            corrected = root / "pause_quiet_bank.mp4"
+            provenance = {"status": "verified", "manifest_audio_sha256": "a" * 64,
+                          "source_sha256": "a" * 64, "current_audio_sha256": "a" * 64}
+            record = ads.apply_pause_mouth_closure(
+                rendered, base, audio, corrected, FFMPEG, FFPROBE, 3.2,
+                reference_audio=audio, reference_audio_provenance=provenance,
+            )
             self.assertEqual(record["status"], "applied")
             self.assertEqual(record["source_frame_count"], 30)
+            self.assertEqual(record["quiet_source_bank"]["start_frame"], 20)
+            self.assertEqual(record["quiet_source_bank"]["end_frame_exclusive"], 30)
+            self.assertEqual(record["uncovered_duration_seconds"], 0.0)
             original_info = ads.probe_media(rendered, FFPROBE)
             corrected_info = ads.probe_media(corrected, FFPROBE)
             original_audio = ads.stream_by_type(original_info, "audio")
@@ -284,10 +485,13 @@ class VerticalAdsTests(unittest.TestCase):
             self.assertEqual(corrected_pcm, original_pcm, "pause closure must preserve every decoded audio sample")
 
             audio_restored = root / "unshifted_audio_restored.mp4"
-            audio_restore = ads.remux_unshifted_audio(rendered, audio, audio_restored, FFMPEG, FFPROBE, 1.2)
+            audio_restore = ads.remux_unshifted_audio(rendered, audio, audio_restored, FFMPEG, FFPROBE, 3.2)
             self.assertEqual(audio_restore["status"], "restored")
             restored_closed = root / "restored_audio_pause_closed.mp4"
-            ads.apply_pause_mouth_closure(audio_restored, base, audio, restored_closed, FFMPEG, FFPROBE, 1.2)
+            ads.apply_pause_mouth_closure(
+                audio_restored, base, audio, restored_closed, FFMPEG, FFPROBE, 3.2,
+                reference_audio=audio, reference_audio_provenance=provenance,
+            )
             restored_pcm = subprocess.check_output([
                 FFMPEG, "-v", "error", "-i", str(audio_restored), "-map", "0:a:0", "-ar", "16000", "-ac", "1", "-f", "s16le", "-",
             ])
@@ -296,7 +500,7 @@ class VerticalAdsTests(unittest.TestCase):
             ])
             self.assertEqual(final_pcm, restored_pcm, "pause correction must stream-copy the restored unshifted AAC track")
 
-            selected_frames = (2, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21)
+            selected_frames = (10, 20, 22, 29, 40, 49, 52, 57, 60, 61)
             select_expr = "+".join("eq(n\\,{})".format(index) for index in selected_frames)
             raw = subprocess.check_output([
                 FFMPEG, "-v", "error", "-i", str(corrected), "-vf", "select=" + select_expr,
@@ -305,31 +509,76 @@ class VerticalAdsTests(unittest.TestCase):
             ])
             frame_bytes = 64 * 80 * 3
             self.assertEqual(len(raw), frame_bytes * len(selected_frames))
-            expected_colors = ("speech", "speech", "transition", "red", "green", "blue", "yellow", "red", "green", "blue", "transition", "speech", "speech")
+            expected_colors = ("speech", "transition", "green", "transition", "speech", "transition", "green", "green", "speech", "speech")
             pause_colors = set()
             for index, expected in enumerate(expected_colors):
                 offset = index * frame_bytes + (40 * 64 + 32) * 3
                 red, green, blue = raw[offset:offset + 3]
-                if 3 <= index <= 9:
+                if expected in ("green", "transition"):
                     pause_colors.add((red, green, blue))
                 if expected == "speech":
-                    self.assertGreater(red, 200, "speech frame was replaced at {}: {}".format(selected_frames[index], (red, green, blue)))
-                    self.assertGreater(blue, 200, "speech frame was replaced at {}: {}".format(selected_frames[index], (red, green, blue)))
-                    self.assertLess(green, 50, "speech frame was altered at {}: {}".format(selected_frames[index], (red, green, blue)))
+                    self.assertGreater(red, 150, "speech frame was replaced at {}: {}".format(selected_frames[index], (red, green, blue)))
+                    self.assertGreater(blue, 150, "speech frame was replaced at {}: {}".format(selected_frames[index], (red, green, blue)))
+                    self.assertLess(green, 100, "speech frame was altered at {}: {}".format(selected_frames[index], (red, green, blue)))
                 elif expected == "transition":
-                    self.assertGreater(red, 200, "pause transition did not retain shared red component: {}".format((red, green, blue)))
-                    self.assertGreater(green, 30, "pause transition did not blend source frame: {}".format((red, green, blue)))
-                    self.assertGreater(blue, 30, "pause transition did not blend MuseTalk frame: {}".format((red, green, blue)))
-                elif expected == "red":
-                    self.assertGreater(red, max(green, blue) + 60, "frame {} RGB={}".format(selected_frames[index], (red, green, blue)))
+                    self.assertGreater(green, 30, "quiet bank was not blended inside the pause: {}".format((red, green, blue)))
+                    self.assertGreater(red, 30, "transition should retain a short MuseTalk edge: {}".format((red, green, blue)))
+                    self.assertGreater(blue, 30, "transition should retain a short MuseTalk edge: {}".format((red, green, blue)))
                 elif expected == "green":
-                    self.assertGreater(green, max(red, blue) + 30, "frame {} RGB={}".format(selected_frames[index], (red, green, blue)))
-                elif expected == "blue":
-                    self.assertGreater(blue, max(red, green) + 60, "frame {} RGB={}".format(selected_frames[index], (red, green, blue)))
+                    self.assertGreater(green, max(red, blue) + 60, "quiet pause frame did not use quiet bank: {}".format((red, green, blue)))
                 else:
-                    self.assertGreater(red, blue + 60, "frame {} RGB={}".format(selected_frames[index], (red, green, blue)))
-                    self.assertGreater(green, blue + 30, "frame {} RGB={}".format(selected_frames[index], (red, green, blue)))
-            self.assertGreaterEqual(len(pause_colors), 3, "pause restoration must follow the moving ping-pong source, not freeze one frame")
+                    self.fail("Unexpected expected-color test case: {}".format(expected))
+
+            all_frames = []
+            for path in (rendered, corrected):
+                decoded = subprocess.check_output([
+                    FFMPEG, "-v", "error", "-i", str(path), "-vf", "fps=25",
+                    "-frames:v", "80", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+                ])
+                self.assertEqual(len(decoded), frame_bytes * 80)
+                all_frames.append(decoded)
+            aligned_pause_frames = set()
+            for interval in record["intervals"]:
+                aligned_pause_frames.update(range(
+                    int(round(interval["start_seconds"] * ads.FPS)),
+                    int(round(interval["end_seconds"] * ads.FPS)),
+                ))
+            for frame_index in range(80):
+                start = frame_index * frame_bytes
+                center = start + (40 * 64 + 32) * 3
+                before_green = all_frames[0][center + 1]
+                after_green = all_frames[1][center + 1]
+                if frame_index in aligned_pause_frames:
+                    self.assertGreater(after_green, before_green + 5,
+                                       "frame {} inside a qualifying pause did not use any quiet-bank pixels".format(frame_index))
+                else:
+                    before = all_frames[0][start:start + frame_bytes]
+                    after = all_frames[1][start:start + frame_bytes]
+                    mean_error = sum(abs(left - right) for left, right in zip(before, after)) / float(frame_bytes)
+                    self.assertLess(mean_error, 3.0,
+                                    "speech/non-pause frame {} changed beyond encode tolerance".format(frame_index))
+            self.assertEqual(len(pause_colors), 2)
+            # At output frame 52 the normal 30-frame ping-pong map points at source frame 7 (red),
+            # while the verified quiet bank points inside source frames 20..29 (green).
+            source_frame = subprocess.check_output([
+                FFMPEG, "-v", "error", "-i", str(base), "-vf", "select='eq(n\\,7)'", "-frames:v", "1",
+                "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+            ])
+            self.assertGreater(source_frame[(40 * 64 + 32) * 3], source_frame[(40 * 64 + 32) * 3 + 1])
+            # Speech frames remain visually unchanged apart from the expected lossy H.264 re-encode tolerance.
+            speech_indices = (10, 40, 61)
+            select_speech = "+".join("eq(n\\,{})".format(index) for index in speech_indices)
+            original_speech = subprocess.check_output([
+                FFMPEG, "-v", "error", "-i", str(rendered), "-vf", "select=" + select_speech,
+                "-fps_mode", "passthrough", "-frames:v", str(len(speech_indices)), "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+            ])
+            corrected_speech = subprocess.check_output([
+                FFMPEG, "-v", "error", "-i", str(corrected), "-vf", "select=" + select_speech,
+                "-fps_mode", "passthrough", "-frames:v", str(len(speech_indices)), "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+            ])
+            self.assertEqual(len(original_speech), len(corrected_speech))
+            mean_error = sum(abs(a - b) for a, b in zip(original_speech, corrected_speech)) / len(original_speech)
+            self.assertLess(mean_error, 3.0, "speech frames must remain visually unchanged")
             self.assertEqual(record["reference_cache_state"], "not_needed; reuses existing Echo motion base")
 
     @unittest.skipUnless(FFMPEG and FFPROBE, "FFmpeg unavailable")
