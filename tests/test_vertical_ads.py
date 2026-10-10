@@ -30,7 +30,8 @@ class VerticalAdsTests(unittest.TestCase):
         help_text = " ".join(ads.make_parser().format_help().split())
         self.assertIn("speech dùng audio thật để sinh chuyển động", help_text)
         self.assertIn("không khuyến nghị làm motion base chuyển động", help_text)
-        self.assertIn("cùng frame motion base", help_text)
+        self.assertIn("auto mute pause >=0.32s", help_text)
+        self.assertIn("off tắt cả gate lẫn correction", help_text)
         self.assertIn("Dương làm miệng trễ audio", help_text)
         echo_help = " ".join(ads.echo.make_parser().format_help().split())
         self.assertIn("speech dùng audio thật để sinh chuyển động", echo_help)
@@ -92,6 +93,71 @@ class VerticalAdsTests(unittest.TestCase):
             self.assertEqual(list(advanced_samples[-640:]), [0] * 640)
             self.assertEqual(delayed_info["sample_offset"], 640)
             self.assertEqual(advanced_info["offset_ms"], -40)
+
+    def test_pause_gate_mutes_only_confident_intervals_and_preserves_speech_and_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, gated = root / "source.wav", root / "gated.wav"
+            source_samples, segments = self._write_synthetic_gate_audio(source)
+            original_sha = ads.musetalk.sha256_file(source)
+            record = ads.gate_pause_audio(source, gated)
+            _, gated_samples = ads._read_normalized_pcm(gated)
+
+            self.assertEqual(record["status"], "applied")
+            self.assertEqual(record["interval_count"], 1)
+            interval = record["intervals"][0]
+            self.assertAlmostEqual(interval["start_seconds"], 3.0, delta=0.02)
+            self.assertAlmostEqual(interval["end_seconds"], 3.4, delta=0.02)
+            self.assertEqual(record["gated_sample_count"], 6400)
+            self.assertEqual(record["sample_count"], len(source_samples))
+            self.assertEqual(len(gated_samples), len(source_samples))
+            self.assertGreater(record["changed_nonzero_sample_count"], 0)
+            self.assertEqual(record["sha256"], ads.musetalk.sha256_file(gated))
+            self.assertEqual(record["source_sha256"], original_sha)
+            self.assertEqual(ads.musetalk.sha256_file(source), original_sha)
+            self.assertEqual(gated_samples[:interval["start_sample"]], source_samples[:interval["start_sample"]])
+            self.assertFalse(any(gated_samples[interval["start_sample"]:interval["end_sample"]]))
+            self.assertEqual(gated_samples[interval["end_sample"]:], source_samples[interval["end_sample"]:])
+            quiet_speech_start = int(segments["quiet_speech_start"] * 16000)
+            quiet_speech_end = int(segments["quiet_speech_end"] * 16000)
+            self.assertEqual(gated_samples[quiet_speech_start:quiet_speech_end],
+                             source_samples[quiet_speech_start:quiet_speech_end],
+                             "globally quiet speech must remain byte-identical")
+
+            forced = root / "forced.wav"
+            force_record = ads.gate_pause_audio(source, forced, ads.PAUSE_FORCE_MIN_DURATION_SECONDS)
+            self.assertEqual(force_record["interval_count"], 2)
+            self.assertAlmostEqual(force_record["intervals"][1]["duration_seconds"], 0.24, delta=0.02)
+
+    def test_pause_gate_precedes_signed_audio_offset_and_preserves_duration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, gated = root / "source.wav", root / "gated.wav"
+            source_samples, _ = self._write_synthetic_gate_audio(source)
+            gate_record = ads.gate_pause_audio(source, gated)
+            _, gated_samples = ads._read_normalized_pcm(gated)
+            interval = gate_record["intervals"][0]
+            for offset in (-40, 40):
+                shifted_path = root / "offset_{:+d}.wav".format(offset)
+                offset_record = ads.shift_pcm_wav(gated, shifted_path, offset)
+                _, shifted_samples = ads._read_normalized_pcm(shifted_path)
+                moved = ads._offset_pause_intervals([interval], len(gated_samples), offset)
+                shift_samples = 640
+                self.assertEqual(len(shifted_samples), len(source_samples))
+                self.assertEqual(offset_record["duration_seconds"], len(source_samples) / 16000)
+                self.assertEqual(len(moved), 1)
+                self.assertEqual(moved[0]["start_sample"], interval["start_sample"] + (shift_samples if offset > 0 else -shift_samples))
+                self.assertEqual(moved[0]["end_sample"], interval["end_sample"] + (shift_samples if offset > 0 else -shift_samples))
+                self.assertFalse(any(shifted_samples[moved[0]["start_sample"]:moved[0]["end_sample"]]))
+
+                expected = ads.array("h")
+                if offset > 0:
+                    expected.extend([0] * shift_samples)
+                    expected.extend(gated_samples[:-shift_samples])
+                else:
+                    expected.extend(gated_samples[shift_samples:])
+                    expected.extend([0] * shift_samples)
+                self.assertEqual(shifted_samples, expected, "offset variants must be derived from the gated WAV")
 
     def test_audio_offset_sweep_requires_short_preview_and_reused_base(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -282,6 +348,7 @@ class VerticalAdsTests(unittest.TestCase):
                 "outputs": {"motion_base": {"path": str(base.resolve())}},
             }
             (root / "run_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            backend_audio_pcm = []
 
             def backend(command, cwd, environment, log_path):
                 config = Path(command[command.index("--inference_config") + 1]).read_text().splitlines()
@@ -293,7 +360,10 @@ class VerticalAdsTests(unittest.TestCase):
                 (avatar / "avator_info.json").write_text(json.dumps(info))
                 audio_line = next(line.strip() for line in config if line.strip().startswith("render_"))
                 output_name, wav_json = audio_line.split(":", 1)
-                duration = ads.musetalk.probe_media(Path(json.loads(wav_json)), FFPROBE).audio_duration
+                configured_audio = Path(json.loads(wav_json))
+                _, configured_pcm = ads._read_normalized_pcm(configured_audio)
+                backend_audio_pcm.append(configured_pcm)
+                duration = ads.musetalk.probe_media(configured_audio, FFPROBE).audio_duration
                 self._video(avatar / "vid_output" / (output_name + ".mp4"), duration)
                 log_path.parent.mkdir(parents=True, exist_ok=True)
                 log_path.write_text("stub CUDA backend; no model loaded\n")
@@ -308,10 +378,26 @@ class VerticalAdsTests(unittest.TestCase):
             report = json.loads(next((root / "out").rglob("vertical_ad_report.json")).read_text())
             video = report["videos"][0]
             self.assertTrue(report["pause_mouth_closure_policy"]["enabled_for_this_base"])
+            self.assertEqual(report["motion_audio_alignment"]["status"], "verified_match")
+            self.assertTrue(report["motion_audio_alignment"]["sha256_matches"])
+            self.assertEqual(report["motion_audio_alignment"]["echo_conditioning_audio_sha256"],
+                             ads.echo.hash_file(audio))
             self.assertEqual(video["pause_mouth_closure"]["status"], "applied")
             self.assertEqual(video["pause_mouth_closure"]["reference_video"], str(base.resolve()))
             self.assertEqual(video["audio_conditioning"]["offset_ms"], 40)
+            conditioning_variant = report["audio_alignment"]["conditioning_variant_details"]["40"]
+            self.assertEqual(video["audio_conditioning"]["conditioning_audio_sha256"], conditioning_variant["sha256"])
+            self.assertEqual(conditioning_variant["sha256"],
+                             ads.musetalk.sha256_file(Path(conditioning_variant["path"])))
+            self.assertEqual(video["audio_conditioning"]["pause_gate"]["interval_count"], 1)
+            _, expected_conditioning_pcm = ads._read_normalized_pcm(Path(conditioning_variant["path"]))
+            self.assertEqual(backend_audio_pcm[0], expected_conditioning_pcm,
+                             "MuseTalk config must receive the pause-gated and offset conditioning waveform")
+            gate_report = report["audio_alignment"]["pause_gated_conditioning_audio"]
+            self.assertEqual(gate_report["sha256"], ads.musetalk.sha256_file(Path(gate_report["path"])))
             self.assertEqual(video["audio_output_restoration"]["status"], "restored")
+            self.assertEqual(video["audio_output_restoration"]["source_sha256"],
+                             report["audio_alignment"]["original_normalized_output_audio"]["sha256"])
             self.assertEqual(video["audio_conditioning"]["unshifted_output_audio"],
                              str((Path(report["job_directory"]) / "intermediate" / "audio_unshifted_16k_mono.wav").resolve()))
             decoded_source = subprocess.check_output([
@@ -323,6 +409,25 @@ class VerticalAdsTests(unittest.TestCase):
                 "-ar", "16000", "-ac", "1", "-f", "s16le", "-",
             ])
             self.assertEqual(decoded_output, decoded_source, "HD export must preserve the unshifted AAC packets exactly")
+
+            manifest["fingerprint_inputs"]["audio_sha256"] = "0" * 64
+            (root / "run_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            off_common = list(common)
+            off_common[off_common.index("40")] = "0"
+            off_common.extend(["--pause-mouth-closure", "off", "--output-root", str(root / "off_out")])
+            with (mock.patch.object(ads.musetalk, "run_backend_process", backend),
+                  mock.patch.object(ads, "gate_pause_audio", side_effect=AssertionError("off must not gate")),
+                  mock.patch.object(ads, "apply_pause_mouth_closure", side_effect=AssertionError("off must not restore frames")),
+                  contextlib.redirect_stdout(io.StringIO())):
+                self.assertEqual(ads.main(off_common), 0)
+            off_report = json.loads(next((root / "off_out").rglob("vertical_ad_report.json")).read_text())
+            off_video = off_report["videos"][0]
+            self.assertEqual(off_report["audio_alignment"]["pause_gated_conditioning_audio"]["status"], "disabled")
+            self.assertEqual(off_report["motion_audio_alignment"]["status"], "mismatch")
+            self.assertIn("đầu/vai", off_report["motion_audio_alignment"]["warning"])
+            self.assertEqual(off_video["pause_mouth_closure"]["status"], "skipped")
+            self.assertEqual(off_video["audio_output_restoration_required"], False)
+            self.assertFalse(Path(off_report["job_directory"]).joinpath("intermediate", "pause_closed_video_1.mp4").exists())
 
     @staticmethod
     def _write_pause_audio(destination):
@@ -339,6 +444,24 @@ class VerticalAdsTests(unittest.TestCase):
                     pcm.append(value)
                 sample_index += count
             output.writeframes(pcm.tobytes())
+
+    @staticmethod
+    def _write_synthetic_gate_audio(destination):
+        segments = ((3.0, 6000), (0.40, 3), (0.40, 50), (0.24, 0), (3.0, 6000))
+        pcm = ads.array("h")
+        sample_index = 0
+        for duration, amplitude in segments:
+            count = int(round(duration * 16000))
+            for index in range(count):
+                value = int(amplitude * math.sin(2.0 * math.pi * 440.0 * (sample_index + index) / 16000)) if amplitude else 0
+                pcm.append(value)
+            sample_index += count
+        with wave.open(str(destination), "wb") as output:
+            output.setnchannels(1)
+            output.setsampwidth(2)
+            output.setframerate(16000)
+            output.writeframes(pcm.tobytes())
+        return pcm, {"quiet_speech_start": 3.40, "quiet_speech_end": 3.80}
 
     @unittest.skipUnless(FFMPEG and FFPROBE, "FFmpeg unavailable")
     def test_neutral_audio_is_zero_pcm_and_mode_separates_fingerprint(self):

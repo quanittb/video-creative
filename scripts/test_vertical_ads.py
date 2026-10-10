@@ -35,6 +35,7 @@ DEFAULT_CACHE_DIR = Path(r"C:\vcs_cache")
 PROFILE_NAMES = ("F10", "A10", "A10HQ")
 PAUSE_RMS_THRESHOLD_DBFS = -60.0
 PAUSE_MIN_DURATION_SECONDS = 0.32
+PAUSE_FORCE_MIN_DURATION_SECONDS = 0.16
 PAUSE_ANALYSIS_WINDOW_SECONDS = 0.02
 PAUSE_MAX_INTERRUPTION_SECONDS = 0.04
 PAUSE_TRANSITION_SECONDS = 0.08
@@ -232,22 +233,142 @@ def validate_audio_offset_ms(value: int) -> int:
     return value
 
 
+def _normalized_wav_info(path: Path) -> Dict[str, Any]:
+    try:
+        with wave.open(str(path), "rb") as audio:
+            params = audio.getparams()
+            if (audio.getcomptype() != "NONE" or params.nchannels != 1 or params.sampwidth != 2
+                    or params.framerate != 16000):
+                raise ValueError("Audio conditioning requires normalized 16 kHz mono PCM16 WAV.")
+            return {"sample_rate": params.framerate, "sample_count": params.nframes,
+                    "duration_seconds": round(params.nframes / float(params.framerate), 6)}
+    except (OSError, wave.Error) as error:
+        raise RuntimeError("Could not inspect normalized PCM WAV: {}".format(error)) from error
+
+
+def _read_normalized_pcm(path: Path) -> Tuple[wave._wave_params, array]:
+    try:
+        with wave.open(str(path), "rb") as audio:
+            params = audio.getparams()
+            if (audio.getcomptype() != "NONE" or params.nchannels != 1 or params.sampwidth != 2
+                    or params.framerate != 16000):
+                raise ValueError("Audio conditioning requires normalized 16 kHz mono PCM16 WAV.")
+            pcm = array("h")
+            pcm.frombytes(audio.readframes(params.nframes))
+    except (OSError, wave.Error) as error:
+        raise RuntimeError("Could not read normalized PCM WAV: {}".format(error)) from error
+    if sys.byteorder != "little":
+        pcm.byteswap()
+    if len(pcm) != params.nframes:
+        raise ValueError("Normalized WAV frame count did not match its decoded PCM samples.")
+    return params, pcm
+
+
+def _write_normalized_pcm(destination: Path, params: wave._wave_params, pcm: array, purpose: str) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name("." + destination.name + ".tmp")
+    if destination.exists() or temporary.exists():
+        raise FileExistsError("Refusing to overwrite {} WAV: {}".format(purpose, destination))
+    try:
+        with wave.open(str(temporary), "wb") as output_wav:
+            output_wav.setnchannels(params.nchannels)
+            output_wav.setsampwidth(params.sampwidth)
+            output_wav.setframerate(params.framerate)
+            data = pcm.tobytes()
+            if sys.byteorder != "little":
+                emitted = array("h", pcm)
+                emitted.byteswap()
+                data = emitted.tobytes()
+            output_wav.writeframes(data)
+        os.replace(str(temporary), str(destination))
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def gate_pause_audio(
+    source: Path,
+    destination: Path,
+    min_pause_seconds: float = PAUSE_MIN_DURATION_SECONDS,
+) -> Dict[str, Any]:
+    """Zero only RMS/hysteresis-confirmed pauses in the MuseTalk conditioning WAV."""
+    intervals = detect_silence_intervals(source, min_duration_seconds=min_pause_seconds)
+    params, pcm = _read_normalized_pcm(source)
+    gated_intervals: List[Dict[str, Any]] = []
+    gated_sample_count = 0
+    changed_sample_count = 0
+    for interval in intervals:
+        start_sample = max(0, min(len(pcm), int(round(interval["start_seconds"] * params.framerate))))
+        end_sample = max(start_sample, min(len(pcm), int(round(interval["end_seconds"] * params.framerate))))
+        if end_sample <= start_sample:
+            continue
+        changed_sample_count += sum(sample != 0 for sample in pcm[start_sample:end_sample])
+        pcm[start_sample:end_sample] = array("h", [0]) * (end_sample - start_sample)
+        gated_sample_count += end_sample - start_sample
+        gated_intervals.append({**interval, "start_sample": start_sample, "end_sample": end_sample,
+                                "sample_count": end_sample - start_sample})
+    _write_normalized_pcm(destination, params, pcm, "pause-gated conditioning")
+    return {
+        "status": "applied" if gated_intervals else "no_qualifying_pauses",
+        "method": "digital-zero PCM16 gate before MuseTalk Whisper feature extraction",
+        "source": str(source.resolve()),
+        "source_sha256": musetalk.sha256_file(source),
+        "path": str(destination.resolve()),
+        "sha256": musetalk.sha256_file(destination),
+        "sample_rate": params.framerate,
+        "sample_count": len(pcm),
+        "duration_seconds": round(len(pcm) / float(params.framerate), 6),
+        "minimum_pause_seconds": min_pause_seconds,
+        "interval_count": len(gated_intervals),
+        "gated_sample_count": gated_sample_count,
+        "gated_duration_seconds": round(gated_sample_count / float(params.framerate), 6),
+        "changed_nonzero_sample_count": changed_sample_count,
+        "intervals": gated_intervals,
+        "output_audio_unchanged": True,
+    }
+
+
+def _disabled_pause_gate_record(audio_path: Path, policy: str) -> Dict[str, Any]:
+    info = _normalized_wav_info(audio_path)
+    digest = musetalk.sha256_file(audio_path)
+    return {
+        "status": "disabled", "requested_policy": policy,
+        "method": "none; pause gating disabled by CLI",
+        "source": str(audio_path.resolve()), "source_sha256": digest,
+        "path": str(audio_path.resolve()), "sha256": digest,
+        **info, "minimum_pause_seconds": None, "interval_count": 0,
+        "gated_sample_count": 0, "gated_duration_seconds": 0.0,
+        "changed_nonzero_sample_count": 0, "intervals": [], "output_audio_unchanged": True,
+    }
+
+
+def _offset_pause_intervals(
+    intervals: Sequence[Mapping[str, Any]], sample_count: int, offset_ms: int,
+    sample_rate: int = 16000,
+) -> List[Dict[str, Any]]:
+    shift = abs(offset_ms) * sample_rate // 1000
+    direction = 1 if offset_ms > 0 else -1 if offset_ms < 0 else 0
+    moved: List[Dict[str, Any]] = []
+    for interval in intervals:
+        start = max(0, min(sample_count, int(interval["start_sample"]) + direction * shift))
+        end = max(0, min(sample_count, int(interval["end_sample"]) + direction * shift))
+        if end <= start:
+            continue
+        moved.append({"start_seconds": round(start / float(sample_rate), 6),
+                      "end_seconds": round(end / float(sample_rate), 6),
+                      "duration_seconds": round((end - start) / float(sample_rate), 6),
+                      "start_sample": start, "end_sample": end, "sample_count": end - start})
+    return moved
+
+
 def shift_pcm_wav(source: Path, destination: Path, offset_ms: int) -> Dict[str, Any]:
     """Shift normalized PCM for MuseTalk conditioning; positive delays mouth timing."""
     validate_audio_offset_ms(offset_ms)
     try:
-        with wave.open(str(source), "rb") as input_wav:
-            params = input_wav.getparams()
-            if (input_wav.getcomptype() != "NONE" or params.nchannels != 1 or params.sampwidth != 2
-                    or params.framerate != 16000):
-                raise ValueError("Audio offset requires normalized 16 kHz mono PCM16 WAV.")
-            sample_count = params.nframes
-            pcm = array("h")
-            pcm.frombytes(input_wav.readframes(sample_count))
+        params, pcm = _read_normalized_pcm(source)
     except (OSError, wave.Error) as error:
         raise RuntimeError("Could not read normalized PCM for audio offset: {}".format(error)) from error
-    if sys.byteorder != "little":
-        pcm.byteswap()
+    sample_count = params.nframes
     if len(pcm) != sample_count:
         raise ValueError("Normalized WAV frame count did not match its decoded PCM samples.")
     shift_samples = abs(offset_ms) * params.framerate // 1000
@@ -262,26 +383,7 @@ def shift_pcm_wav(source: Path, destination: Path, offset_ms: int) -> Dict[str, 
         shifted.extend([0] * shift_samples)
     else:
         shifted = pcm
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name("." + destination.name + ".tmp")
-    if destination.exists() or temporary.exists():
-        raise FileExistsError("Refusing to overwrite audio-offset WAV: {}".format(destination))
-    try:
-        with wave.open(str(temporary), "wb") as output_wav:
-            output_wav.setnchannels(params.nchannels)
-            output_wav.setsampwidth(params.sampwidth)
-            output_wav.setframerate(params.framerate)
-            data = shifted.tobytes()
-            if sys.byteorder != "little":
-                # `array` was byte-swapped above only for parsing; emit WAV little-endian.
-                emitted = array("h", shifted)
-                emitted.byteswap()
-                data = emitted.tobytes()
-            output_wav.writeframes(data)
-        os.replace(str(temporary), str(destination))
-    except Exception:
-        temporary.unlink(missing_ok=True)
-        raise
+    _write_normalized_pcm(destination, params, shifted, "audio-offset conditioning")
     return {"offset_ms": offset_ms, "conditioning_sign": "positive delays mouth; negative advances mouth",
             "sample_offset": shift_samples, "sample_rate": params.framerate,
             "duration_seconds": round(sample_count / float(params.framerate), 6),
@@ -764,7 +866,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bbox-shift", type=int, default=0)
     parser.add_argument("--parsing-mode", choices=("jaw", "raw"), default="jaw")
     parser.add_argument("--pause-mouth-closure", choices=("auto", "force", "off"), default="auto",
-                        help="auto cần manifest speech + audio SHA-256 trùng khớp; dùng cùng frame motion base khi cả output và source frame đều trong pause. force bỏ qua cổng mode/hash nhưng vẫn cần source-time pause đã xác minh; off tắt hoàn toàn.")
+                        help="Gate PCM pause cho MuseTalk và correction sau render: auto mute pause >=0.32s, force >=0.16s; correction auto cần manifest speech + SHA khớp và source-time pause an toàn. off tắt cả gate lẫn correction.")
     parser.add_argument("--audio-offset-ms", type=int, default=0,
                         help="Dịch audio chỉ cho MuseTalk conditioning theo bước 40ms, giới hạn ±160ms. Dương làm miệng trễ audio; âm làm miệng đi trước. Audio output vẫn không dịch.")
     parser.add_argument("--audio-offset-sweep", action="store_true",
@@ -1068,8 +1170,9 @@ def _prepare_conditioning_audio(
     ffmpeg: str,
     ffprobe: str,
     offsets_ms: Sequence[int],
-) -> Tuple[Path, Dict[int, Path], float, float]:
-    """Normalize once, then create fixed-length offset variants for conditioning only."""
+    pause_policy: str,
+) -> Tuple[Path, Path, Dict[int, Path], float, float, Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    """Normalize once, gate reliable pauses, then create fixed-length offset variants."""
     intermediate = job_dir / "intermediate"
     intermediate.mkdir(parents=True, exist_ok=True)
     original = intermediate / "audio_unshifted_16k_mono.wav"
@@ -1078,17 +1181,62 @@ def _prepare_conditioning_audio(
         resolve_project_path(args.audio), original, args.duration, ffmpeg, ffprobe,
     )
     normalization_seconds = time.perf_counter() - started
-    result: Dict[int, Path] = {0: original}
+
+    gate_started = time.perf_counter()
+    if pause_policy == "off":
+        gated_audio = original
+        gate_record = _disabled_pause_gate_record(original, pause_policy)
+    else:
+        minimum_pause_seconds = (PAUSE_FORCE_MIN_DURATION_SECONDS if pause_policy == "force"
+                                 else PAUSE_MIN_DURATION_SECONDS)
+        gated_audio = intermediate / "audio_conditioning_pause_gated_16k_mono.wav"
+        gate_record = gate_pause_audio(original, gated_audio, minimum_pause_seconds)
+        gate_record["requested_policy"] = pause_policy
+    gate_wall_seconds = time.perf_counter() - gate_started
+    gate_record["preparation_wall_seconds"] = round(gate_wall_seconds, 3)
+
+    result: Dict[int, Path] = {0: gated_audio}
+    variant_records: Dict[str, Dict[str, Any]] = {}
+    base_gate_intervals = gate_record.get("intervals", [])
     offset_started = time.perf_counter()
     for offset in sorted(set(offsets_ms)):
         validate_audio_offset_ms(offset)
         if offset == 0:
-            continue
-        shifted = intermediate / "audio_conditioning_{:+d}ms.wav".format(offset)
-        shift_pcm_wav(original, shifted, offset)
+            shifted = gated_audio
+            offset_record = {"offset_ms": 0, "sample_offset": 0, "sample_rate": 16000,
+                             "duration_seconds": round(actual_duration, 6),
+                             "original_audio_preserved_for_output": True}
+        else:
+            shifted = intermediate / "audio_conditioning_{:+d}ms.wav".format(offset)
+            offset_record = shift_pcm_wav(gated_audio, shifted, offset)
         result[offset] = shifted
+        variant_info = _normalized_wav_info(shifted)
+        moved_intervals = _offset_pause_intervals(
+            base_gate_intervals, variant_info["sample_count"], offset, variant_info["sample_rate"],
+        )
+        gated_samples = sum(item["sample_count"] for item in moved_intervals)
+        variant_records[str(offset)] = {
+            "path": str(shifted.resolve()),
+            "sha256": musetalk.sha256_file(shifted),
+            **variant_info,
+            "offset": offset_record,
+            "pause_gate": {
+                "status": gate_record["status"],
+                "requested_policy": pause_policy,
+                "interval_count": len(moved_intervals),
+                "gated_sample_count": gated_samples,
+                "gated_duration_seconds": round(gated_samples / float(variant_info["sample_rate"]), 6),
+                "intervals": moved_intervals,
+                "applied_before_offset": True,
+            },
+        }
     offset_seconds = time.perf_counter() - offset_started
-    return original, result, actual_duration, normalization_seconds + offset_seconds
+    gate_record["preparation_wall_seconds"] = round(gate_wall_seconds, 3)
+    gate_record["total_conditioning_preparation_wall_seconds"] = round(
+        normalization_seconds + gate_wall_seconds + offset_seconds, 3,
+    )
+    return (original, gated_audio, result, actual_duration,
+            normalization_seconds + gate_wall_seconds + offset_seconds, gate_record, variant_records)
 
 
 def _prepare_pause_reference_audio(
@@ -1247,10 +1395,13 @@ def run_workflow(args: argparse.Namespace, job_dir: Path, report: Dict[str, Any]
     closure_enabled, closure_reason = _pause_closure_decision(
         args.pause_mouth_closure, source_mouth_mode, manifest_audio_sha256, current_audio_sha256,
     )
-    closure_min_seconds = 0.16 if args.pause_mouth_closure == "force" else PAUSE_MIN_DURATION_SECONDS
+    closure_min_seconds = (PAUSE_FORCE_MIN_DURATION_SECONDS if args.pause_mouth_closure == "force"
+                           else PAUSE_MIN_DURATION_SECONDS)
     offsets = [-40, 0, 40] if args.audio_offset_sweep else [args.audio_offset_ms]
-    unshifted_audio, conditioning_audio, normalized_audio_seconds, audio_preparation_seconds = _prepare_conditioning_audio(
-        args, job_dir, ffmpeg, ffprobe, offsets,
+    (unshifted_audio, gated_conditioning_audio, conditioning_audio,
+     normalized_audio_seconds, audio_preparation_seconds, pause_gate_record,
+     conditioning_variant_records) = _prepare_conditioning_audio(
+        args, job_dir, ffmpeg, ffprobe, offsets, args.pause_mouth_closure,
     )
     pause_reference_audio: Optional[Path] = None
     pause_reference_audio_record: Dict[str, Any] = {"status": "not_required; pause closure is disabled"}
@@ -1263,20 +1414,66 @@ def run_workflow(args: argparse.Namespace, job_dir: Path, report: Dict[str, Any]
     _append_phase(report, "pause_reference_audio_preparation", pause_reference_audio_wall,
                   "Normalize and verify the Echo conditioning audio used to qualify mapped source-frame pauses.",
                   cache_state="PREPARED" if pause_reference_audio is not None else "SKIPPED")
+    if not manifest_audio_sha256:
+        motion_alignment_status = "unverified"
+        motion_alignment_warning = (
+            "Không có SHA-256 audio Echo đã dùng để sinh motion base; đầu/vai đang dùng chuyển động cũ và "
+            "không thể xác nhận bám nhịp kịch bản hiện tại. Nếu cần gesture khớp audio này, hãy sinh lại Echo speech base."
+        )
+    elif manifest_audio_sha256.lower() != current_audio_sha256.lower():
+        motion_alignment_status = "mismatch"
+        motion_alignment_warning = (
+            "Audio hiện tại khác audio dùng để sinh motion base; gate chỉ giúp MuseTalk xử lý khẩu hình/pause, "
+            "không đồng bộ lại gesture đầu/vai. Hãy sinh lại Echo speech base nếu cần cử chỉ bám nhịp kịch bản hiện tại."
+        )
+    else:
+        motion_alignment_status = "verified_match"
+        motion_alignment_warning = None
+    echo_conditioning_audio_path = (
+        base_manifest.get("source_audio") if base_manifest else
+        report["echo"].get("source_manifest_audio")
+    )
+    motion_audio_alignment = {
+        "status": motion_alignment_status,
+        "echo_conditioning_audio_path": echo_conditioning_audio_path,
+        "echo_conditioning_audio_sha256": manifest_audio_sha256,
+        "current_audio_sha256": current_audio_sha256,
+        "sha256_matches": bool(manifest_audio_sha256 and
+                                manifest_audio_sha256.lower() == current_audio_sha256.lower()),
+        "motion_base_path": str(base_video.resolve()),
+        "warning": motion_alignment_warning,
+        "recommended_action": ("Regenerate an Echo speech motion base with the current audio before relying on head/shoulder gesture timing."
+                               if motion_alignment_status != "verified_match" else
+                               "Audio identity is verified; visual gesture quality still needs review."),
+        "scope_note": "Pause gating and mouth correction affect lip-sync only; they do not retime Echo-generated head or shoulder motion.",
+    }
+    report["motion_audio_alignment"] = motion_audio_alignment
+    original_audio_info = _normalized_wav_info(unshifted_audio)
     report["audio_alignment"] = {
         "unshifted_normalized_audio": str(unshifted_audio.resolve()),
         "unshifted_normalized_audio_sha256": musetalk.sha256_file(unshifted_audio),
+        "original_normalized_output_audio": {
+            "path": str(unshifted_audio.resolve()),
+            "sha256": musetalk.sha256_file(unshifted_audio),
+            **original_audio_info,
+        },
+        "pre_offset_conditioning_audio": str(gated_conditioning_audio.resolve()),
+        "pause_gated_conditioning_audio": pause_gate_record,
         "normalized_duration_seconds": round(normalized_audio_seconds, 6),
         "conditioning_variants": {str(offset): str(path.resolve()) for offset, path in conditioning_audio.items()},
+        "conditioning_variant_details": conditioning_variant_records,
         "output_audio_source": "unshifted normalized source; offset affects MuseTalk conditioning only",
-        "output_audio_remux": "AAC is re-encoded from original normalized PCM only when a non-zero offset is selected; later stages stream-copy the AAC track",
+        "output_audio_remux": "AAC is re-encoded from original normalized PCM when the conditioning waveform is offset or pause-gated; later stages stream-copy the AAC track",
+        "feature_alignment_note": "MuseTalk derives Whisper audio features at 50 Hz and renders video at 25 FPS (about 40 ms per output frame); pause gate zeros only detected conditioning pauses and does not alter motion-base frames.",
         "preparation_wall_seconds": round(audio_preparation_seconds, 3),
         "offset_sweep_model_reload_note": "Each preview starts a separate MuseTalk process and reloads weights." if args.audio_offset_sweep else None,
     }
     _append_phase(report, "audio_conditioning_preparation", audio_preparation_seconds,
-                  "Normalize the original audio once and create exact-length PCM offset variants for MuseTalk conditioning only.")
+                  "Normalize output audio; gate reliable pauses in the MuseTalk conditioning copy, then create exact-length offset variants.")
     report["pause_mouth_closure_policy"] = {
         "requested": args.pause_mouth_closure,
+        "conditioning_audio_gate": pause_gate_record,
+        "conditioning_gate_enabled": args.pause_mouth_closure != "off",
         "enabled_for_this_base": closure_enabled,
         "source_mouth_mode": source_mouth_mode or "unknown",
         "source_run_manifest": str(base_manifest_path) if base_manifest_path else
@@ -1290,15 +1487,20 @@ def run_workflow(args: argparse.Namespace, job_dir: Path, report: Dict[str, Any]
         "reference": "same approved motion-base frames with the same forward+reverse ping-pong mapping; no neutral pass or extra model render",
         "source_pause_guard": "Every corrected output frame must be inside an output pause and map to a source frame whose Echo-conditioning-audio time is also a detected pause; unmatched repeated pauses remain uncovered.",
         "fallback_if_correction_fails": "fail workflow and preserve intermediates; never mark output corrected",
-        "note": ("Pause frames are restored from the same animated motion base at the matching ping-pong frame index, "
-                 "so head/shoulder movement continues instead of freezing. Auto requires a speech-mode manifest and matching input-audio SHA-256. "
+        "note": ("The conditioning pause gate is independent of manifest identity and zeros only confidently detected pauses in the current audio. "
+                 "Post-render pause correction is secondary: safe pause frames may be restored from the same animated motion base at the matching ping-pong frame index, "
+                 "so head/shoulder movement continues instead of freezing. Auto correction requires a speech-mode manifest and matching input-audio SHA-256. "
                  "Even then, repeated pauses are corrected only when the mapped source time was also silent during Echo conditioning. "
-                 "Force bypasses mode/audio identity checks but still requires verified source-time silence; it also admits shorter pauses."),
+                 "Force uses a 0.16s gate/correction threshold and bypasses correction mode/audio identity checks, but still requires verified source-time silence. "
+                 "Neither gate nor correction guarantees perfect lip-sync, and neither retimes Echo head/shoulder gesture."),
     }
+    print("MuseTalk pause conditioning gate: {} | {} interval(s), {} samples zeroed".format(
+        pause_gate_record["status"], pause_gate_record["interval_count"], pause_gate_record["gated_sample_count"],
+    ))
     if not closure_enabled:
-        print("Pause mouth closure: skipped ({})".format(closure_reason))
+        print("Post-render pause correction: skipped ({})".format(closure_reason))
     else:
-        print("Pause mouth closure: enabled ({}, minimum {:.2f}s)".format(closure_reason, closure_min_seconds))
+        print("Post-render pause correction: enabled ({}, minimum {:.2f}s)".format(closure_reason, closure_min_seconds))
     outputs: List[Dict[str, Any]] = []
     settings = [("first", args.bbox_shift, args.parsing_mode, args.audio_offset_ms)]
     if args.action == "benchmark":
@@ -1337,16 +1539,29 @@ def run_workflow(args: argparse.Namespace, job_dir: Path, report: Dict[str, Any]
         muse_meta["render_manifest"] = str(run_manifest_path)
         muse_meta["model_weights_reloaded_for_this_process"] = bool(manifest.get("model_weights_reloaded_for_this_process", True))
         original_intermediate = muse_data["path"]
+        conditioning_variant = conditioning_variant_records[str(audio_offset_ms)]
+        unshifted_audio_sha256 = musetalk.sha256_file(unshifted_audio)
+        conditioning_differs_from_output = conditioning_variant["sha256"] != unshifted_audio_sha256
+        needs_audio_restore = audio_offset_ms != 0 or conditioning_differs_from_output
         muse_data["audio_conditioning"] = {
             "offset_ms": audio_offset_ms,
             "sign": "positive delays mouth relative to original audio; negative advances mouth",
             "conditioning_audio": str(conditioning_audio[audio_offset_ms].resolve()),
+            "conditioning_audio_sha256": conditioning_variant["sha256"],
+            "sample_rate": conditioning_variant["sample_rate"],
+            "sample_count": conditioning_variant["sample_count"],
+            "duration_seconds": conditioning_variant["duration_seconds"],
+            "pause_gate": conditioning_variant["pause_gate"],
             "unshifted_output_audio": str(unshifted_audio.resolve()),
             "conditioning_audio_only": audio_offset_ms != 0,
+            "conditioning_waveform_differs_from_output": conditioning_differs_from_output,
         }
         audio_restore_wall = 0.0
-        audio_restore_record: Dict[str, Any] = {"status": "not_needed; MuseTalk conditioned with unshifted audio"}
-        if audio_offset_ms != 0:
+        audio_restore_record: Dict[str, Any] = {
+            "status": "not_needed; MuseTalk conditioned with unshifted audio",
+            "source": str(unshifted_audio.resolve()), "source_sha256": unshifted_audio_sha256,
+        }
+        if needs_audio_restore:
             audio_restore_started = time.perf_counter()
             restored_intermediate = job_dir / "intermediate" / ("audio_unshifted_video_{}.mp4".format(index))
             audio_restore_record = remux_unshifted_audio(
@@ -1357,9 +1572,10 @@ def run_workflow(args: argparse.Namespace, job_dir: Path, report: Dict[str, Any]
             muse_data["path"] = restored_intermediate
             muse_meta["audio_intermediate_original"] = str(original_intermediate.resolve())
         muse_meta["audio_output_restoration"] = audio_restore_record
+        muse_meta["audio_output_restoration_required"] = needs_audio_restore
         muse_meta["audio_offset_restore_wall_seconds"] = round(audio_restore_wall, 3)
         _append_phase(report, "audio_offset_restore_video_{}_wall".format(index), audio_restore_wall,
-                      "Restore unshifted normalized source audio after conditioning-only offset; AAC is copied by later phases.",
+                      "Restore unshifted normalized source audio when conditioning was gated or offset; AAC is copied by later phases.",
                       video_index=index)
         closure_started = time.perf_counter()
         if not closure_enabled:

@@ -52,9 +52,15 @@ Chỉ tiếp tục khi `dir` tìm thấy file. Muốn test khẩu hình ngay tr�
 
 ## 2. Duyệt khẩu hình trước khi chạy dài
 
-Trong mẫu đã kiểm tra, motion base/voice preview tự khép miệng ở đoạn nghỉ nhưng đầu ra MuseTalk vẫn hở miệng tại một số frame. Bộ xử lý dò pause từ WAV PCM gốc và chỉ crossfade sang frame motion base khi **cả** frame output lẫn thời điểm nguồn của frame được ánh xạ cũng nằm trong pause. Cách này giữ chuyển động đầu/vai, không chạy inference thêm và không làm đứng hình cả người. Khoảng speech ngoài vùng chuyển tiếp vẫn giữ frame MuseTalk; audio output không bị dịch.
+MuseTalk upstream tạo Whisper audio features ở **50 Hz**, rồi lấy context tương ứng cho video **25 FPS** (khoảng 40 ms mỗi frame); mỗi frame dùng feature context gồm nhiều bước kề nhau. Vì vậy audio đã im lặng không đảm bảo mọi frame miệng sẽ tự khép đúng ngay tại ranh giới pause. Pipeline giờ tạo một bản conditioning riêng: dò pause bằng RMS PCM/hysteresis, rồi đặt mẫu PCM16 trong vùng đủ tin cậy về digital zero **trước** khi MuseTalk trích Whisper features. `auto` mute pause dài từ 0,32 giây; `force` từ 0,16 giây. Ngưỡng RMS và bảo vệ giọng nhỏ giữ phần speech ngoài các khoảng đã nhận diện nguyên vẹn. Đây chỉ là gate audio cho MuseTalk: không thay frame motion base, không làm đứng hình đầu/vai, không thêm model hay tải dữ liệu, chỉ thêm lượt scan/ghi WAV CPU.
 
-`auto` chỉ bật nếu Echo manifest xác nhận mode `speech` **và** SHA-256 của audio hiện tại trùng chính xác với file audio đã dùng để sinh motion base. Motion base dài 5,16 giây được MuseTalk lặp tiến/lùi trong chu kỳ khoảng 10,32 giây; vì vậy một pause muộn có thể ánh xạ về source frame được sinh trong lúc đang nói. Các frame như vậy sẽ không bị thay thế. Report ghi `requested_intervals`, `intervals` được xử lý an toàn và `uncovered_intervals`; không mặc định rằng mọi pause trong audio dài đã được khép.
+Offset `-40/0/+40 ms` được áp dụng **sau gate**, vì vậy khoảng pause trong conditioning audio dịch cùng lời nói. Final MP4 luôn nhận lại audio chuẩn hóa gốc, không gate và không dịch. Nếu gate làm thay đổi waveform hoặc chọn offset khác 0, pipeline remux audio gốc sau MuseTalk trước các bước correction/export.
+
+Sau inference, bước correction bằng frame motion base vẫn là lớp phụ: chỉ crossfade khi **cả** frame output lẫn thời điểm nguồn của frame được ánh xạ đều nằm trong pause. Cách này giữ chuyển động đầu/vai liên tục và không chạy inference thêm. `auto` correction cần Echo manifest xác nhận mode `speech` cùng SHA-256 audio trùng; `force` bỏ qua cổng mode/hash nhưng vẫn cần xác minh source-time pause. Motion base 5,16 giây được lặp tiến/lùi trong chu kỳ khoảng 10,32 giây, nên pause muộn có thể không có frame nguồn im lặng tương ứng. Report tách các pause được yêu cầu, được correction và chưa được correction.
+
+Report `motion_audio_alignment` so SHA-256 audio Echo dùng để tạo cử chỉ với audio hiện tại. Khi mismatch hoặc không có manifest, cảnh báo rằng gate/correction chỉ tác động khẩu hình, không đồng bộ lại gesture đầu/vai; hãy tạo Echo speech base mới nếu cần cử chỉ theo đúng kịch bản. `--pause-mouth-closure off` tắt cả gate và post-render correction. Không thể cam kết lip-sync hoàn hảo bằng ngưỡng pause: Whisper context, giới hạn 25 FPS và sai số của model vẫn có thể làm khẩu hình lệch; phải nghe/xem A/B video thật trước khi chạy dài.
+
+Tham chiếu upstream: [MuseTalk `audio_processor.py`](https://github.com/TMElyralab/MuseTalk/blob/main/musetalk/utils/audio_processor.py) (16 kHz input, 50 Hz Whisper features và cách ánh xạ sang FPS output).
 
 Kiểm tra cấu hình trước:
 
@@ -86,9 +92,9 @@ set "LIP_MASK=jaw"
 
 Nếu baseline tốt hơn, giữ `LIP_MASK=jaw`. Nếu clip `raw_mask` khớp môi hơn, đổi `LIP_MASK=raw`. Nếu cả hai chưa đạt, gửi các clip ngắn để đánh giá tiếp; chưa chạy video dài.
 
-Để `--pause-mouth-closure auto` mặc định cho preview và render. `auto` yêu cầu manifest Echo có mode `speech` và SHA-256 audio khớp với file hiện tại; base `neutral`, khác audio, thiếu hash hoặc không tìm được manifest sẽ bị bỏ qua an toàn. Kể cả khi khớp, chỉ frame nguồn nằm trong pause của audio conditioning mới được dùng; các pause muộn không có frame nguồn tương ứng được ghi là chưa xử lý.
+Để `--pause-mouth-closure auto` mặc định cho preview và render. Gate conditioning `auto` chạy trên audio hiện tại, kể cả khi base được tái sử dụng; riêng correction frame sau render yêu cầu manifest Echo có mode `speech` và SHA-256 audio trùng file hiện tại. Base neutral, khác audio, thiếu hash hoặc không tìm được manifest sẽ bỏ qua correction an toàn. Kể cả khi khớp, chỉ frame nguồn nằm trong pause của audio conditioning mới được dùng; các pause muộn không có frame nguồn tương ứng được ghi là chưa xử lý.
 
-`force` là override rõ ràng cho cổng mode/hash, ví dụ khi audio đầu ra khác audio đã dùng tạo base. Nó vẫn **không** lấy frame nguồn tại thời điểm Echo đang nghe lời nói: cần đọc và xác minh được file `source_audio` cùng SHA-256 trong manifest; nếu thiếu thì report ghi các pause chưa xử lý và không blend frame nào. `force` hạ thời lượng pause đầu ra tối thiểu từ 0,32s xuống 0,16s nhưng vẫn giữ ngưỡng RMS và quy tắc source-time silence. `off` tắt correction hoàn toàn.
+`force` đặt ngưỡng gate/correction xuống pause từ 0,16 giây. Nó bỏ qua cổng mode/hash của correction, ví dụ khi audio đầu ra khác audio đã dùng tạo base, nhưng vẫn **không** lấy frame nguồn tại thời điểm Echo đang nghe lời nói: cần đọc và xác minh được file `source_audio` cùng SHA-256 trong manifest; nếu thiếu thì report ghi các pause chưa xử lý và không blend frame nào. `off` tắt gate conditioning lẫn correction frame sau render.
 
 Offset mặc định là 0ms và không tự đoán. Nếu khẩu hình có vẻ sớm/trễ, dùng preview A/B quanh 0 bằng jaw mask:
 
@@ -130,7 +136,7 @@ Mỗi job giữ riêng native intermediate và hai file `vertical_ad_1080x1920_f
 
 Thời gian `export_wall_seconds` gồm đọc/probe intermediate, FFmpeg CPU encode, probe và hash xác minh. `encoder_process_seconds` chỉ là FFmpeg. Tổng các phase render có tên `render_phase_sum`, không giả là toàn bộ wall time. Không dùng lại MP4 cũ để tính tốc độ render. Khi dùng `--base-video`, Echo được ghi `REUSED` với 0s; thời gian tạo nền trước đó nằm trong `run_manifest.json` của nền.
 
-`pause_mouth_closure_wall_seconds` ghi riêng thời gian dò pause và blend frame khi có khoảng nghỉ. Bước này tái sử dụng motion base có sẵn, không chạy thêm MuseTalk hoặc tạo cache/model riêng. Audio normalization/offset và remux AAC được tách thành field/phase riêng; MuseTalk vẫn reload weights mỗi lần.
+`audio_alignment.pause_gated_conditioning_audio` ghi WAV gating thực tế, SHA-256, thời lượng, số interval và số sample đã mute; `conditioning_variant_details` ghi hash/interval của từng offset sau gate, còn `conditioning_variants` giữ nguyên bản đồ đường dẫn cũ. `motion_audio_alignment` so SHA audio Echo với audio hiện tại và cảnh báo khi cử chỉ đầu/vai đang dựa trên audio khác. `pause_mouth_closure_wall_seconds` ghi riêng thời gian dò pause và blend frame sau render; gate thêm scan/ghi WAV CPU, không chạy thêm MuseTalk hay tải model. Audio normalization/gate/offset/remux AAC được tách thành field trong report; MuseTalk vẫn reload weights mỗi lần.
 
 ## 4. Một video production hoặc các mốc 30/60 giây
 
