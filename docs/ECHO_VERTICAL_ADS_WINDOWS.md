@@ -160,7 +160,25 @@ Nếu tự dò không chọn đúng MuseTalk Python/checkout, thêm `--musetalk-
 
 So bản này với `vertical_ad_1080x1920.mp4` gốc của job. Chuyển động đầu/vai ngoài vùng môi phải tiếp tục chạy. Nếu coverage không đủ hoặc không có donor đạt kiểm tra, core mới ghi report thất bại và không xuất video final; không hạ ngưỡng bằng tay. Report và test hiện tại chỉ xác nhận hợp đồng dữ liệu/compositing trên synthetic clip; chưa xác nhận chất lượng hình ảnh hay thời gian trên RTX 3060. Giữ `--pause-correction-region` mặc định `full-frame` cho các lệnh `test_vertical_ads.bat` cho đến khi duyệt A/B.
 
-### Dùng lại job hiện tại khi frame nguồn yên không có donor môi khép
+### Preview donor cùng pose từ full render
+
+Trước khi tạo lại video dài, có thể thử speech-pose-bank trên một preview ngắn. Chế độ này dùng toàn bộ video MuseTalk đã có làm donor bank, nhưng chỉ xuất prefix vài giây để kiểm tra. Candidate donor phải là frame không rơi vào pause của audio unshifted và có đúng source-frame index theo chu kỳ ping-pong của motion base. Lệnh không chạy lại Echo hoặc sinh lip-sync MuseTalk; nó vẫn chạy FaceParsing và face-landmark inference cục bộ để chọn donor và QC. Mask thay các nhãn môi 11/12/13; căn chỉnh chỉ tịnh tiến, không co giãn dọc/ngang. Mọi donor vẫn phải qua parser, landmark closure, geometry, coverage và QC trên video đã mã hóa.
+
+Trong CMD tại thư mục dự án, dùng job đã render:
+
+```bat
+set "JOB=output\vertical_ads\job_20261010_224236_c886c7c9"
+set "ECHO_BASE=output\echo_flash\a10_0682611f141d\motion_base.mp4"
+dir "%JOB%\intermediate\audio_unshifted_16k_mono.wav"
+dir "%JOB%\intermediate\musetalk_video_1.mp4"
+dir "%JOB%\vertical_ad_report.json"
+dir "%ECHO_BASE%"
+python -u scripts\reprocess_pause_correction.py --job-dir "%JOB%" --motion-base "%ECHO_BASE%" --pause-correction-region mouth-only --mouth-donor-mode speech-pose-bank --preview-seconds 10 --output-label speechpose_preview
+```
+
+Script tự dùng `audio_unshifted_video_1.mp4` nếu có; nếu không, nó lấy `musetalk_video_1.mp4` và ghép audio unshifted đã xác minh trước khi xây donor bank. Không cần phải có riêng file `audio_unshifted_video_1.mp4`. Output dự kiến là `%JOB%\vertical_ad_1080x1920_pause_mouth_only_speechpose_preview_reprocessed.mp4` cùng report `%JOB%\pause_mouth_only_speechpose_preview_reprocess_report.json`. Preview chỉ dài tối đa 10 giây; audio là prefix không đổi nội dung của AAC nguồn. Nếu bất kỳ pause frame nào không có donor cùng pose đủ kín/đạt geometry, hoặc final-frame QC không đạt, lệnh dừng và không promote HD output. Đọc report trước khi mở video. Nếu báo cáo không tạo final, đừng nới gate: nó có nghĩa là chính render hiện tại không có đủ donor cùng pose đạt chuẩn.
+
+### Pass cũ: donor MuseTalk im lặng
 
 Nếu report cũ ghi `no_confident_mouth_donor_alignment`, `valid_closed_donor_frames=0` và `corrected_pause_frame_count=0`, video HD cũ thực chất chưa được sửa môi nghỉ. Không chạy lại toàn bộ 55 giây. Dùng chế độ `silence-conditioned` để tạo một donor pass ngắn từ chính motion base, sau đó thử ghép trên intermediate speech đã có; avatar cache trong job được tái sử dụng. Lượt donor vẫn có thể không đạt nếu MuseTalk không khép môi đủ ở frame tương ứng; khi đó report sẽ nêu lý do và không tạo final.
 

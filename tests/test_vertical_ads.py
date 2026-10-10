@@ -129,6 +129,12 @@ class VerticalAdsTests(unittest.TestCase):
         self.assertIsNone(reprocess_pause.make_parser().parse_args([
             "--job-dir", "job", "--motion-base", "base.mp4",
         ]).reuse_silence_donor_label)
+        preview_args = reprocess_pause.make_parser().parse_args([
+            "--job-dir", "job", "--motion-base", "base.mp4",
+            "--pause-correction-region", "mouth-only", "--mouth-donor-mode", "speech-pose-bank",
+            "--preview-seconds", "5.16", "--output-label", "speechpose_preview",
+        ])
+        self.assertEqual(preview_args.preview_seconds, 5.16)
         self.assertEqual(args.audio_offset_ms, 0)
         help_text = " ".join(ads.make_parser().format_help().split())
         self.assertIn("speech dùng audio thật để sinh chuyển động", help_text)
@@ -549,6 +555,7 @@ class VerticalAdsTests(unittest.TestCase):
         self.assertEqual(alpha.shape, labels.shape)
         self.assertGreater(np.count_nonzero(alpha), 0)
         self.assertLess(np.count_nonzero(alpha), labels.size * 0.02)
+        self.assertTrue(np.any(alpha[labels == 11] > 0), "semantic mask must include the inner-mouth cavity")
 
         open_labels = labels.copy()
         open_labels[120:130, 87:113] = 11
@@ -611,6 +618,39 @@ class VerticalAdsTests(unittest.TestCase):
         )
         self.assertEqual(int(warped[49, 52]), 255)
         self.assertEqual(int(np.count_nonzero(warped)), 1)
+
+    def test_speech_pose_transform_translates_without_rescaling_mouth_aperture(self):
+        if mouth_masks.cv2 is None or mouth_masks.np is None:
+            self.skipTest("OpenCV/NumPy from the MuseTalk runtime are required for mouth alignment checks")
+        np = mouth_masks.np
+        donor = np.zeros((64, 64), dtype=np.uint8)
+        donor[30:33, 30:34] = 255
+        warped = mouth_masks._warp_donor_to_target(
+            donor, [10, 10, 50, 50], [12, 12, 48, 48],
+            [29, 29, 35, 34], [31, 29, 37, 34],
+            interpolation=mouth_masks.cv2.INTER_NEAREST,
+            preserve_donor_scale=True,
+        )
+        self.assertEqual(int(np.count_nonzero(warped)), int(np.count_nonzero(donor)))
+        self.assertTrue(np.array_equal(warped[30:33, 32:36], donor[30:33, 30:34]))
+
+    def test_speech_pose_helper_rejects_forged_candidate_map_before_video_io(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request_path = root / "request.json"
+            request_path.write_text(json.dumps({
+                "fps": 25, "width": 64, "height": 80, "output_frame_count": 1,
+                "donor_mode": "speech-pose-bank", "donor_video_frame_count": 3,
+                "donor_source_frame_count": 1, "motion_base_frame_count": 1,
+                "pause_intervals": [{"start_seconds": 0.0, "end_seconds": 0.04}],
+                "speech_pose_candidate_frame_indices_by_source": {"0": [2]},
+                "output_pause_frames": [{"output_frame_index": 0, "exact_source_frame_index": 0}],
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "do not match pause exclusions"):
+                mouth_masks.run_extraction(
+                    root / "rendered.mp4", root / "donor.mp4", root / "masks", root / "patches",
+                    root / "report.json", request_path, parser=object(), torch=object(),
+                )
 
     def test_mouth_only_color_match_reduces_lip_seam_without_touching_inner_mouth(self):
         if mouth_masks.cv2 is None or mouth_masks.np is None:
@@ -1429,6 +1469,26 @@ class VerticalAdsTests(unittest.TestCase):
         self.assertAlmostEqual(sum(item["duration_seconds"] for item in residual), 0.46, places=6)
         self.assertEqual(ads.pingpong_frame_index(60, 30), 0)
 
+    def test_speech_pose_donor_bank_excludes_pause_and_tail_and_requires_exact_pose(self):
+        pause_intervals = [
+            {"start_seconds": 0.0, "end_seconds": 0.04},
+            {"start_seconds": 0.20, "end_seconds": 0.24},
+        ]
+        # With N=3, pose 0 occurs at 0, 5, 6, 11 on the 12-frame
+        # full render. Frame 0 is the target pause and frame 5 overlaps
+        # another pause, so only frames 6 and 11 are valid donors.
+        candidates = ads.speech_pose_donor_candidates(
+            [0], pause_intervals, output_frame_count=12, source_frame_count=3, fps=25,
+        )
+        self.assertEqual(candidates, {0: [6, 11]})
+        self.assertTrue(all(ads.pingpong_frame_index(index, 3) == 0 for index in candidates[0]))
+        self.assertEqual(
+            ads.speech_pose_donor_candidates(
+                [0], pause_intervals, output_frame_count=10, source_frame_count=3, fps=25,
+            ),
+            {0: [6]},
+        )
+
     def test_silence_donor_lookup_never_falls_back_from_exact_source_index(self):
         unrelated = (object(), {"closed": True}, object())
         requested = {"exact_source_frame_index": 8, "donor_frame_index": 8}
@@ -1583,10 +1643,12 @@ class VerticalAdsTests(unittest.TestCase):
                 "unshifted_audio": audio, "echo_reference_audio": echo_audio,
             }
             cases = (
-                ("none", "no_confident_mouth_donor_alignment", "none", 0),
-                ("partial", "partially_applied", "partial", 1),
+                ("none", "no_confident_mouth_donor_alignment", "none", 0, "quiet-source", None),
+                ("partial", "partially_applied", "partial", 1, "quiet-source", None),
+                ("speech_pose_no_donor", "no_confident_mouth_donor_alignment", "none", 0,
+                 "speech-pose-bank", 0.12),
             )
-            for label, status, coverage, corrected_count in cases:
+            for label, status, coverage, corrected_count, donor_mode, preview_seconds in cases:
                 correction = {
                     "status": status, "correction_region": "mouth-only",
                     "pause_coverage_status": coverage,
@@ -1604,7 +1666,8 @@ class VerticalAdsTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, "No HD final was promoted"):
                         reprocess_pause.reprocess(
                             job, base, FFMPEG, FFPROBE,
-                            correction_region="mouth-only", output_label=label,
+                            correction_region="mouth-only", mouth_donor_mode=donor_mode,
+                            output_label=label, preview_seconds=preview_seconds,
                         )
                 export.assert_not_called()
                 paths = reprocess_pause._reprocess_output_paths(job, "mouth-only", label)

@@ -178,6 +178,43 @@ def pingpong_frame_index(frame_index: int, source_frame_count: int) -> int:
     return position if position < source_frame_count else 2 * source_frame_count - 1 - position
 
 
+def speech_pose_donor_candidates(
+    output_pause_frame_indices: Sequence[int],
+    pause_intervals: Sequence[Mapping[str, float]],
+    output_frame_count: int,
+    source_frame_count: int,
+    fps: int = FPS,
+) -> Dict[int, List[int]]:
+    """Map each pause's exact base pose to non-pause frames in the existing render.
+
+    Donors are full-audio MuseTalk output frames. The audio pause intervals and
+    timeline boundary are applied before indexing, so pause frames and audio-only
+    tail frames can never enter the bank.
+    """
+    if output_frame_count < 0 or source_frame_count < 1 or fps < 1:
+        raise ValueError("Speech-pose donor mapping requires valid frame counts and FPS.")
+    pause_frames = {int(index) for index in output_pause_frame_indices}
+    if any(index < 0 or index >= output_frame_count for index in pause_frames):
+        raise ValueError("Speech-pose pause frame is outside the rendered video timeline.")
+    target_poses = {pingpong_frame_index(index, source_frame_count) for index in pause_frames}
+    candidates: Dict[int, List[int]] = {source_index: [] for source_index in sorted(target_poses)}
+    for output_index in range(output_frame_count):
+        if output_index in pause_frames:
+            continue
+        start = output_index / float(fps)
+        end = (output_index + 1) / float(fps)
+        if any(
+            float(interval["start_seconds"]) < end - 1e-9
+            and float(interval["end_seconds"]) > start + 1e-9
+            for interval in pause_intervals
+        ):
+            continue
+        source_index = pingpong_frame_index(output_index, source_frame_count)
+        if source_index in candidates:
+            candidates[source_index].append(output_index)
+    return candidates
+
+
 def source_aligned_pause_intervals(
     output_pause_intervals: Sequence[Mapping[str, float]],
     source_pause_intervals: Sequence[Mapping[str, float]],
@@ -802,33 +839,73 @@ def apply_pause_mouth_closure(
     mouth_donor_mode: str = "quiet-source",
     silence_conditioned_donor_video: Optional[Path] = None,
     silence_conditioned_trailing_truncation_verified: bool = False,
+    speech_pose_candidate_frame_indices: Optional[Mapping[int, Sequence[int]]] = None,
     musetalk_dir: Optional[str | Path] = None,
     musetalk_python: Optional[str | Path] = None,
     helper_log_path: Optional[Path] = None,
+    preview_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     if correction_region not in ("full-frame", "mouth-only"):
         raise ValueError("Pause correction region must be full-frame or mouth-only.")
-    if mouth_donor_mode not in ("quiet-source", "silence-conditioned"):
-        raise ValueError("Mouth donor mode must be quiet-source or silence-conditioned.")
+    if mouth_donor_mode not in ("quiet-source", "silence-conditioned", "speech-pose-bank"):
+        raise ValueError("Mouth donor mode must be quiet-source, silence-conditioned or speech-pose-bank.")
     if correction_region != "mouth-only" and mouth_donor_mode != "quiet-source":
-        raise ValueError("Silence-conditioned donor mode is available only with mouth-only correction.")
+        raise ValueError("Non-quiet mouth donor modes are available only with mouth-only correction.")
     if mouth_donor_mode == "silence-conditioned" and silence_conditioned_donor_video is None:
         raise ValueError("Silence-conditioned donor mode requires its MuseTalk donor video.")
+    if preview_seconds is not None and (
+            correction_region != "mouth-only" or mouth_donor_mode != "speech-pose-bank"
+            or not math.isfinite(preview_seconds) or preview_seconds <= 0):
+        raise ValueError("--preview-seconds requires a positive duration with speech-pose-bank mouth-only correction.")
     intervals = detect_silence_intervals(normalized_audio, min_duration_seconds=min_pause_seconds)
+    donor_exclusion_intervals = (
+        detect_silence_intervals(normalized_audio, min_duration_seconds=1.0 / fps)
+        if mouth_donor_mode == "speech-pose-bank" else intervals
+    )
+    correction_duration = min(duration_seconds, preview_seconds) if preview_seconds is not None else duration_seconds
     reference_path = reference_audio or normalized_audio
     source_pause_intervals = detect_silence_intervals(reference_path, min_duration_seconds=1.0 / fps)
     frame_count = count_video_frames(reference_motion_video, ffprobe)
     rendered_frame_count = count_video_frames(rendered_video, ffprobe)
+    if preview_seconds is not None:
+        correction_duration = min(correction_duration, rendered_frame_count / float(fps))
+    requested_intervals = []
+    for interval in intervals:
+        start = float(interval["start_seconds"])
+        end = min(float(interval["end_seconds"]), correction_duration)
+        if start < end:
+            requested_intervals.append({
+                "start_seconds": round(start, 6),
+                "end_seconds": round(end, 6),
+                "duration_seconds": round(end - start, 6),
+            })
+    output_frame_count = (
+        min(rendered_frame_count, int(math.ceil(correction_duration * fps - 1e-9)))
+        if preview_seconds is not None else rendered_frame_count
+    )
     aligned_intervals = source_aligned_pause_intervals(
-        intervals, source_pause_intervals, duration_seconds, frame_count, fps,
-        output_frame_count=rendered_frame_count,
+        requested_intervals, source_pause_intervals, correction_duration, frame_count, fps,
+        output_frame_count=output_frame_count,
     )
     output_pause_frames = pause_frame_indices(
-        intervals, duration_seconds, fps, frame_count=rendered_frame_count,
+        requested_intervals, correction_duration, fps, frame_count=output_frame_count,
     )
+    if mouth_donor_mode == "speech-pose-bank":
+        expected_candidates = speech_pose_donor_candidates(
+            output_pause_frames, donor_exclusion_intervals, rendered_frame_count, frame_count, fps,
+        )
+        supplied_candidates = {
+            int(source_index): sorted(set(int(index) for index in indices))
+            for source_index, indices in (speech_pose_candidate_frame_indices or {}).items()
+        }
+        if speech_pose_candidate_frame_indices is not None and supplied_candidates != expected_candidates:
+            raise ValueError(
+                "Speech-pose donor candidates do not match the verified unshifted-audio pauses and exact ping-pong mapping."
+            )
+        speech_pose_candidate_frame_indices = expected_candidates
     # Audio-duration-based indices are retained only to report pause frames
     # whose audio extends past the decoded visual stream; never process them.
-    audio_pause_frames = pause_frame_indices(intervals, duration_seconds, fps)
+    audio_pause_frames = pause_frame_indices(requested_intervals, correction_duration, fps)
     pause_frames_beyond_video = sorted(set(audio_pause_frames) - set(output_pause_frames))
     source_donor_frames = quiet_source_frame_indices(source_pause_intervals, frame_count, fps)
     manifest_hash = str((reference_audio_provenance or {}).get("manifest_audio_sha256") or "")
@@ -842,7 +919,9 @@ def apply_pause_mouth_closure(
     )
     if not provenance_verified:
         status = "skipped_unverified_reference_audio"
-    elif not intervals:
+    elif preview_seconds is not None and not output_pause_frames:
+        status = "no_qualifying_pauses_in_preview"
+    elif not requested_intervals:
         status = "no_qualifying_pauses"
     elif correction_region == "full-frame" and not aligned_intervals:
         status = "no_source_aligned_silent_frames"
@@ -850,14 +929,20 @@ def apply_pause_mouth_closure(
         status = "no_verified_quiet_source_donor_frames"
     else:
         status = "applied"
-    uncovered_reason = ("no_exact_pingpong_source_frame_is_verified_silent"
-                        if status == "applied" else status)
+    uncovered_reason = (
+        "no_exact_pingpong_source_frame_is_verified_silent"
+        if correction_region == "full-frame" and status == "applied" else
+        "no_validated_closed_donor_for_exact_pingpong_pose"
+        if mouth_donor_mode == "speech-pose-bank" and status == "applied" else
+        "no_validated_mouth_donor" if correction_region == "mouth-only" and status == "applied"
+        else status
+    )
     initial_coverage = aligned_intervals if correction_region == "full-frame" and status == "applied" else []
     uncovered_intervals = subtract_pause_intervals(
-        intervals, initial_coverage, uncovered_reason,
+        requested_intervals, initial_coverage, uncovered_reason,
     )
     uncovered_intervals = classify_uncovered_by_video_duration(
-        uncovered_intervals, min(duration_seconds, rendered_frame_count / float(fps)),
+        uncovered_intervals, min(correction_duration, output_frame_count / float(fps)),
     )
     video_uncovered_intervals = [
         item for item in uncovered_intervals if item.get("reason") != "audio_pause_after_end_of_rendered_video"
@@ -883,15 +968,23 @@ def apply_pause_mouth_closure(
                             "transition_seconds": PAUSE_TRANSITION_SECONDS,
                             "transition_curve": "linear fade within matched source-silent runs",
                             "speech_frames_preserved": True,
-                            "audio_policy": "unshifted output audio stream copied unchanged with FFmpeg -c:a copy"},
+                            "audio_policy": ("copy only the requested preview prefix from the unshifted output audio stream"
+                                             if preview_seconds is not None else
+                                             "unshifted output audio stream copied unchanged with FFmpeg -c:a copy")},
         "pingpong_mapping": (
             "MuseTalk frame_list + reversed frame_list modulo mapping; only exact output/source timestamp matches are eligible"
             if correction_region == "full-frame" else
             "exact ping-pong source frame index is used to select the same frame from a silence-conditioned MuseTalk pass; no unrelated donor fallback is permitted"
             if mouth_donor_mode == "silence-conditioned" else
+            "donor frames are selected only from non-pause frames of this full-audio MuseTalk render with the same exact ping-pong-mapped motion-base source-frame index; no other pose is eligible"
+            if mouth_donor_mode == "speech-pose-bank" else
             "MuseTalk frame_list + reversed frame_list records the exact source timestamp; among fully verified quiet-source donors passing unchanged face-geometry gates, select the smallest inner-mouth fraction, then the lowest geometry score"
         ),
-        "requested_intervals": intervals,
+        "requested_intervals": requested_intervals,
+        "detected_audio_pause_intervals": intervals,
+        "speech_pose_donor_exclusion_intervals": (
+            donor_exclusion_intervals if mouth_donor_mode == "speech-pose-bank" else None
+        ),
         "reference_audio_pause_intervals": source_pause_intervals,
         "intervals": initial_coverage,
         "uncovered_intervals": uncovered_intervals,
@@ -904,6 +997,9 @@ def apply_pause_mouth_closure(
         "requested_output_pause_frame_count": len(output_pause_frames),
         "rendered_video_frame_count": rendered_frame_count,
         "rendered_video_frame_duration_seconds": round(rendered_frame_count / float(fps), 6),
+        "corrected_output_frame_count_requested": output_frame_count,
+        "preview_seconds_requested": preview_seconds,
+        "correction_duration_seconds": round(correction_duration, 6),
         "pause_frame_indices_outside_rendered_video": pause_frames_beyond_video,
         "pause_frame_count_outside_rendered_video": len(pause_frames_beyond_video),
         "verified_quiet_source_frame_indices": source_donor_frames,
@@ -929,6 +1025,8 @@ def apply_pause_mouth_closure(
             if correction_region == "full-frame" else
             "frame_list + frame_list[::-1], modulo 2N, including duplicated turn endpoints; donor index equals mapped source index in a separately silence-conditioned N-frame MuseTalk pass"
             if mouth_donor_mode == "silence-conditioned" else
+            "for each requested output pause, candidate donor indices are non-pause frames in the existing output whose mapped source index equals the pause frame's mapped source index"
+            if mouth_donor_mode == "speech-pose-bank" else
             "donor bank contains only verified quiet-source frames; within existing face-geometry gates, lowest inner-mouth fraction wins, with geometry score as tie-breaker"
             ),
         } if provenance_verified else {
@@ -972,7 +1070,6 @@ def apply_pause_mouth_closure(
     mouth_request_path: Optional[Path] = None
     try:
         if correction_region == "mouth-only":
-            output_frame_count = int(rendered_frame_count or 0)
             pause_frame_set = set(output_pause_frames)
             if mouth_donor_mode == "silence-conditioned":
                 donor_video = Path(silence_conditioned_donor_video).resolve()
@@ -995,6 +1092,15 @@ def apply_pause_mouth_closure(
                         )
                     )
                 helper_donor_mode = "silence-conditioned-exact-source"
+            elif mouth_donor_mode == "speech-pose-bank":
+                donor_video = rendered_video.resolve()
+                donor_frame_count = count_video_frames(donor_video, ffprobe)
+                if donor_frame_count != rendered_frame_count:
+                    raise ValueError(
+                        "Speech-pose donor bank must use every frame of the existing full-audio render: expected {}, got {}."
+                        .format(rendered_frame_count, donor_frame_count)
+                    )
+                helper_donor_mode = "speech-pose-bank"
             else:
                 donor_video = reference_motion_video
                 donor_frame_count = frame_count
@@ -1007,6 +1113,9 @@ def apply_pause_mouth_closure(
                 "donor_mode": helper_donor_mode,
                 "donor_video_frame_count": donor_frame_count,
                 "donor_source_frame_count": frame_count,
+                "planned_output_path": str(destination.resolve()),
+                "rendered_full_audio_video": str(rendered_video.resolve()),
+                "preview_seconds_requested": preview_seconds,
                 "donor_trailing_truncation_verified": bool(
                     helper_donor_mode == "silence-conditioned-exact-source"
                     and silence_conditioned_trailing_truncation_verified
@@ -1014,6 +1123,12 @@ def apply_pause_mouth_closure(
                     and donor_timeline["status"] == "verified_trailing_frame_truncation"
                 ) if helper_donor_mode == "silence-conditioned-exact-source" else False,
                 "quiet_source_frame_indices": source_donor_frames if helper_donor_mode == "quiet-source" else [],
+                "motion_base_frame_count": frame_count,
+                "pause_intervals": donor_exclusion_intervals,
+                "speech_pose_candidate_frame_indices_by_source": (
+                    {str(source_index): indices for source_index, indices in sorted((speech_pose_candidate_frame_indices or {}).items())}
+                    if helper_donor_mode == "speech-pose-bank" else {}
+                ),
                 "output_pause_frames": [
                     {"output_frame_index": index,
                      "exact_source_frame_index": pingpong_frame_index(index, frame_count),
@@ -1056,7 +1171,7 @@ def apply_pause_mouth_closure(
             record["mouth_mask_extraction"] = mouth_report
             corrected_frame_indices = [int(index) for index in mouth_report.get("corrected_output_frame_indices", [])]
             mouth_coverage_intervals = frame_indices_to_intervals(
-                corrected_frame_indices, duration_seconds, fps, frame_count=output_frame_count,
+                corrected_frame_indices, correction_duration, fps, frame_count=output_frame_count,
             )
             record["intervals"] = mouth_coverage_intervals
             record["covered_duration_seconds"] = round(
@@ -1064,7 +1179,7 @@ def apply_pause_mouth_closure(
             )
             coverage = summarize_pause_coverage(
                 intervals, mouth_coverage_intervals,
-                min(duration_seconds, output_frame_count / float(fps)),
+                min(correction_duration, output_frame_count / float(fps)),
                 output_pause_frames, corrected_frame_indices,
             )
             record.update(coverage)
@@ -1089,6 +1204,11 @@ def apply_pause_mouth_closure(
             record["selected_donor_frame_counts"] = mouth_report.get("selected_donor_frame_counts", {})
             record["mouth_donor_mode"] = mouth_donor_mode
             record["silence_conditioned_donor_video"] = str(donor_video) if mouth_donor_mode == "silence-conditioned" else None
+            record["speech_pose_donor_source_video"] = str(donor_video) if mouth_donor_mode == "speech-pose-bank" else None
+            record["speech_pose_candidate_frame_indices_by_source"] = (
+                {str(source_index): indices for source_index, indices in sorted((speech_pose_candidate_frame_indices or {}).items())}
+                if mouth_donor_mode == "speech-pose-bank" else None
+            )
             record["audio_unchanged"] = None
             record["head_body_motion_policy"] = "donor pixels are confined to the per-frame semantic lip alpha; the MuseTalk head/body frame remains the base"
             if not corrected_frame_indices:
@@ -1101,7 +1221,7 @@ def apply_pause_mouth_closure(
                 mouth_temp_root = None
                 return record
             graph = build_mouth_only_pause_closure_filter(
-                duration_seconds, fps, frame_count=output_frame_count,
+                correction_duration, fps, frame_count=output_frame_count,
             )
             frame_pattern = "%08d.png"
             command = [
@@ -1113,6 +1233,8 @@ def apply_pause_mouth_closure(
                 "-pix_fmt", "yuv420p", "-fps_mode", "passthrough", "-video_track_timescale", "25000",
                 "-c:a", "copy", "-movflags", "+faststart", str(temporary),
             ]
+            if preview_seconds is not None:
+                command[-1:-1] = ["-t", "{:.6f}".format(correction_duration)]
         else:
             graph = build_pause_closure_filter(frame_count, duration_seconds, aligned_intervals, fps)
             command = [
@@ -1146,16 +1268,18 @@ def apply_pause_mouth_closure(
             raise ValueError("Pause-corrected video changed dimensions or FPS unexpectedly.")
         if correction_region == "mouth-only":
             corrected_frame_count = count_video_frames(temporary, ffprobe)
-            if corrected_frame_count != rendered_frame_count:
+            if corrected_frame_count != output_frame_count:
                 raise ValueError(
-                    "Mouth-only correction changed decoded video frame count: source={} output={}.".format(
-                        rendered_frame_count, corrected_frame_count,
+                    "Mouth-only correction changed requested decoded video frame count: expected={} output={}.".format(
+                        output_frame_count, corrected_frame_count,
                     )
                 )
             record["corrected_video_frame_count"] = corrected_frame_count
         if str(corrected_audio.get("codec_name")) != str(source_audio.get("codec_name")):
             raise ValueError("Pause correction changed the MuseTalk audio codec despite stream-copy mode.")
-        if abs(corrected_audio_duration - source_audio_duration) > 0.01:
+        expected_audio_duration = correction_duration if preview_seconds is not None else source_audio_duration
+        if ((preview_seconds is not None and corrected_audio_duration > source_audio_duration + 0.01)
+                or abs(corrected_audio_duration - expected_audio_duration) > (0.16 if preview_seconds is not None else 0.01)):
             raise ValueError("Pause correction changed the MuseTalk audio duration unexpectedly.")
         record["source_frame_count"] = frame_count
         record["output_audio_codec"] = str(corrected_audio.get("codec_name"))
@@ -1163,16 +1287,25 @@ def apply_pause_mouth_closure(
         if correction_region == "mouth-only":
             source_packet_hashes = audio_packet_hashes(rendered_video, ffprobe)
             corrected_packet_hashes = audio_packet_hashes(temporary, ffprobe)
-            if corrected_packet_hashes != source_packet_hashes:
+            packet_match = (
+                corrected_packet_hashes == source_packet_hashes[:len(corrected_packet_hashes)]
+                if preview_seconds is not None else corrected_packet_hashes == source_packet_hashes
+            )
+            if not packet_match or (preview_seconds is not None and not corrected_packet_hashes):
                 raise ValueError(
-                    "Mouth-only correction did not preserve every AAC/audio packet: source={} output={}.".format(
+                    "Mouth-only correction did not preserve the expected AAC/audio packet sequence: source={} output={}.".format(
                         len(source_packet_hashes), len(corrected_packet_hashes),
                     )
                 )
             record["source_audio_packet_count"] = len(source_packet_hashes)
             record["corrected_audio_packet_count"] = len(corrected_packet_hashes)
             record["audio_packet_payload_hashes_match"] = True
-            record["audio_unchanged"] = True
+            record["audio_packet_sequence_policy"] = (
+                "corrected preview packets are an exact prefix of the original unshifted audio packet sequence"
+                if preview_seconds is not None else "all original unshifted audio packet payloads are preserved"
+            )
+            record["audio_unchanged"] = preview_seconds is None
+            record["audio_prefix_unchanged"] = preview_seconds is not None
             if (correction_region == "mouth-only" and corrected_frame_indices
                     and mouth_helper_paths is not None and mouth_helper_environment is not None
                     and mouth_request_path is not None and mouth_temp_root is not None):

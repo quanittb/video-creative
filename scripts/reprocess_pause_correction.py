@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 import time
@@ -452,13 +453,21 @@ def reprocess(
     musetalk_python: Optional[str] = None, mouth_donor_mode: str = "quiet-source",
     output_label: Optional[str] = None,
     reuse_silence_donor_label: Optional[str] = None,
+    preview_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     if correction_region not in ("full-frame", "mouth-only"):
         raise ValueError("--pause-correction-region must be full-frame or mouth-only.")
-    if mouth_donor_mode not in ("quiet-source", "silence-conditioned"):
-        raise ValueError("--mouth-donor-mode must be quiet-source or silence-conditioned.")
+    if mouth_donor_mode not in ("quiet-source", "silence-conditioned", "speech-pose-bank"):
+        raise ValueError("--mouth-donor-mode must be quiet-source, silence-conditioned or speech-pose-bank.")
     if mouth_donor_mode == "silence-conditioned" and correction_region != "mouth-only":
         raise ValueError("--mouth-donor-mode silence-conditioned requires --pause-correction-region mouth-only.")
+    if preview_seconds is not None:
+        if (correction_region != "mouth-only" or mouth_donor_mode != "speech-pose-bank"
+                or not isinstance(preview_seconds, (int, float))
+                or not math.isfinite(preview_seconds) or preview_seconds <= 0):
+            raise ValueError("--preview-seconds requires a positive duration with speech-pose-bank mouth-only correction.")
+        if output_label is None:
+            raise ValueError("--preview-seconds requires --output-label so the short preview cannot be mistaken for the full final.")
     output_label = _validated_output_label(output_label)
     reuse_silence_donor_label = _validated_output_label(reuse_silence_donor_label)
     if reuse_silence_donor_label is not None:
@@ -502,6 +511,8 @@ def reprocess(
     if actual_audio is None or actual_video is None:
         raise ValueError("Intermediate không có audio để giữ nguyên qua reprocess.")
     duration = ads.media_duration(actual_data, actual_audio)
+    video_duration = ads.media_duration(actual_data, actual_video)
+    output_duration = min(duration, video_duration, preview_seconds) if preview_seconds is not None else duration
     reference_data = ads.probe_media(inputs["reference_video"], ffprobe)
     reference_stream = ads.stream_by_type(reference_data, "video")
     if reference_stream is None:
@@ -535,6 +546,8 @@ def reprocess(
         reference_source=("exact_pingpong_source_frame_mapping" if correction_region == "full-frame"
                           else "same_motion_base_silence_conditioned_musetalk_exact_pingpong_frame"
                           if mouth_donor_mode == "silence-conditioned" else
+                          "existing_full_audio_musetalk_nonpause_donor_bank_exact_pingpong_pose"
+                          if mouth_donor_mode == "speech-pose-bank" else
                           "verified_quiet_source_mouth_donor_bank"),
         correction_region=correction_region,
         mouth_donor_mode=mouth_donor_mode,
@@ -548,6 +561,7 @@ def reprocess(
         musetalk_dir=musetalk_dir,
         musetalk_python=musetalk_python,
         helper_log_path=output_paths["helper_log"],
+        preview_seconds=preview_seconds,
     )
     if silence_donor_record is not None:
         correction["silence_conditioned_donor_render"] = silence_donor_record
@@ -567,16 +581,21 @@ def reprocess(
             "job_directory": str(job_dir),
             "output_label": output_label,
             "report_path": str(report_path),
+            "corrected_intermediate": str(corrected),
+            "candidate_final_output": str(final_video),
             "motion_base": str(inputs["motion_base"] or inputs["report"].get("motion_base", {}).get("path")),
             "reference_policy": (inputs["reference_policy"] if correction_region == "full-frame"
                                  else "same_motion_base_silence_conditioned_musetalk_exact_pingpong_frame"
                                  if mouth_donor_mode == "silence-conditioned" else
+                                 "existing_full_audio_musetalk_nonpause_donor_bank_exact_pingpong_pose"
+                                 if mouth_donor_mode == "speech-pose-bank" else
                                  "verified_quiet_source_mouth_donor_bank"),
             "final_output": None,
             "output_promoted": False,
             "coverage_failure": coverage_failure,
             "silence_conditioned_donor_render": silence_donor_record,
             "pause_correction": correction,
+            "preview_seconds_requested": preview_seconds,
             "note": ("Không tạo final đã sửa vì pause correction không có đủ frame/donor đạt kiểm tra; Echo và full-audio lip-sync không được chạy lại."
                      + (" Đã chạy pass MuseTalk donor im lặng." if silence_donor_record and silence_donor_record.get("models_rerun")
                         else " Đã tái sử dụng donor im lặng đã xác minh." if silence_donor_record else "")),
@@ -587,7 +606,7 @@ def reprocess(
         raise RuntimeError("Pause correction bị bỏ qua: {}. Report: {}".format(correction["status"], report_path))
 
     export_seconds, exported = ads.export_hd_video(
-        corrected, final_video, ffmpeg, ffprobe, duration,
+        corrected, final_video, ffmpeg, ffprobe, output_duration,
         output_paths["export_log"],
     )
     report = {
@@ -596,6 +615,8 @@ def reprocess(
                    or correction["status"] == "partially_applied" else "complete"),
         "correction_region": correction_region,
         "mouth_donor_mode": mouth_donor_mode,
+        "preview_seconds_requested": preview_seconds,
+        "output_duration_seconds": round(output_duration, 6),
         "job_directory": str(job_dir),
         "output_label": output_label,
         "source_video": str(inputs["rendered_video"]),
@@ -609,6 +630,8 @@ def reprocess(
         "reference_policy": (inputs["reference_policy"] if correction_region == "full-frame"
                              else "same_motion_base_silence_conditioned_musetalk_exact_pingpong_frame"
                              if mouth_donor_mode == "silence-conditioned" else
+                             "existing_full_audio_musetalk_nonpause_donor_bank_exact_pingpong_pose"
+                             if mouth_donor_mode == "speech-pose-bank" else
                              "verified_quiet_source_mouth_donor_bank"),
         "silence_conditioned_donor_render": silence_donor_record,
         "manifest_audio_identity": {
@@ -618,6 +641,7 @@ def reprocess(
         },
         "pause_correction": correction,
         "corrected_intermediate": str(corrected),
+        "candidate_final_output": str(final_video),
         "final_output": str(final_video),
         "export": exported,
         "export_wall_seconds": round(export_seconds, 3),
@@ -629,6 +653,7 @@ def reprocess(
             "Echo and full-audio lip-sync were not rerun; a separate silence-conditioned MuseTalk donor inference was rendered."
             if silence_donor_record else "Echo and MuseTalk were not rerun."
         ),
+        "speech_pose_donor_bank": correction.get("speech_pose_candidate_frame_indices_by_source") if mouth_donor_mode == "speech-pose-bank" else None,
         "musetalk_silence_conditioned_donor_rendered": bool(
             silence_donor_record and silence_donor_record.get("models_rerun")
         ),
@@ -638,6 +663,8 @@ def reprocess(
                        if correction_region == "full-frame" else
                        "Silence-conditioned mode uses only the exact ping-pong-mapped frame from a separate MuseTalk pass over the same motion base; parser, closure, or geometry failure leaves that output frame unchanged. No unrelated donor fallback is allowed. Diagnostics describe preparation only, not visual quality; inspect the output before use."
                        if mouth_donor_mode == "silence-conditioned" else
+                       "speech-pose-bank uses only non-pause frames from the existing full-audio MuseTalk render that map to the exact same ping-pong motion-base frame. It does not rerun Echo or MuseTalk lip-sync generation; local FaceParsing and landmark inference still run. Parser, closure, geometry, coverage, or final encoded-frame QC failure prevents HD final promotion."
+                       if mouth_donor_mode == "speech-pose-bank" else
                        "Only parser-validated lip pixels in output pause frames are replaced from a verified quiet-source frame with confident normalized face geometry. All other pixels/audio remain from the MuseTalk intermediate; this experimental path requires human A/B review."),
     }
     echo.write_json_atomic(report_path, report)
@@ -646,18 +673,20 @@ def reprocess(
 
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Reprocess a completed job at verified pauses. Echo is not rerun; MuseTalk reruns only when mouth-only silence-conditioned donors are explicitly selected.",
+        description="Reprocess a completed job at verified pauses. Echo is not rerun; speech-pose-bank reuses non-pause frames from the existing full-audio MuseTalk render.",
     )
     parser.add_argument("--job-dir", required=True, type=Path, help="Completed output\\vertical_ads\\job_... folder.")
     parser.add_argument("--motion-base", required=True, type=Path, help="Original Echo motion_base.mp4 whose SHA-256 is in the job report; required for exact ping-pong frame mapping.")
     parser.add_argument("--pause-correction-region", choices=("full-frame", "mouth-only"), default="full-frame",
                         help="full-frame preserves the prior reprocess behavior; mouth-only is an opt-in semantic lip patch.")
-    parser.add_argument("--mouth-donor-mode", choices=("quiet-source", "silence-conditioned"), default="quiet-source",
-                        help="mouth-only donors: legacy quiet-source bank or same-motion-base silent MuseTalk pass with exact mapped-frame-only selection.")
+    parser.add_argument("--mouth-donor-mode", choices=("quiet-source", "silence-conditioned", "speech-pose-bank"), default="quiet-source",
+                        help="mouth-only donors: quiet-source legacy, silence-conditioned extra MuseTalk pass, or speech-pose-bank from existing non-pause full-audio frames at the exact same ping-pong pose (no Echo/lip-sync generation; local face parsing and landmark checks still run).")
     parser.add_argument("--output-label", default=None,
                         help="Optional suffix (1-48 letters/digits/_/-; starts with a letter/digit) so a new attempt writes beside prior outputs without overwriting them.")
     parser.add_argument("--reuse-silence-donor-label", default=None,
                         help="Reuse and provenance-check existing donor MP4/WAV/log with this prior output label; requires a different --output-label and silence-conditioned mode.")
+    parser.add_argument("--preview-seconds", type=float, default=None,
+                        help="Emit only a short labeled prefix while mining donors from the entire existing full-audio render. Requires mouth-only speech-pose-bank and --output-label; does not rerun Echo or MuseTalk lip-sync generation, but local face parsing and landmark inference still run.")
     parser.add_argument("--musetalk-dir", default=None, help="MuseTalk checkout containing existing FaceParsing code and weights; omit for automatic discovery.")
     parser.add_argument("--musetalk-python", default=None, help="Python executable of the installed MuseTalk runtime; omit for automatic discovery.")
     parser.add_argument("--ffmpeg", default="ffmpeg")
@@ -672,6 +701,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.job_dir, args.motion_base, args.ffmpeg, args.ffprobe,
             args.pause_correction_region, args.musetalk_dir, args.musetalk_python,
             args.mouth_donor_mode, args.output_label, args.reuse_silence_donor_label,
+            args.preview_seconds,
         )
     except Exception as error:
         print("ERROR: {}".format(error), file=sys.stderr)

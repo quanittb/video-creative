@@ -39,6 +39,8 @@ MIN_COLOR_MATCH_LIP_PIXELS = 8
 MIN_COLOR_MATCH_PIXELS_PER_LIP_CLASS = 4
 MAX_LIP_LUMINANCE_SHIFT = 12.0
 MAX_LIP_CHROMA_SHIFT = 18.0
+MAX_SPEECH_POSE_PARSE_CANDIDATES_PER_SOURCE_POSE = 8
+MAX_SPEECH_POSE_LANDMARK_CHECKS_PER_SOURCE_POSE = 2
 
 
 def _require_image_dependencies() -> None:
@@ -290,6 +292,64 @@ def _exact_source_donor_missing_reason(
     return None
 
 
+def _pingpong_frame_index(frame_index: int, source_frame_count: int) -> int:
+    if source_frame_count < 1 or frame_index < 0:
+        raise ValueError("Ping-pong frame mapping requires nonnegative output and positive source counts.")
+    position = frame_index % (2 * source_frame_count)
+    return position if position < source_frame_count else 2 * source_frame_count - 1 - position
+
+
+def _bounded_evenly_spaced_indices(indices: Sequence[int], maximum: int) -> List[int]:
+    """Choose a deterministic timeline-spanning candidate subset without growing with duration."""
+    ordered = sorted(set(int(index) for index in indices))
+    if maximum < 1:
+        raise ValueError("Candidate shortlist maximum must be positive.")
+    if len(ordered) <= maximum:
+        return ordered
+    if maximum == 1:
+        return [ordered[len(ordered) // 2]]
+    selected = []
+    for position in range(maximum):
+        source_position = int(round(position * (len(ordered) - 1) / float(maximum - 1)))
+        selected.append(ordered[source_position])
+    return sorted(set(selected))
+
+
+def _derive_speech_pose_candidates(
+    requests: Mapping[int, Mapping[str, Any]],
+    pause_intervals: Sequence[Mapping[str, Any]],
+    donor_frame_count: int,
+    motion_base_frame_count: int,
+    fps: int,
+) -> Dict[int, List[int]]:
+    """Derive only active, in-video donors that match a requested source pose exactly."""
+    if donor_frame_count < 1 or motion_base_frame_count < 1 or fps < 1:
+        raise ValueError("Speech-pose candidate mapping requires valid frame counts and FPS.")
+    pause_indices = set(requests)
+    target_source_indices: set[int] = set()
+    for output_index, item in requests.items():
+        source_index = int(item.get("exact_source_frame_index", -1))
+        if source_index != _pingpong_frame_index(output_index, motion_base_frame_count):
+            raise ValueError("Speech-pose request source index does not match the exact ping-pong mapping.")
+        target_source_indices.add(source_index)
+    candidate_map: Dict[int, List[int]] = {index: [] for index in sorted(target_source_indices)}
+    for output_index in range(donor_frame_count):
+        if output_index in pause_indices:
+            continue
+        start = output_index / float(fps)
+        end = (output_index + 1) / float(fps)
+        if any(
+            float(interval["start_seconds"]) < end - 1e-9
+            and float(interval["end_seconds"]) > start + 1e-9
+            for interval in pause_intervals
+        ):
+            continue
+        source_index = _pingpong_frame_index(output_index, motion_base_frame_count)
+        if source_index in candidate_map:
+            candidate_map[source_index].append(output_index)
+    return candidate_map
+
+
 def _face_mouth_geometry_deltas(
     target: Mapping[str, Any], donor: Mapping[str, Any], width: int, height: int,
 ) -> Dict[str, List[float] | float]:
@@ -400,6 +460,7 @@ def _warp_donor_to_target(
     donor_anchor_bbox: Optional[Sequence[int]] = None,
     target_anchor_bbox: Optional[Sequence[int]] = None,
     interpolation: Optional[int] = None,
+    preserve_donor_scale: bool = False,
 ) -> np.ndarray:
     _require_image_dependencies()
     dh, dw = donor_frame.shape[:2]
@@ -407,7 +468,17 @@ def _warp_donor_to_target(
     dx0, dy0, dx1, dy1 = [float(value) for value in donor_bbox]
     sx, sy = (tx1 - tx0) / (dx1 - dx0), (ty1 - ty0) / (dy1 - dy0)
     offset_x, offset_y = tx0 - sx * dx0, ty0 - sy * dy0
-    if donor_anchor_bbox is not None and target_anchor_bbox is not None:
+    if preserve_donor_scale:
+        # Same-pose donors already share the motion-base framing. Translate their
+        # closed lips into the target mouth center without resizing the aperture.
+        sx = sy = 1.0
+        if donor_anchor_bbox is None or target_anchor_bbox is None:
+            raise ValueError("Scale-preserving donor alignment requires donor and target mouth anchors.")
+        dmx0, dmy0, dmx1, dmy1 = [float(value) for value in donor_anchor_bbox]
+        tmx0, tmy0, tmx1, tmy1 = [float(value) for value in target_anchor_bbox]
+        offset_x = (tmx0 + tmx1 - dmx0 - dmx1) * 0.5
+        offset_y = (tmy0 + tmy1 - dmy0 - dmy1) * 0.5
+    elif donor_anchor_bbox is not None and target_anchor_bbox is not None:
         dmx0, dmy0, dmx1, dmy1 = [float(value) for value in donor_anchor_bbox]
         tmx0, tmy0, tmx1, tmy1 = [float(value) for value in target_anchor_bbox]
         donor_center = ((dmx0 + dmx1) * 0.5, (dmy0 + dmy1) * 0.5)
@@ -512,28 +583,50 @@ def run_extraction(
     landmark_detector: Any = None,
     landmark_detector_error: Optional[str] = None,
 ) -> Dict[str, Any]:
-    _require_image_dependencies()
     request = json.loads(request_path.read_text(encoding="utf-8"))
     fps = int(request["fps"])
     width, height = int(request["width"]), int(request["height"])
     output_frame_count = int(request["output_frame_count"])
     donor_mode = str(request.get("donor_mode", "quiet-source"))
-    if donor_mode not in ("quiet-source", "silence-conditioned-exact-source"):
+    if donor_mode not in ("quiet-source", "silence-conditioned-exact-source", "speech-pose-bank"):
         raise ValueError("Unsupported mouth donor mode: {}".format(donor_mode))
     requests = {int(item["output_frame_index"]): item for item in request["output_pause_frames"]}
+    pause_indices = set(requests)
+    motion_base_frame_count = int(request.get("motion_base_frame_count", request.get("donor_source_frame_count", 0)))
+    donor_frame_count = int(request.get("donor_video_frame_count", output_frame_count))
+    pause_intervals = request.get("pause_intervals") or []
+    speech_pose_candidates: Dict[int, List[int]] = {}
     if donor_mode == "quiet-source":
         source_candidates = [int(index) for index in request.get("quiet_source_frame_indices", [])]
-    else:
+    elif donor_mode == "silence-conditioned-exact-source":
         source_candidates = sorted({int(item.get("donor_frame_index", -1)) for item in requests.values()})
+    else:
+        speech_pose_candidates = _derive_speech_pose_candidates(
+            requests, pause_intervals, donor_frame_count, motion_base_frame_count, fps,
+        )
+        supplied = {
+            int(source_index): sorted(set(int(index) for index in indices))
+            for source_index, indices in (request.get("speech_pose_candidate_frame_indices_by_source") or {}).items()
+        }
+        if supplied != speech_pose_candidates:
+            raise ValueError(
+                "Speech-pose candidate indices do not match pause exclusions and exact ping-pong source mapping."
+            )
+        speech_pose_candidates = {
+            source_index: _bounded_evenly_spaced_indices(
+                candidates, MAX_SPEECH_POSE_PARSE_CANDIDATES_PER_SOURCE_POSE,
+            )
+            for source_index, candidates in speech_pose_candidates.items()
+        }
+        source_candidates = sorted({index for indices in speech_pose_candidates.values() for index in indices})
     if fps < 1 or width < 1 or height < 1 or output_frame_count < 1:
         raise ValueError("Invalid frame geometry in mouth-mask request.")
     if not requests:
         raise ValueError("No output pause frames were supplied for mouth correction.")
-    if not source_candidates:
+    if not source_candidates and donor_mode != "speech-pose-bank":
         raise ValueError("No eligible donor frames were supplied.")
     if any(index < 0 or index >= output_frame_count for index in requests):
         raise ValueError("Pause-frame index is outside the requested output timeline.")
-    donor_frame_count = int(request.get("donor_video_frame_count", output_frame_count))
     donor_source_frame_count = int(request.get("donor_source_frame_count", donor_frame_count))
     trailing_truncation_verified = request.get("donor_trailing_truncation_verified") is True
     if donor_frame_count < 1 or donor_source_frame_count < 1:
@@ -558,7 +651,20 @@ def run_extraction(
             donor_index = int(item.get("donor_frame_index", -1))
             if source_index < 0 or source_index != donor_index:
                 raise ValueError("Silence-conditioned mode requires donor_frame_index to equal the exact ping-pong source frame.")
+    elif donor_mode == "speech-pose-bank":
+        if motion_base_frame_count < 1:
+            raise ValueError("Speech-pose mode requires the verified motion-base frame count.")
+        if donor_frame_count < output_frame_count:
+            raise ValueError("Speech-pose donor video must cover the complete requested output preview.")
+        if any(index < 0 or index >= donor_frame_count for index in source_candidates):
+            raise ValueError("Speech-pose donor frame is outside the rendered output timeline.")
+    speech_pose_by_candidate = {
+        donor_index: source_index
+        for source_index, indices in speech_pose_candidates.items()
+        for donor_index in indices
+    }
 
+    _require_image_dependencies()
     rendered_capture = cv2.VideoCapture(str(rendered_video))
     reference_capture = cv2.VideoCapture(str(reference_video))
     if not rendered_capture.isOpened() or not reference_capture.isOpened():
@@ -590,7 +696,8 @@ def run_extraction(
                                        round((output_index + 1) / float(fps), 6)],
             "exact_source_frame_index": int(item.get("exact_source_frame_index", -1)),
             "source_frame_index": int(item.get("exact_source_frame_index", -1)),
-            "donor_frame_index_requested": int(item.get("donor_frame_index", -1)) if donor_mode != "quiet-source" else None,
+            "donor_frame_index_requested": int(item.get("donor_frame_index", -1)) if donor_mode == "silence-conditioned-exact-source" else None,
+            "donor_frame_indices_requested": list(speech_pose_candidates.get(int(item.get("exact_source_frame_index", -1)), [])) if donor_mode == "speech-pose-bank" else None,
             "donor_frame_index": None,
             "patch_prepared": False,
             "status": "skipped",
@@ -613,6 +720,50 @@ def run_extraction(
     started = time.perf_counter()
     zero_mask = np.zeros((height, width), dtype=np.uint8)
     zero_donor = np.zeros((height, width, 3), dtype=np.uint8)
+    speech_pose_parse_cache: Dict[int, List[Tuple[int, np.ndarray, Dict[str, Any], np.ndarray]]] = {}
+
+    def validate_closed_donor(
+        donor_index: int,
+        donor_frame: np.ndarray,
+        descriptor: Dict[str, Any],
+        labels: np.ndarray,
+    ) -> None:
+        aperture, aperture_reason, mouth_width = detect_mouth_aperture(landmark_detector, donor_frame)
+        descriptor["mouth_aperture_ratio"] = aperture
+        descriptor["mouth_aperture_status"] = "measured" if aperture is not None else aperture_reason
+        descriptor["mouth_width_pixels_landmarked"] = mouth_width
+        landmark_metric = {
+            "name": "inner_lip_gap_over_mouth_width",
+            "value": round(aperture, 6) if aperture is not None else None,
+            "mouth_width_pixels": round(mouth_width, 3) if mouth_width is not None else None,
+            "maximum_closed_threshold": MAX_MOUTH_APERTURE_RATIO,
+            "status": "measured" if aperture is not None else aperture_reason,
+            "passed": aperture is not None and aperture <= MAX_MOUTH_APERTURE_RATIO,
+        }
+        closed_metric = {
+            "name": "inner_mouth_fraction",
+            "value": round(float(descriptor.get("inner_mouth_fraction", 1.0)), 6),
+            "maximum_closed_threshold": MAX_INNER_MOUTH_FRACTION,
+            "parser_passed": float(descriptor.get("inner_mouth_fraction", 1.0)) <= MAX_INNER_MOUTH_FRACTION,
+            "landmark_mouth_aperture": landmark_metric,
+            "passed": is_closed_donor(descriptor),
+        }
+        if not is_closed_donor(descriptor):
+            reasons["donor_mouth_not_confidently_closed"] += 1
+            donor_validation[donor_index] = {
+                "status": "skipped", "reason": "donor_mouth_not_confidently_closed",
+                "source_frame_index": speech_pose_by_candidate.get(donor_index),
+                "landmark_checked": donor_mode == "speech-pose-bank",
+                "closed_mouth_metric": closed_metric,
+            }
+            return
+        donor_cache[donor_index] = (donor_frame, descriptor, labels)
+        donor_validation[donor_index] = {
+            "status": "available", "reason": None,
+            "source_frame_index": speech_pose_by_candidate.get(donor_index),
+            "landmark_checked": donor_mode == "speech-pose-bank",
+            "closed_mouth_metric": closed_metric,
+        }
 
     def build_report() -> Dict[str, Any]:
         donor_count = len(donor_cache)
@@ -633,16 +784,22 @@ def run_extraction(
                 "minimum_mouth_width_pixels": MIN_MOUTH_WIDTH_PIXELS,
                 "unavailable_or_uncertain_policy": "fail closed; a parser-only result cannot certify a closed-mouth donor",
             },
-            "mask_region": "semantic lip classes, 3x3 dilation, 5x5 Gaussian feather sigma=0.9 at native resolution",
-            "mask_alignment": "face-box scale with mouth-center anchored translation; conservative face/mouth proxy gates reject visibly displaced candidates",
+            "mask_region": "target semantic inner-mouth and lip classes 11, 12, 13, 3x3 dilation, 5x5 Gaussian feather sigma=0.9 at native resolution",
+            "mask_alignment": ("exact-pose donors use mouth-center translation only, with donor scale fixed at 1.0 so the measured closed-lip aperture is not resized; conservative face/mouth proxy gates reject displaced candidates"
+                               if donor_mode == "speech-pose-bank" else
+                               "face-box scale with mouth-center anchored translation; conservative face/mouth proxy gates reject visibly displaced candidates"),
             "donor_validation": (
                 "only the exact ping-pong-mapped frame from the silence-conditioned MuseTalk pass is eligible; parser inner-mouth fraction must be <= {:.2f} and landmark aperture must be <= {:.3f}; no fallback donor is permitted".format(MAX_INNER_MOUTH_FRACTION, MAX_MOUTH_APERTURE_RATIO)
                 if donor_mode == "silence-conditioned-exact-source" else
+                "donors must be non-pause frames from this full-audio MuseTalk output with the same exact ping-pong source pose; at most {} parser-preselected candidates per source pose receive landmark closure checks; no cross-pose fallback; parser inner-mouth fraction must be <= {:.2f} and landmark aperture must be <= {:.3f}".format(MAX_SPEECH_POSE_LANDMARK_CHECKS_PER_SOURCE_POSE, MAX_INNER_MOUTH_FRACTION, MAX_MOUTH_APERTURE_RATIO)
+                if donor_mode == "speech-pose-bank" else
                 "source frame lies fully within verified quiet-source interval; parser inner-mouth fraction must be <= {:.2f} and landmark aperture must be <= {:.3f}".format(MAX_INNER_MOUTH_FRACTION, MAX_MOUTH_APERTURE_RATIO)
             ),
             "donor_selection_policy": (
                 "Use only the exact mapped donor frame if parser fraction <= {:.2f}, landmark aperture <= {:.3f}, and face/mouth geometry gates pass; never fall back to another frame.".format(MAX_INNER_MOUTH_FRACTION, MAX_MOUTH_APERTURE_RATIO)
                 if donor_mode == "silence-conditioned-exact-source" else
+                "For a target, inspect only the bounded parser-ranked donor shortlist for its exact mapped base pose, then apply existing strict closure and face/mouth geometry gates; missing pose donors stay uncovered."
+                if donor_mode == "speech-pose-bank" else
                 "Require parser fraction <= {:.2f} and landmark aperture <= {:.3f}; rank eligible donors by lowest face/mouth geometry score, then lowest inner_mouth_fraction.".format(MAX_INNER_MOUTH_FRACTION, MAX_MOUTH_APERTURE_RATIO)
             ),
             "face_mouth_alignment_gate": {
@@ -661,6 +818,9 @@ def run_extraction(
             "frame_time_basis": "timestamp_seconds is the output video frame start: output_frame_index / FPS; frame_interval_seconds gives its full 1/FPS interval.",
             "donor_video_frame_count": donor_frame_count,
             "donor_source_frame_count": donor_source_frame_count,
+            "source_rendered_video": request.get("rendered_full_audio_video", str(rendered_video.resolve())),
+            "donor_video": str(reference_video.resolve()),
+            "planned_output_path": request.get("planned_output_path"),
             "donor_trailing_truncation_verified": trailing_truncation_verified,
             "missing_trailing_donor_frame_index": (
                 donor_source_frame_count - 1 if trailing_truncation_verified else None
@@ -674,7 +834,13 @@ def run_extraction(
             "uncovered_output_pause_frame_count": len(requests) - corrected_frames,
             "selected_donor_by_output_frame": selected_donor_by_output_frame,
             "quiet_source_candidate_frames": len(source_candidates) if donor_mode == "quiet-source" else 0,
-            "exact_neutral_donor_candidate_frames": len(source_candidates) if donor_mode != "quiet-source" else 0,
+            "exact_neutral_donor_candidate_frames": len(source_candidates) if donor_mode == "silence-conditioned-exact-source" else 0,
+            "speech_pose_candidate_frames_tested": len(source_candidates) if donor_mode == "speech-pose-bank" else 0,
+            "speech_pose_candidate_indices_by_source": ({str(index): values for index, values in sorted(speech_pose_candidates.items())} if donor_mode == "speech-pose-bank" else None),
+            "speech_pose_candidate_indices_before_bounding": ({str(index): values for index, values in sorted((request.get("speech_pose_candidate_frame_indices_by_source") or {}).items(), key=lambda item: int(item[0]))} if donor_mode == "speech-pose-bank" else None),
+            "speech_pose_parse_candidate_limit_per_source_pose": MAX_SPEECH_POSE_PARSE_CANDIDATES_PER_SOURCE_POSE if donor_mode == "speech-pose-bank" else None,
+            "speech_pose_landmark_check_limit_per_source_pose": MAX_SPEECH_POSE_LANDMARK_CHECKS_PER_SOURCE_POSE if donor_mode == "speech-pose-bank" else None,
+            "donor_frame_validation": {str(index): value for index, value in sorted(donor_validation.items())},
             "valid_closed_donor_frames": donor_count,
             "selected_donor_frame_count": sum(selected_donors.values()),
             "selected_donor_frame_counts": {str(index): count for index, count in sorted(selected_donors.items())},
@@ -687,6 +853,8 @@ def run_extraction(
             "speech_and_nonmask_pixels_policy": (
                 "leave MuseTalk content unchanged; only nonzero semantic lip alpha may use the exact mapped silence-conditioned donor frame"
                 if donor_mode == "silence-conditioned-exact-source" else
+                "leave the full-audio MuseTalk frame unchanged outside the semantic mouth alpha; only a validated same-pose speech frame may supply the mouth patch"
+                if donor_mode == "speech-pose-bank" else
                 "leave MuseTalk content unchanged; only nonzero semantic lip alpha may use a verified quiet-source donor"
             ),
             "unshifted_output_audio_policy": "map MuseTalk input audio stream 0:a:0 with stream copy; do not gate or replace output audio",
@@ -717,46 +885,59 @@ def run_extraction(
                 reasons["donor_" + reason] += 1
                 donor_validation[donor_index] = {
                     "status": "skipped", "reason": "donor_" + reason,
+                    "source_frame_index": speech_pose_by_candidate.get(donor_index),
                     "closed_mouth_metric": None,
                 }
                 continue
-            aperture, aperture_reason, mouth_width = detect_mouth_aperture(landmark_detector, donor_frame)
-            descriptor["mouth_aperture_ratio"] = aperture
-            descriptor["mouth_aperture_status"] = "measured" if aperture is not None else aperture_reason
-            descriptor["mouth_width_pixels_landmarked"] = mouth_width
-            landmark_metric = {
-                "name": "inner_lip_gap_over_mouth_width",
-                "value": round(aperture, 6) if aperture is not None else None,
-                "mouth_width_pixels": round(mouth_width, 3) if mouth_width is not None else None,
-                "maximum_closed_threshold": MAX_MOUTH_APERTURE_RATIO,
-                "status": "measured" if aperture is not None else aperture_reason,
-                "passed": aperture is not None and aperture <= MAX_MOUTH_APERTURE_RATIO,
-            }
-            closed_metric = {
-                "name": "inner_mouth_fraction",
-                "value": round(float(descriptor.get("inner_mouth_fraction", 1.0)), 6),
-                "maximum_closed_threshold": MAX_INNER_MOUTH_FRACTION,
-                "parser_passed": float(descriptor.get("inner_mouth_fraction", 1.0)) <= MAX_INNER_MOUTH_FRACTION,
-                "landmark_mouth_aperture": landmark_metric,
-                "passed": is_closed_donor(descriptor),
-            }
-            if not is_closed_donor(descriptor):
-                reasons["donor_mouth_not_confidently_closed"] += 1
+            if donor_mode == "speech-pose-bank":
+                source_index = speech_pose_by_candidate[donor_index]
+                parser_fraction = float(descriptor.get("inner_mouth_fraction", 1.0))
                 donor_validation[donor_index] = {
-                    "status": "skipped", "reason": "donor_mouth_not_confidently_closed",
-                    "closed_mouth_metric": closed_metric,
+                    "status": "parser_prefiltered",
+                    "reason": None if parser_fraction <= MAX_INNER_MOUTH_FRACTION else "parser_inner_mouth_fraction_above_threshold",
+                    "source_frame_index": source_index,
+                    "inner_mouth_fraction": round(parser_fraction, 6),
+                    "maximum_inner_mouth_fraction": MAX_INNER_MOUTH_FRACTION,
+                    "landmark_checked": False,
                 }
+                if parser_fraction > MAX_INNER_MOUTH_FRACTION:
+                    reasons["donor_parser_inner_mouth_fraction_above_threshold"] += 1
+                    continue
+                speech_pose_parse_cache.setdefault(source_index, []).append(
+                    (donor_index, donor_frame, descriptor, labels),
+                )
                 continue
-            donor_cache[donor_index] = (donor_frame, descriptor, labels)
-            donor_validation[donor_index] = {
-                "status": "available", "reason": None, "closed_mouth_metric": closed_metric,
-            }
+            validate_closed_donor(donor_index, donor_frame, descriptor, labels)
+
+        if donor_mode == "speech-pose-bank":
+            for source_index in sorted(speech_pose_candidates):
+                parser_candidates = sorted(
+                    speech_pose_parse_cache.get(source_index, []),
+                    key=lambda item: (float(item[2].get("inner_mouth_fraction", 1.0)), item[0]),
+                )
+                shortlist = parser_candidates[:MAX_SPEECH_POSE_LANDMARK_CHECKS_PER_SOURCE_POSE]
+                for donor_index, _, descriptor, _ in parser_candidates[len(shortlist):]:
+                    donor_validation[donor_index] = {
+                        "status": "skipped",
+                        "reason": "speech_pose_landmark_validation_budget_exceeded",
+                        "source_frame_index": source_index,
+                        "inner_mouth_fraction": round(float(descriptor.get("inner_mouth_fraction", 1.0)), 6),
+                        "landmark_checked": False,
+                    }
+                    reasons["speech_pose_landmark_validation_budget_exceeded"] += 1
+                for donor_index, donor_frame, descriptor, labels in shortlist:
+                    donor_validation[donor_index]["landmark_checked"] = True
+                    validate_closed_donor(donor_index, donor_frame, descriptor, labels)
 
         if not donor_cache:
-            skip_reason = "no_validated_closed_donor_frame_available"
-            reasons[skip_reason] += len(requests)
             for diagnostic in frame_diagnostics.values():
+                source_index = int(diagnostic.get("exact_source_frame_index", -1))
+                if donor_mode == "speech-pose-bank" and not speech_pose_candidates.get(source_index):
+                    skip_reason = "no_non_pause_donor_for_exact_pingpong_pose"
+                else:
+                    skip_reason = "no_validated_closed_donor_frame_available"
                 diagnostic["skip_reason"] = skip_reason
+                reasons[skip_reason] += 1
             # Target parsing cannot produce a patch without at least one donor
             # that passed both closure checks; return the diagnostics now.
             report = build_report()
@@ -806,6 +987,19 @@ def run_extraction(
                                 )
                                 reasons[skip_reason] += 1
                                 diagnostic["skip_reason"] = skip_reason
+                        elif donor_mode == "speech-pose-bank":
+                            source_index = int(requests[output_index].get("exact_source_frame_index", -1))
+                            requested_donor_indices = speech_pose_candidates.get(source_index, [])
+                            diagnostic["donor_frame_indices_requested"] = list(requested_donor_indices)
+                            candidates = [
+                                (donor_index, *donor_cache[donor_index])
+                                for donor_index in requested_donor_indices if donor_index in donor_cache
+                            ]
+                            if not requested_donor_indices:
+                                diagnostic["skip_reason"] = "no_non_pause_donor_for_exact_pingpong_pose"
+                            elif not candidates:
+                                reasons["no_closed_speech_donor_for_exact_pingpong_pose"] += 1
+                                diagnostic["skip_reason"] = "no_closed_speech_donor_for_exact_pingpong_pose"
                         else:
                             candidates = [
                                 (donor_index, donor_frame, donor_descriptor, donor_labels)
@@ -869,9 +1063,13 @@ def run_extraction(
                                 donor_descriptor["face_bbox"], target_descriptor["face_bbox"],
                                 donor_mouth_bbox, target_mouth_bbox,
                             )
-                            aligned_donor = _warp_donor_to_target(donor_frame, *alignment_args)
+                            aligned_donor = _warp_donor_to_target(
+                                donor_frame, *alignment_args,
+                                preserve_donor_scale=donor_mode == "speech-pose-bank",
+                            )
                             aligned_donor_labels = _warp_donor_to_target(
                                 donor_labels, *alignment_args, interpolation=cv2.INTER_NEAREST,
+                                preserve_donor_scale=donor_mode == "speech-pose-bank",
                             )
                             aligned_donor, color_adjustment = _match_donor_lip_color(
                                 aligned_donor, target_frame, target_mask, labels, aligned_donor_labels,
