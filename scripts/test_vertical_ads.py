@@ -595,6 +595,77 @@ def count_video_frames(path: Path, ffprobe: str) -> int:
     return frame_count
 
 
+def validate_donor_frame0_prefix(
+    path: Path,
+    expected_frame_count: int,
+    expected_dimensions: Tuple[int, int],
+    fps: float,
+    ffprobe: str,
+) -> Dict[str, Any]:
+    """Validate a donor as an exact frame-0 CFR prefix, allowing only one missing tail frame."""
+    data = probe_media(path, ffprobe)
+    stream = stream_by_type(data, "video")
+    if stream is None:
+        raise ValueError("Silence-conditioned donor output does not contain a video stream.")
+    dimensions = (int(stream.get("width", 0)), int(stream.get("height", 0)))
+    stream_fps = echo.parse_fraction(str(stream.get("avg_frame_rate") or stream.get("r_frame_rate") or "0/1"))
+    actual_count = count_video_frames(path, ffprobe)
+    if dimensions != expected_dimensions or abs(stream_fps - fps) > 0.01:
+        raise ValueError(
+            "Silence-conditioned donor must match motion-base dimensions/FPS; expected {}x{} at {} FPS, got {}x{} at {:.3f} FPS.".format(
+                expected_dimensions[0], expected_dimensions[1], fps,
+                dimensions[0], dimensions[1], stream_fps,
+            )
+        )
+    if actual_count not in (expected_frame_count, expected_frame_count - 1):
+        raise ValueError(
+            "Silence-conditioned donor must contain {} frames or a verified one-frame trailing truncation; got {} frames.".format(
+                expected_frame_count, actual_count,
+            )
+        )
+
+    result = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_frames",
+         "-show_entries", "frame=best_effort_timestamp_time", "-of", "json", str(path)],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace", check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("Could not inspect donor frame timestamps: {}".format(result.stderr.strip()))
+    try:
+        frames = json.loads(result.stdout).get("frames", [])
+        timestamps = [float(item["best_effort_timestamp_time"]) for item in frames]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("Could not parse decoded donor frame timestamps.") from error
+    if len(timestamps) != actual_count:
+        raise ValueError(
+            "Silence-conditioned donor timestamp count {} differs from decoded frame count {}.".format(
+                len(timestamps), actual_count,
+            )
+        )
+    tolerance = 0.0001
+    for index, timestamp in enumerate(timestamps):
+        expected_timestamp = index / float(fps)
+        if abs(timestamp - expected_timestamp) > tolerance:
+            raise ValueError(
+                "Silence-conditioned donor is not a frame-0 CFR prefix: frame {} PTS {:.6f}s, expected {:.6f}s at {} FPS.".format(
+                    index, timestamp, expected_timestamp, fps,
+                )
+            )
+    truncated = actual_count == expected_frame_count - 1
+    return {
+        "status": "verified_trailing_frame_truncation" if truncated else "verified_exact_frame_count",
+        "expected_source_frame_count": expected_frame_count,
+        "decoded_frame_count": actual_count,
+        "first_frame_pts_seconds": timestamps[0],
+        "last_frame_pts_seconds": timestamps[-1],
+        "fps": stream_fps,
+        "frame_timeline": "CFR frame-0 prefix; decoded PTS equals frame_index / FPS",
+        "missing_trailing_source_frame_index": expected_frame_count - 1 if truncated else None,
+        "no_padding_or_frame_remapping": True,
+    }
+
+
 def audio_packet_hashes(path: Path, ffprobe: str) -> List[str]:
     """Return packet payload hashes so stream-copy preservation includes AAC tail packets."""
     result = subprocess.run(
@@ -707,6 +778,7 @@ def apply_pause_mouth_closure(
     correction_region: str = "full-frame",
     mouth_donor_mode: str = "quiet-source",
     silence_conditioned_donor_video: Optional[Path] = None,
+    silence_conditioned_trailing_truncation_verified: bool = False,
     musetalk_dir: Optional[str | Path] = None,
     musetalk_python: Optional[str | Path] = None,
     helper_log_path: Optional[Path] = None,
@@ -884,10 +956,14 @@ def apply_pause_mouth_closure(
                 donor_fps = (echo.parse_fraction(str(donor_stream.get("avg_frame_rate") or "0/1"))
                              if donor_stream else 0.0)
                 donor_frame_count = count_video_frames(donor_video, ffprobe)
+                donor_timeline = validate_donor_frame0_prefix(
+                    donor_video, frame_count, reference_dimensions, fps, ffprobe,
+                )
                 if (donor_dimensions != reference_dimensions or abs(donor_fps - fps) > 0.01
-                        or donor_frame_count != frame_count):
+                        or (donor_frame_count == frame_count - 1
+                            and not silence_conditioned_trailing_truncation_verified)):
                     raise ValueError(
-                        "Silence-conditioned donor must match motion-base dimensions/FPS and contain exactly {} frames; got {}x{}, {:.3f} FPS, {} frames.".format(
+                        "Silence-conditioned donor must match motion-base dimensions/FPS and have a provenance-verified frame-0 timeline; expected {} frames, got {}x{}, {:.3f} FPS, {} frames.".format(
                             frame_count, donor_dimensions[0], donor_dimensions[1], donor_fps, donor_frame_count,
                         )
                     )
@@ -903,6 +979,13 @@ def apply_pause_mouth_closure(
                 "output_frame_count": output_frame_count,
                 "donor_mode": helper_donor_mode,
                 "donor_video_frame_count": donor_frame_count,
+                "donor_source_frame_count": frame_count,
+                "donor_trailing_truncation_verified": bool(
+                    helper_donor_mode == "silence-conditioned-exact-source"
+                    and silence_conditioned_trailing_truncation_verified
+                    and donor_frame_count == frame_count - 1
+                    and donor_timeline["status"] == "verified_trailing_frame_truncation"
+                ) if helper_donor_mode == "silence-conditioned-exact-source" else False,
                 "quiet_source_frame_indices": source_donor_frames if helper_donor_mode == "quiet-source" else [],
                 "output_pause_frames": [
                     {"output_frame_index": index,

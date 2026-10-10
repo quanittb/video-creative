@@ -37,6 +37,9 @@ class VerticalAdsTests(unittest.TestCase):
         self.assertIsNone(reprocess_pause.make_parser().parse_args([
             "--job-dir", "job", "--motion-base", "base.mp4",
         ]).output_label)
+        self.assertIsNone(reprocess_pause.make_parser().parse_args([
+            "--job-dir", "job", "--motion-base", "base.mp4",
+        ]).reuse_silence_donor_label)
         self.assertEqual(args.audio_offset_ms, 0)
         help_text = " ".join(ads.make_parser().format_help().split())
         self.assertIn("speech dùng audio thật để sinh chuyển động", help_text)
@@ -83,6 +86,37 @@ class VerticalAdsTests(unittest.TestCase):
             collision.write_text("prior attempt", encoding="utf-8")
             with self.assertRaisesRegex(FileExistsError, "không ghi đè"):
                 reprocess_pause._ensure_outputs_unused([Path(directory) / "new.mp4", collision])
+
+    @unittest.skipUnless(FFMPEG and FFPROBE, "FFmpeg/ffprobe are required for donor timeline tests")
+    def test_donor_frame0_prefix_accepts_only_exact_or_one_missing_trailing_frame(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            exact = root / "exact.mp4"
+            one_short = root / "one_short.mp4"
+            two_short = root / "two_short.mp4"
+            gap = root / "gap.mp4"
+            source = root / "source.mp4"
+            self._ffmpeg([
+                "-f", "lavfi", "-i", "color=red:s=64x80:r=25:d=0.16", "-frames:v", "4", "-an",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(source),
+            ])
+            self._ffmpeg(["-i", str(source), "-frames:v", "4", "-an", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(exact)])
+            self._ffmpeg(["-i", str(source), "-frames:v", "3", "-an", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(one_short)])
+            self._ffmpeg(["-i", str(source), "-frames:v", "2", "-an", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(two_short)])
+            self._ffmpeg([
+                "-i", str(source), "-vf", "select='not(eq(n,1))'", "-fps_mode", "vfr", "-an",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(gap),
+            ])
+
+            exact_timeline = ads.validate_donor_frame0_prefix(exact, 4, (64, 80), 25, FFPROBE)
+            self.assertEqual(exact_timeline["status"], "verified_exact_frame_count")
+            short_timeline = ads.validate_donor_frame0_prefix(one_short, 4, (64, 80), 25, FFPROBE)
+            self.assertEqual(short_timeline["status"], "verified_trailing_frame_truncation")
+            self.assertEqual(short_timeline["missing_trailing_source_frame_index"], 3)
+            for invalid in (two_short, gap):
+                with self.subTest(invalid=invalid.name):
+                    with self.assertRaises(ValueError):
+                        ads.validate_donor_frame0_prefix(invalid, 4, (64, 80), 25, FFPROBE)
 
     def test_auto_pause_closure_requires_speech_mode_and_matching_source_audio(self):
         digest = "a" * 64
@@ -337,11 +371,20 @@ class VerticalAdsTests(unittest.TestCase):
         self.assertEqual(reason, "ok")
         self.assertIsNotNone(open_descriptor)
         self.assertFalse(mouth_masks.is_closed_donor(open_descriptor))
-
         invalid, invalid_descriptor, reason = mouth_masks.build_feathered_mouth_mask(np.zeros((200, 200), dtype=np.uint8))
         self.assertIsNone(invalid)
         self.assertIsNone(invalid_descriptor)
         self.assertEqual(reason, "face_skin_not_detected")
+
+    def test_truncated_donor_skips_only_missing_terminal_index_without_fallback(self):
+        reason = mouth_masks._exact_source_donor_missing_reason(128, 129, 128, True)
+        self.assertEqual(reason, "exact_mapped_donor_frame_missing_trailing_truncation")
+        self.assertIsNone(mouth_masks._exact_source_donor_missing_reason(127, 129, 128, True))
+        self.assertIsNone(mouth_masks._exact_source_donor_missing_reason(128, 129, 128, False))
+        unrelated_donor = (object(), {}, {})
+        self.assertIsNone(mouth_masks._exact_mapped_donor(
+            {"exact_source_frame_index": 128, "donor_frame_index": 128}, {127: unrelated_donor},
+        ), "a nearby available donor must never substitute for missing source frame 128")
 
     def test_mouth_only_geometry_rejects_pose_proxy_mismatch(self):
         if mouth_masks.cv2 is None or mouth_masks.np is None:
@@ -589,12 +632,25 @@ class VerticalAdsTests(unittest.TestCase):
             (job / "logs").mkdir()
             cache_path = root / "vcs_cache" / "cache-key"
             cache_path.mkdir(parents=True)
+            (cache_path / "cache_manifest.json").write_text(json.dumps({
+                "inputs": {
+                    "base_video": {
+                        "sha256": ads.musetalk.sha256_file(base), "width": 64,
+                        "height": 80, "target_fps": 25,
+                    },
+                    "musetalk": {"parameters": {"bbox_shift": 0, "parsing_mode": "jaw",
+                                                  "extra_margin": 10, "left_cheek_width": 90,
+                                                  "right_cheek_width": 90}},
+                },
+            }), encoding="utf-8")
             paths = SimpleNamespace(root=root / "musetalk", python=root / "python.exe")
+            job_lip_settings = {"bbox_shift": 0, "parsing_mode": "jaw",
+                                "audio_padding_left": 2, "audio_padding_right": 2,
+                                "extra_margin": 10}
             inputs = {
                 "video_entry": {
                     "avatar_cache_path": str(cache_path),
-                    "lip_sync_settings": {"bbox_shift": 0, "parsing_mode": "jaw",
-                                          "audio_padding_left": 2, "audio_padding_right": 2},
+                    "lip_sync_settings": job_lip_settings,
                 },
                 "motion_base": base,
                 "motion_metadata": {"width": 64, "height": 80, "fps": 25.0,
@@ -607,14 +663,30 @@ class VerticalAdsTests(unittest.TestCase):
                 if action == "dry-run":
                     return {"cache_hit": True, "cache_path": cache_path}
                 shutil.copyfile(base, kwargs["output"])
+                kwargs["log_path"].write_text(
+                    "Total process time of 4 frames including saving images = 0.1s\n",
+                    encoding="utf-8",
+                )
                 return {"cache_hit": True, "cache_path": cache_path,
                         "audio_duration": 0.16, "backend_seconds": 2.0}
+
+            def render_manifest_lookup(_cache, output_path):
+                return {
+                    "output": str(output_path.resolve()),
+                    "audio_source": str((job / "intermediate" / "pause_silence_conditioning_16k_mono.wav").resolve()),
+                    "cache_state": "REUSE", "motion_policy": "error",
+                    "source_video_duration_seconds": 0.16,
+                    "normalized_audio_duration_seconds": 0.16,
+                    "normalized_audio": {"sample_rate": 16000, "channels": 1, "codec": "pcm_s16le"},
+                    "lip_sync_settings": job_lip_settings,
+                }
 
             with (
                 mock.patch.object(reprocess_pause.musetalk, "discover_musetalk_paths", return_value=paths),
                 mock.patch.object(reprocess_pause.musetalk, "validate_safe_cache_root"),
                 mock.patch.object(reprocess_pause.musetalk, "find_ffmpeg_pair", return_value=(FFMPEG, FFPROBE)),
                 mock.patch.object(reprocess_pause.musetalk, "run_pipeline", side_effect=fake_pipeline),
+                mock.patch.object(reprocess_pause.ads, "find_musetalk_render_manifest", side_effect=render_manifest_lookup),
             ):
                 record = reprocess_pause._render_silence_conditioned_donor(
                     job, inputs, FFMPEG, FFPROBE, str(paths.root), str(paths.python),
@@ -644,6 +716,94 @@ class VerticalAdsTests(unittest.TestCase):
             self.assertEqual(calls, ["dry-run"], "cache miss must fail before any inference backend call")
             self.assertFalse((failed_job / "intermediate" / "pause_silence_conditioned_musetalk_donor.mp4").exists())
 
+    @unittest.skipUnless(FFMPEG and FFPROBE, "FFmpeg/ffprobe are required for donor reuse")
+    def test_existing_silence_donor_reuse_verifies_provenance_and_accepts_aligned_trailing_truncation(self):
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            job = root / "job"
+            (job / "intermediate").mkdir(parents=True)
+            (job / "logs").mkdir()
+            base = root / "motion_base.mp4"
+            donor = root / "silence_donor.mp4"
+            self._ffmpeg([
+                "-f", "lavfi", "-i", "color=red:s=64x80:r=25:d=0.16", "-frames:v", "4", "-an",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(base),
+            ])
+            self._ffmpeg([
+                "-f", "lavfi", "-i", "color=blue:s=64x80:r=25:d=0.12", "-frames:v", "3", "-an",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(donor),
+            ])
+            cache_path = root / "vcs_cache" / "cache-key"
+            cache_path.mkdir(parents=True)
+            base_sha = ads.musetalk.sha256_file(base)
+            (cache_path / "cache_manifest.json").write_text(json.dumps({
+                "inputs": {
+                    "base_video": {"sha256": base_sha, "width": 64, "height": 80, "target_fps": 25},
+                    "musetalk": {"parameters": {"bbox_shift": 0, "parsing_mode": "jaw",
+                                                  "extra_margin": 10, "left_cheek_width": 90,
+                                                  "right_cheek_width": 90}},
+                },
+            }), encoding="utf-8")
+            settings = {"bbox_shift": 0, "parsing_mode": "jaw",
+                        "audio_padding_left": 2, "audio_padding_right": 2,
+                        "extra_margin": 10}
+            inputs = {
+                "video_entry": {"avatar_cache_path": str(cache_path), "lip_sync_settings": settings},
+                "motion_base": base,
+                "motion_metadata": {"sha256": base_sha, "width": 64, "height": 80, "fps": 25.0},
+            }
+            prior_paths = reprocess_pause._reprocess_output_paths(job, "mouth-only", "sameframe_v1")
+            shutil.copyfile(donor, prior_paths["silence_donor_video"])
+            reprocess_pause._write_exact_silence_wav(prior_paths["silence_audio"], 4 * 16000 // 25)
+            prior_paths["silence_donor_log"].write_text(
+                "Total process time of 4 frames including saving images = 11.1s\n",
+                encoding="utf-8",
+            )
+            donor_sha_before = ads.musetalk.sha256_file(prior_paths["silence_donor_video"])
+            silence_sha_before = ads.musetalk.sha256_file(prior_paths["silence_audio"])
+            manifest = {
+                "output": str(prior_paths["silence_donor_video"].resolve()),
+                "audio_source": str(prior_paths["silence_audio"].resolve()),
+                "cache_state": "REUSE", "motion_policy": "error",
+                "source_video_duration_seconds": 0.16,
+                "normalized_audio_duration_seconds": 0.16,
+                "normalized_audio": {"sample_rate": 16000, "channels": 1, "codec": "pcm_s16le"},
+                "lip_sync_settings": settings,
+            }
+            paths = SimpleNamespace(root=root / "musetalk", python=root / "python.exe")
+            with (
+                mock.patch.object(reprocess_pause.musetalk, "validate_safe_cache_root"),
+                mock.patch.object(reprocess_pause.musetalk, "find_ffmpeg_pair", return_value=(FFMPEG, FFPROBE)),
+                mock.patch.object(reprocess_pause.musetalk, "run_pipeline", side_effect=AssertionError("must reuse; do not render")) as runner,
+                mock.patch.object(reprocess_pause.ads, "find_musetalk_render_manifest", return_value=manifest),
+            ):
+                record = reprocess_pause._render_silence_conditioned_donor(
+                    job, inputs, FFMPEG, FFPROBE, str(paths.root), str(paths.python),
+                    output_label="retry_2", reuse_silence_donor_label="sameframe_v1",
+                )
+            runner.assert_not_called()
+            self.assertEqual(record["reuse_status"], "reused_existing_donor_assets")
+            self.assertEqual(record["donor_video_frame_count"], 3)
+            self.assertEqual(record["frame_timeline_validation"]["status"], "verified_trailing_frame_truncation")
+            self.assertEqual(record["frame_timeline_validation"]["missing_trailing_source_frame_index"], 3)
+            self.assertFalse(record["models_rerun"])
+            self.assertEqual(ads.musetalk.sha256_file(prior_paths["silence_donor_video"]), donor_sha_before)
+            self.assertEqual(ads.musetalk.sha256_file(prior_paths["silence_audio"]), silence_sha_before)
+
+            wrong_manifest = dict(manifest, audio_source=str((job / "intermediate" / "wrong.wav").resolve()))
+            with (
+                mock.patch.object(reprocess_pause.musetalk, "validate_safe_cache_root"),
+                mock.patch.object(reprocess_pause.musetalk, "find_ffmpeg_pair", return_value=(FFMPEG, FFPROBE)),
+                mock.patch.object(reprocess_pause.ads, "find_musetalk_render_manifest", return_value=wrong_manifest),
+            ):
+                with self.assertRaisesRegex(ValueError, "does not point to the selected donor MP4 and silence WAV"):
+                    reprocess_pause._render_silence_conditioned_donor(
+                        job, inputs, FFMPEG, FFPROBE, str(paths.root), str(paths.python),
+                        output_label="retry_3", reuse_silence_donor_label="sameframe_v1",
+                    )
+
     @unittest.skipUnless(FFMPEG and FFPROBE, "FFmpeg/ffprobe are required for mapped-donor extraction")
     def test_silence_donor_mode_uses_only_exact_mapped_frame_and_reports_skip(self):
         if mouth_masks.cv2 is None or mouth_masks.np is None:
@@ -655,7 +815,7 @@ class VerticalAdsTests(unittest.TestCase):
             donor_video, rendered_video = root / "neutral.avi", root / "rendered.avi"
             writer = cv2.VideoWriter(str(donor_video), cv2.VideoWriter_fourcc(*"MJPG"), 25.0, (width, height))
             self.assertTrue(writer.isOpened())
-            for color in ((20, 40, 220), (20, 40, 220), (20, 40, 220), (20, 40, 220)):
+            for color in ((20, 40, 220), (20, 40, 220), (20, 40, 220)):
                 writer.write(np.full((height, width, 3), color, dtype=np.uint8))
             writer.release()
             writer = cv2.VideoWriter(str(rendered_video), cv2.VideoWriter_fourcc(*"MJPG"), 25.0, (width, height))
@@ -676,34 +836,47 @@ class VerticalAdsTests(unittest.TestCase):
                 "fps": 25, "width": width, "height": height,
                 "output_frame_count": 10,
                 "donor_mode": "silence-conditioned-exact-source",
-                "donor_video_frame_count": 4,
+                "donor_video_frame_count": 3,
+                "donor_source_frame_count": 4,
+                "donor_trailing_truncation_verified": True,
                 "output_pause_frames": [
                     {"output_frame_index": 5, "exact_source_frame_index": 2, "donor_frame_index": 2},
-                    {"output_frame_index": 9, "exact_source_frame_index": 1, "donor_frame_index": 1},
+                    {"output_frame_index": 9, "exact_source_frame_index": 3, "donor_frame_index": 3},
                 ],
             }), encoding="utf-8")
             with mock.patch.object(
-                mouth_masks, "_raw_label_map", side_effect=[closed, open_labels, target, target],
+                mouth_masks, "_raw_label_map", side_effect=[closed, target, target],
             ) as parser:
                 report = mouth_masks.run_extraction(
                     rendered_video, donor_video, root / "alpha", root / "donors",
                     root / "report.json", request, parser=object(), torch=object(),
                 )
-            self.assertEqual(parser.call_count, 4, "the helper should parse only requested mapped donor frames, never scan/fallback to others")
+            self.assertEqual(parser.call_count, 3, "the helper should parse only available exact donors and targets, never scan/fallback to others")
             frames = {item["output_frame_index"]: item for item in report["frame_diagnostics"]}
             self.assertEqual(frames[5]["source_frame_index"], 2)
             self.assertEqual(frames[5]["donor_frame_index_requested"], 2)
-            self.assertIsNone(frames[5]["donor_frame_index"])
-            self.assertEqual(frames[5]["skip_reason"], "donor_mouth_not_confidently_closed")
-            self.assertFalse(frames[5]["patch_prepared"], "frame 5 must not fall back to the unrelated closed frame 1")
-            self.assertGreater(frames[5]["donor_closed_mouth_metric"]["value"], mouth_masks.MAX_INNER_MOUTH_FRACTION)
-            self.assertEqual(frames[9]["source_frame_index"], 1)
-            self.assertEqual(frames[9]["donor_frame_index"], 1)
-            self.assertTrue(frames[9]["patch_prepared"])
+            self.assertEqual(frames[5]["donor_frame_index"], 2)
+            self.assertTrue(frames[5]["patch_prepared"])
+            self.assertEqual(frames[9]["source_frame_index"], 3)
+            self.assertEqual(frames[9]["donor_frame_index_requested"], 3)
+            self.assertIsNone(frames[9]["donor_frame_index"])
+            self.assertEqual(frames[9]["skip_reason"], "exact_mapped_donor_frame_missing_trailing_truncation")
+            self.assertFalse(frames[9]["patch_prepared"], "missing terminal source frame must stay unchanged, without padding or fallback")
             self.assertEqual(report["donor_mode"], "silence-conditioned-exact-source")
-            self.assertEqual(report["corrected_output_frame_indices"], [9])
+            self.assertEqual(report["corrected_output_frame_indices"], [5])
             self.assertEqual(report["uncovered_output_pause_frame_count"], 1)
             self.assertIn("no fallback", report["donor_validation"])
+            self.assertEqual(report["missing_trailing_donor_frame_index"], 3)
+
+            invalid_request = root / "invalid_request.json"
+            payload = json.loads(request.read_text(encoding="utf-8"))
+            payload["donor_trailing_truncation_verified"] = False
+            invalid_request.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "approved exact/prefix match"):
+                mouth_masks.run_extraction(
+                    rendered_video, donor_video, root / "invalid_alpha", root / "invalid_donors",
+                    root / "invalid_report.json", invalid_request, parser=object(), torch=object(),
+                )
 
     def test_mouth_only_filter_changes_only_masked_pixels_and_copies_audio(self):
         if not FFMPEG or not FFPROBE:
@@ -949,7 +1122,7 @@ class VerticalAdsTests(unittest.TestCase):
             ])
             unsafe_output = root / "must_not_exist.mp4"
             with mock.patch.object(ads.musetalk, "run_backend_process", side_effect=AssertionError("invalid donor must fail before helper inference")):
-                with self.assertRaisesRegex(ValueError, "contain exactly 4 frames"):
+                with self.assertRaisesRegex(ValueError, "provenance-verified frame-0 timeline"):
                     ads.apply_pause_mouth_closure(
                         rendered, base, audio_wav, unsafe_output, FFMPEG, FFPROBE, 0.20,
                         min_pause_seconds=0.08,

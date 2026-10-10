@@ -142,6 +142,39 @@ Nếu tự dò không chọn đúng MuseTalk Python/checkout, thêm `--musetalk-
 
 So bản này với `vertical_ad_1080x1920.mp4` gốc của job. Chuyển động đầu/vai ngoài vùng môi phải tiếp tục chạy. Nếu report báo coverage thấp hoặc không có donor đạt kiểm tra, đó là skip có chủ ý; không hạ ngưỡng bằng tay. Report và test hiện tại chỉ xác nhận hợp đồng dữ liệu/compositing trên synthetic clip; chưa xác nhận chất lượng hình ảnh hay thời gian trên RTX 3060. Giữ `--pause-correction-region` mặc định `full-frame` cho các lệnh `test_vertical_ads.bat` cho đến khi xem xong A/B.
 
+### Dùng lại donor MuseTalk đã render nhưng bị thiếu một frame cuối
+
+Nếu lượt `silence-conditioned` trước đã xử lý đủ **129 PNG frames** nhưng file MP4 chỉ giải mã được 128 frame và lệnh dừng ở bước validation, không chạy MuseTalk lại. Dùng lại cùng bộ MP4/WAV/log theo nhãn cũ, đồng thời chọn nhãn output mới. Bản core đã sửa sẽ xác minh cache manifest (base SHA), MuseTalk render manifest (đúng donor MP4 và silence WAV), WAV PCM16 16 kHz digital-zero đúng 129-frame duration, log báo đủ 129 PNG, cùng PTS donor bắt đầu tại 0 và tăng liên tiếp mỗi 1/25 giây. Chỉ trường hợp thiếu đúng frame cuối cùng mới được chấp nhận; frame được map sang index 128 sẽ giữ nguyên và ghi lý do `exact_mapped_donor_frame_missing_trailing_truncation`. Không đệm, dịch, nội suy hoặc chọn donor thay thế. Mismatch nào khác sẽ dừng trước inference/composite.
+
+Trong CMD tại thư mục dự án, dùng chính job, motion base và donor label đã chạy. Với job trong ví dụ và donor `sameframe_v1`:
+
+```bat
+set "JOB=output\vertical_ads\job_20261010_125846_9dadea01_mouth_quality_retry"
+set "ECHO_BASE=output\echo_flash\a10_0682611f141d\motion_base.mp4"
+set "DONOR_LABEL=sameframe_v1"
+set "OUTPUT_LABEL=sameframe_retry_2"
+dir "%JOB%\intermediate\pause_silence_conditioned_musetalk_donor_%DONOR_LABEL%.mp4"
+dir "%JOB%\intermediate\pause_silence_conditioning_%DONOR_LABEL%_16k_mono.wav"
+dir "%JOB%\logs\pause_silence_conditioned_musetalk_donor_%DONOR_LABEL%.log"
+dir "%JOB%\vertical_ad_report.json"
+dir "%ECHO_BASE%"
+```
+
+Mỗi lệnh `dir` phải tìm đúng một file. Nếu base nằm ở đường dẫn khác, thay `ECHO_BASE` bằng đường dẫn gốc của máy bạn. Sau đó chạy:
+
+```bat
+python -u scripts\reprocess_pause_correction.py --job-dir "%JOB%" --motion-base "%ECHO_BASE%" --pause-correction-region mouth-only --mouth-donor-mode silence-conditioned --reuse-silence-donor-label "%DONOR_LABEL%" --output-label "%OUTPUT_LABEL%"
+```
+
+Lệnh này tái sử dụng MP4/WAV/log đã có, không chạy lại Echo hoặc MuseTalk inference. Nó ghi intermediate, report và final với nhãn `sameframe_retry_2`, giữ nguyên donor cũ. Xem báo cáo và mở video bằng:
+
+```bat
+type "%JOB%\pause_mouth_only_%OUTPUT_LABEL%_reprocess_report.json"
+start "" "%JOB%\vertical_ad_1080x1920_pause_mouth_only_%OUTPUT_LABEL%_reprocessed.mp4"
+```
+
+Trong report, xác nhận `frame_timeline_validation.status` là `verified_trailing_frame_truncation`, `models_rerun` là `false`, và xem `uncorrected_output_pause_frame_indices`/`frame_diagnostics` để biết pause nào bị bỏ qua do frame 128 không có trong donor. Nếu lệnh báo thiếu manifest, WAV hoặc log, hoặc timestamp/base SHA không khớp, dừng và gửi nguyên thông báo lỗi; không đổi tên/tạo file giả để vượt kiểm tra. Khi gõ đường dẫn video vào CMD, dùng `start "" "đường_dẫn.mp4"` để mở; không chạy đường dẫn như một lệnh.
+
 Offset mặc định là 0ms và không tự đoán. Nếu khẩu hình có vẻ sớm/trễ, dùng preview A/B quanh 0 bằng jaw mask:
 
 ```bat

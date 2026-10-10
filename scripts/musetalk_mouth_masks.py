@@ -149,6 +149,18 @@ def _exact_mapped_donor(
     return donor_index, *donor
 
 
+def _exact_source_donor_missing_reason(
+    donor_index: int,
+    source_frame_count: int,
+    donor_frame_count: int,
+    trailing_truncation_verified: bool,
+) -> Optional[str]:
+    if (trailing_truncation_verified and donor_frame_count == source_frame_count - 1
+            and donor_index == source_frame_count - 1):
+        return "exact_mapped_donor_frame_missing_trailing_truncation"
+    return None
+
+
 def _face_mouth_geometry_deltas(
     target: Mapping[str, Any], donor: Mapping[str, Any], width: int, height: int,
 ) -> Dict[str, List[float] | float]:
@@ -390,7 +402,23 @@ def run_extraction(
     if any(index < 0 or index >= output_frame_count for index in requests):
         raise ValueError("Pause-frame index is outside the requested output timeline.")
     donor_frame_count = int(request.get("donor_video_frame_count", output_frame_count))
-    if donor_frame_count < 1 or any(index < 0 or index >= donor_frame_count for index in source_candidates):
+    donor_source_frame_count = int(request.get("donor_source_frame_count", donor_frame_count))
+    trailing_truncation_verified = request.get("donor_trailing_truncation_verified") is True
+    if donor_frame_count < 1 or donor_source_frame_count < 1:
+        raise ValueError("Invalid donor frame count in mouth-mask request.")
+    if donor_mode == "silence-conditioned-exact-source":
+        if trailing_truncation_verified and donor_frame_count != donor_source_frame_count - 1:
+            raise ValueError("Trailing-truncation verification does not match the donor/source frame counts.")
+        if donor_frame_count != donor_source_frame_count and not (
+                trailing_truncation_verified and donor_frame_count == donor_source_frame_count - 1):
+            raise ValueError("Silence-conditioned donor frame count is not an approved exact/prefix match.")
+        if any(index < 0 or index >= donor_source_frame_count for index in source_candidates):
+            raise ValueError("Mapped donor-frame index is outside the motion-base source timeline.")
+        if any(index >= donor_frame_count and not (
+                trailing_truncation_verified and index == donor_source_frame_count - 1)
+               for index in source_candidates):
+            raise ValueError("Donor-frame index is outside the supplied donor video.")
+    elif any(index < 0 or index >= donor_frame_count for index in source_candidates):
         raise ValueError("Donor-frame index is outside the supplied donor video.")
     if donor_mode == "silence-conditioned-exact-source":
         for item in requests.values():
@@ -406,6 +434,18 @@ def run_extraction(
     donor_cache: Dict[int, Tuple[np.ndarray, Dict[str, Any], Dict[str, Any]]] = {}
     donor_validation: Dict[int, Dict[str, Any]] = {}
     reasons: Counter[str] = Counter()
+    missing_terminal_reason = (
+        _exact_source_donor_missing_reason(
+            donor_source_frame_count - 1, donor_source_frame_count, donor_frame_count,
+            trailing_truncation_verified,
+        ) if donor_mode == "silence-conditioned-exact-source" else None
+    )
+    if missing_terminal_reason:
+        donor_validation[donor_source_frame_count - 1] = {
+            "status": "skipped",
+            "reason": missing_terminal_reason,
+            "closed_mouth_metric": None,
+        }
     selected_donors: Counter[int] = Counter()
     mask_areas: List[int] = []
     corrected_indices: List[int] = []
@@ -444,6 +484,10 @@ def run_extraction(
     zero_donor = np.zeros((height, width, 3), dtype=np.uint8)
     try:
         for donor_index in source_candidates:
+            if _exact_source_donor_missing_reason(
+                    donor_index, donor_source_frame_count, donor_frame_count,
+                    trailing_truncation_verified):
+                continue
             donor_frame = _read_frame(reference_capture, donor_index)
             if donor_frame is None or donor_frame.shape[:2] != (height, width):
                 reasons["quiet_donor_frame_unreadable_or_wrong_size"] += 1
@@ -513,8 +557,16 @@ def run_extraction(
                             exact_donor = _exact_mapped_donor(requests[output_index], donor_cache)
                             candidates = [exact_donor] if exact_donor is not None else []
                             if not candidates:
-                                reasons["exact_mapped_neutral_donor_not_confidently_closed"] += 1
-                                diagnostic["skip_reason"] = validation.get("reason") or "exact_mapped_neutral_donor_unavailable"
+                                skip_reason = (
+                                    validation.get("reason")
+                                    or _exact_source_donor_missing_reason(
+                                        exact_donor_index, donor_source_frame_count, donor_frame_count,
+                                        trailing_truncation_verified,
+                                    )
+                                    or "exact_mapped_neutral_donor_unavailable"
+                                )
+                                reasons[skip_reason] += 1
+                                diagnostic["skip_reason"] = skip_reason
                         else:
                             candidates = [
                                 (donor_index, donor_frame, donor_descriptor, donor_labels)
@@ -653,6 +705,13 @@ def run_extraction(
         "lip_color_policy": "Bounded per-class median Lab L/a/b match from overlapping parsed upper/lower lip pixels; inner-mouth label 11 is untouched; skip if fewer than {} total or {} per-class matching samples.".format(MIN_COLOR_MATCH_LIP_PIXELS, MIN_COLOR_MATCH_PIXELS_PER_LIP_CLASS),
         "diagnostic_scope": "Per-frame records describe parser/donor patch preparation only; they do not visually validate that the output mouth appears closed or natural.",
         "frame_time_basis": "timestamp_seconds is the output video frame start: output_frame_index / FPS; frame_interval_seconds gives its full 1/FPS interval.",
+        "donor_video_frame_count": donor_frame_count,
+        "donor_source_frame_count": donor_source_frame_count,
+        "donor_trailing_truncation_verified": trailing_truncation_verified,
+        "missing_trailing_donor_frame_index": (
+            donor_source_frame_count - 1 if trailing_truncation_verified else None
+        ),
+        "missing_trailing_frame_policy": "leave any pause mapped to the absent last source frame unchanged; do not pad, shift, interpolate, or choose another donor",
         "frame_diagnostics": [frame_diagnostics[index] for index in sorted(frame_diagnostics)],
         "requested_output_pause_frames": len(requests),
         "corrected_output_pause_frames": corrected_frames,

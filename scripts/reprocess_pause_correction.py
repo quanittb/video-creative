@@ -186,6 +186,142 @@ def _write_exact_silence_wav(path: Path, sample_count: int, sample_rate: int = 1
     }
 
 
+def _validate_exact_silence_wav(path: Path, sample_count: int, sample_rate: int = 16000) -> Dict[str, Any]:
+    path = _required_file(path, "silence-conditioned donor WAV")
+    with wave.open(str(path), "rb") as audio:
+        actual_samples = audio.getnframes()
+        actual_format = (audio.getnchannels(), audio.getsampwidth(), audio.getframerate())
+        if audio.getcomptype() != "NONE" or actual_format != (1, 2, sample_rate):
+            raise ValueError("Existing donor WAV must be uncompressed mono PCM16 at {} Hz.".format(sample_rate))
+        if actual_samples != sample_count:
+            raise ValueError("Existing donor WAV sample count does not exactly match the motion-base frame duration.")
+        while True:
+            samples = audio.readframes(65536)
+            if not samples:
+                break
+            if any(samples):
+                raise ValueError("Existing donor WAV contains nonzero samples; refusing to use it as silence conditioning.")
+    return {
+        "path": str(path), "sample_rate": sample_rate, "channels": 1,
+        "sample_width_bytes": 2, "sample_count": actual_samples,
+        "duration_seconds": round(actual_samples / float(sample_rate), 9),
+        "sha256": musetalk.sha256_file(path), "digital_silence": True,
+        "validation": "exact frame-aligned PCM16 digital silence",
+    }
+
+
+def _verify_silence_donor_assets(
+    inputs: Mapping[str, Any],
+    donor_video: Path,
+    silence_audio: Path,
+    donor_log: Path,
+    ffprobe: str,
+    source_frames: int,
+    fps: int,
+    expected_dimensions: tuple[int, int],
+    expected_silence_samples: int,
+) -> Dict[str, Any]:
+    """Prove the cached donor came from this base + exact silent WAV before it is reused."""
+    silence_record = _validate_exact_silence_wav(silence_audio, expected_silence_samples)
+    donor_video = _required_file(donor_video, "silence-conditioned donor video")
+    donor_log = _required_file(donor_log, "silence-conditioned donor log")
+    cache_value = inputs["video_entry"].get("avatar_cache_path")
+    if not cache_value:
+        raise ValueError("Source job report has no avatar-cache path; cannot verify donor provenance.")
+    expected_cache = Path(str(cache_value)).expanduser().resolve()
+    if not expected_cache.is_dir():
+        raise ValueError("Avatar cache from the source job report no longer exists; cannot verify donor provenance.")
+    cache_manifest_path = _required_file(expected_cache / "cache_manifest.json", "MuseTalk avatar cache manifest")
+    try:
+        cache_manifest = json.loads(cache_manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ValueError("Could not read the MuseTalk avatar cache manifest: {}".format(error)) from error
+    cache_inputs = cache_manifest.get("inputs") or {}
+    cache_base = cache_inputs.get("base_video") or {}
+    expected_base_sha = str(inputs["motion_metadata"].get("sha256") or "").lower()
+    if (not expected_base_sha or str(cache_base.get("sha256") or "").lower() != expected_base_sha
+            or int(cache_base.get("width", 0)) != expected_dimensions[0]
+            or int(cache_base.get("height", 0)) != expected_dimensions[1]
+            or int(cache_base.get("target_fps", 0)) != fps):
+        raise ValueError("Avatar cache manifest base SHA/dimensions/FPS do not match this job's motion base.")
+    parameters = ((cache_inputs.get("musetalk") or {}).get("parameters") or {})
+    settings = inputs["video_entry"].get("lip_sync_settings") or {}
+    expected_cache_parameters = {
+        "bbox_shift": int(settings.get("bbox_shift", 0)),
+        "parsing_mode": str(settings.get("parsing_mode") or "jaw"),
+        "extra_margin": 10,
+        "left_cheek_width": 90,
+        "right_cheek_width": 90,
+    }
+    for key, expected in expected_cache_parameters.items():
+        if parameters.get(key) != expected:
+            raise ValueError("Avatar cache MuseTalk {} does not match this job report.".format(key))
+
+    try:
+        render_manifest = ads.find_musetalk_render_manifest(expected_cache, donor_video)
+    except RuntimeError as error:
+        raise ValueError("No MuseTalk render manifest proves this donor's source paths: {}".format(error)) from error
+    if (Path(str(render_manifest.get("output") or "")).expanduser().resolve() != donor_video.resolve()
+            or Path(str(render_manifest.get("audio_source") or "")).expanduser().resolve() != silence_audio.resolve()):
+        raise ValueError("MuseTalk render manifest does not point to the selected donor MP4 and silence WAV.")
+    if str(render_manifest.get("cache_state") or "").upper() != "REUSE":
+        raise ValueError("MuseTalk render manifest does not confirm reuse of the source job's avatar cache.")
+    expected_duration = source_frames / float(fps)
+    if (render_manifest.get("motion_policy") != "error"
+            or abs(float(render_manifest.get("source_video_duration_seconds") or -1.0) - expected_duration) > 0.0001
+            or abs(float(render_manifest.get("normalized_audio_duration_seconds") or -1.0) - expected_duration) > 1.0 / 16000.0 + 1e-6):
+        raise ValueError("MuseTalk render manifest duration/motion policy does not match the exact frame-aligned donor request.")
+    normalized_audio = render_manifest.get("normalized_audio") or {}
+    if (int(normalized_audio.get("sample_rate", 0)) != 16000
+            or int(normalized_audio.get("channels", 0)) != 1
+            or normalized_audio.get("codec") != "pcm_s16le"):
+        raise ValueError("MuseTalk render manifest does not confirm 16 kHz mono PCM normalization.")
+    manifest_settings = render_manifest.get("lip_sync_settings") or {}
+    expected_render_settings = {
+        "bbox_shift": int(settings.get("bbox_shift", 0)),
+        "parsing_mode": str(settings.get("parsing_mode") or "jaw"),
+        "audio_padding_left": int(settings.get("audio_padding_left", 2)),
+        "audio_padding_right": int(settings.get("audio_padding_right", 2)),
+        "extra_margin": 10,
+    }
+    for key, expected in expected_render_settings.items():
+        if manifest_settings.get(key) != expected:
+            raise ValueError("MuseTalk donor render manifest {} does not match the source job settings.".format(key))
+
+    donor_timeline = ads.validate_donor_frame0_prefix(
+        donor_video, source_frames, expected_dimensions, fps, ffprobe,
+    )
+    log_text = donor_log.read_text(encoding="utf-8", errors="replace")
+    frame_counts = {int(value) for value in re.findall(
+        r"Total process time of\s+(\d+)\s+frames including saving images", log_text,
+    )}
+    if frame_counts != {source_frames}:
+        raise ValueError(
+            "MuseTalk log does not prove that all {} source PNG frames were rendered (reported counts: {}).".format(
+                source_frames, sorted(frame_counts),
+            )
+        )
+    return {
+        "status": "verified",
+        "donor_video": str(donor_video),
+        "donor_video_sha256": musetalk.sha256_file(donor_video),
+        "donor_video_frame_count": donor_timeline["decoded_frame_count"],
+        "donor_video_fps": donor_timeline["fps"],
+        "donor_video_dimensions": list(expected_dimensions),
+        "frame_timeline_validation": donor_timeline,
+        "source_png_frames_reported": source_frames,
+        "donor_log": str(donor_log),
+        "silent_audio": silence_record,
+        "avatar_cache_path": str(expected_cache),
+        "avatar_cache_hit": True,
+        "cache_preflight_hit": None,
+        "cache_validation": "existing cache manifest base SHA and MuseTalk render manifest REUSE were verified; dry-run was skipped to avoid rerendering",
+        "cache_base_sha256": expected_base_sha,
+        "musetalk_render_manifest": render_manifest,
+        "visual_quality_status": "not_assessed_by_pipeline; inspect output frames and diagnostics",
+    }
+
+
 def _render_silence_conditioned_donor(
     job_dir: Path,
     inputs: Mapping[str, Any],
@@ -194,8 +330,9 @@ def _render_silence_conditioned_donor(
     musetalk_dir: Optional[str],
     musetalk_python: Optional[str],
     output_label: Optional[str] = None,
+    reuse_silence_donor_label: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Render a motion-base-length neutral donor and require the cache from the original job."""
+    """Render a donor or verify/reuse an earlier exact-silence donor from the source job."""
     video_entry = inputs["video_entry"]
     cache_value = video_entry.get("avatar_cache_path")
     if not cache_value:
@@ -207,7 +344,6 @@ def _render_silence_conditioned_donor(
     parsing_mode = str(settings.get("parsing_mode") or "jaw")
     audio_padding_left = int(settings.get("audio_padding_left", 2))
     audio_padding_right = int(settings.get("audio_padding_right", 2))
-    paths = musetalk.discover_musetalk_paths(musetalk_dir, musetalk_python)
     musetalk.validate_safe_cache_root(cache_root)
     ffmpeg, ffprobe = musetalk.find_ffmpeg_pair(ffmpeg, ffprobe)
     source_frames = ads.count_video_frames(inputs["motion_base"], ffprobe)
@@ -220,6 +356,31 @@ def _render_silence_conditioned_donor(
         raise ValueError("Motion-base frame duration cannot be represented as an exact 16 kHz WAV sample count.")
     sample_count = sample_numerator // fps
     duration = source_frames / float(fps)
+    expected_dimensions = (int(inputs["motion_metadata"].get("width", 0)),
+                           int(inputs["motion_metadata"].get("height", 0)))
+    if expected_dimensions[0] < 1 or expected_dimensions[1] < 1:
+        raise ValueError("Source job report does not contain valid motion-base dimensions.")
+    if reuse_silence_donor_label is not None:
+        reuse_paths = _reprocess_output_paths(job_dir, "mouth-only", reuse_silence_donor_label)
+        verified = _verify_silence_donor_assets(
+            inputs, reuse_paths["silence_donor_video"], reuse_paths["silence_audio"],
+            reuse_paths["silence_donor_log"], ffprobe, source_frames, fps,
+            expected_dimensions, sample_count,
+        )
+        verified.update({
+            "mode": "same_motion_base_silence_conditioned_musetalk",
+            "reuse_status": "reused_existing_donor_assets",
+            "motion_base": str(inputs["motion_base"]),
+            "motion_base_sha256": inputs["motion_metadata"]["sha256"],
+            "lip_sync_settings": {
+                "bbox_shift": bbox_shift, "parsing_mode": parsing_mode,
+                "audio_padding_left": audio_padding_left, "audio_padding_right": audio_padding_right,
+            },
+            "models_rerun": False,
+        })
+        return verified
+
+    paths = musetalk.discover_musetalk_paths(musetalk_dir, musetalk_python)
     output_paths = _reprocess_output_paths(job_dir, "mouth-only", output_label)
     silence_audio = output_paths["silence_audio"]
     donor_video = output_paths["silence_donor_video"]
@@ -227,7 +388,7 @@ def _render_silence_conditioned_donor(
     for path, label in ((donor_video, "neutral donor video"), (log_path, "neutral donor log")):
         if path.exists():
             raise FileExistsError("Refusing to overwrite {}: {}".format(label, path))
-    silence_record = _write_exact_silence_wav(silence_audio, sample_count)
+    _write_exact_silence_wav(silence_audio, sample_count)
     pipeline_args = {
         "base_video": inputs["motion_base"],
         "audio": silence_audio,
@@ -261,34 +422,15 @@ def _render_silence_conditioned_donor(
         raise RuntimeError("MuseTalk silence donor không xác nhận reuse đúng avatar cache trong report job.")
     if not donor_video.is_file():
         raise RuntimeError("MuseTalk không tạo silence-conditioned donor video: {}".format(donor_video))
-    donor_info = ads.probe_media(donor_video, ffprobe)
-    donor_stream = ads.stream_by_type(donor_info, "video")
-    if donor_stream is None:
-        raise ValueError("Silence-conditioned donor output không có video stream.")
-    donor_frames = ads.count_video_frames(donor_video, ffprobe)
-    donor_fps = echo.parse_fraction(str(donor_stream.get("avg_frame_rate") or "0/1"))
-    expected_dimensions = (int(inputs["motion_metadata"].get("width", 0)),
-                          int(inputs["motion_metadata"].get("height", 0)))
-    donor_dimensions = (int(donor_stream.get("width", 0)), int(donor_stream.get("height", 0)))
-    if (donor_frames != source_frames or donor_dimensions != expected_dimensions
-            or abs(donor_fps - fps) > 0.01):
-        raise ValueError(
-            "Silence-conditioned donor failed validation: expected {} frames, {}x{}, {} FPS; got {} frames, {}x{}, {:.3f} FPS.".format(
-                source_frames, expected_dimensions[0], expected_dimensions[1], fps,
-                donor_frames, donor_dimensions[0], donor_dimensions[1], donor_fps,
-            )
-        )
-    return {
+    verified = _verify_silence_donor_assets(
+        inputs, donor_video, silence_audio, log_path, ffprobe,
+        source_frames, fps, expected_dimensions, sample_count,
+    )
+    verified.update({
         "status": "generated",
         "mode": "same_motion_base_silence_conditioned_musetalk",
         "motion_base": str(inputs["motion_base"]),
         "motion_base_sha256": inputs["motion_metadata"]["sha256"],
-        "silent_audio": silence_record,
-        "donor_video": str(donor_video.resolve()),
-        "donor_video_sha256": musetalk.sha256_file(donor_video),
-        "donor_video_frame_count": donor_frames,
-        "donor_video_fps": donor_fps,
-        "donor_video_dimensions": list(donor_dimensions),
         "avatar_cache_path": str(run_cache),
         "avatar_cache_hit": bool(run.get("cache_hit")),
         "cache_preflight_hit": bool(dry_run.get("cache_hit")),
@@ -299,9 +441,9 @@ def _render_silence_conditioned_donor(
         },
         "audio_duration_seconds": run.get("audio_duration"),
         "backend_seconds": run.get("backend_seconds"),
-        "log": str(log_path.resolve()),
-        "visual_quality_status": "not_assessed_by_pipeline; inspect output frames and diagnostics",
-    }
+        "models_rerun": True,
+    })
+    return verified
 
 
 def reprocess(
@@ -309,6 +451,7 @@ def reprocess(
     correction_region: str = "full-frame", musetalk_dir: Optional[str] = None,
     musetalk_python: Optional[str] = None, mouth_donor_mode: str = "quiet-source",
     output_label: Optional[str] = None,
+    reuse_silence_donor_label: Optional[str] = None,
 ) -> Dict[str, Any]:
     if correction_region not in ("full-frame", "mouth-only"):
         raise ValueError("--pause-correction-region must be full-frame or mouth-only.")
@@ -317,6 +460,14 @@ def reprocess(
     if mouth_donor_mode == "silence-conditioned" and correction_region != "mouth-only":
         raise ValueError("--mouth-donor-mode silence-conditioned requires --pause-correction-region mouth-only.")
     output_label = _validated_output_label(output_label)
+    reuse_silence_donor_label = _validated_output_label(reuse_silence_donor_label)
+    if reuse_silence_donor_label is not None:
+        if mouth_donor_mode != "silence-conditioned":
+            raise ValueError("--reuse-silence-donor-label requires --mouth-donor-mode silence-conditioned.")
+        if not output_label:
+            raise ValueError("Provide a new --output-label when reusing a donor so outputs are distinct.")
+        if output_label == reuse_silence_donor_label:
+            raise ValueError("Use a different --output-label than --reuse-silence-donor-label.")
     job_dir = _required_file(job_dir / "vertical_ad_report.json", "vertical_ad_report.json").parent
     inputs = _verified_job_inputs(job_dir, motion_base)
     ffmpeg, ffprobe = echo.resolve_tools(ffmpeg_arg, ffprobe_arg)
@@ -329,10 +480,11 @@ def reprocess(
     if inputs["restore_audio"]:
         protected_outputs.append(output_paths["unshifted_video"])
     if mouth_donor_mode == "silence-conditioned":
-        protected_outputs.extend((
-            output_paths["silence_audio"], output_paths["silence_donor_video"],
-            output_paths["silence_donor_log"],
-        ))
+        if reuse_silence_donor_label is None:
+            protected_outputs.extend((
+                output_paths["silence_audio"], output_paths["silence_donor_video"],
+                output_paths["silence_donor_log"],
+            ))
     _ensure_outputs_unused(protected_outputs)
     unshifted_video = inputs["rendered_video"]
     reencoded_audio_restore: Optional[Dict[str, Any]] = None
@@ -368,7 +520,8 @@ def reprocess(
     silence_donor_record: Optional[Dict[str, Any]] = None
     if mouth_donor_mode == "silence-conditioned":
         silence_donor_record = _render_silence_conditioned_donor(
-            job_dir, inputs, ffmpeg, ffprobe, musetalk_dir, musetalk_python, output_label,
+            job_dir, inputs, ffmpeg, ffprobe, musetalk_dir, musetalk_python,
+            output_label, reuse_silence_donor_label,
         )
 
     started = time.perf_counter()
@@ -387,6 +540,11 @@ def reprocess(
         mouth_donor_mode=mouth_donor_mode,
         silence_conditioned_donor_video=(Path(silence_donor_record["donor_video"])
                                          if silence_donor_record else None),
+        silence_conditioned_trailing_truncation_verified=bool(
+            silence_donor_record
+            and silence_donor_record.get("frame_timeline_validation", {}).get("status")
+            == "verified_trailing_frame_truncation"
+        ),
         musetalk_dir=musetalk_dir,
         musetalk_python=musetalk_python,
         helper_log_path=output_paths["helper_log"],
@@ -394,6 +552,8 @@ def reprocess(
     if silence_donor_record is not None:
         correction["silence_conditioned_donor_render"] = silence_donor_record
         correction["reference_cache_state"] = (
+            "reused existing provenance-verified silence-conditioned donor assets"
+            if not silence_donor_record.get("models_rerun") else
             "REUSED avatar cache from the source job report; separate silence-conditioned MuseTalk donor pass rendered"
         )
     if correction["status"] not in ("applied", "partially_applied"):
@@ -413,7 +573,8 @@ def reprocess(
             "silence_conditioned_donor_render": silence_donor_record,
             "pause_correction": correction,
             "note": ("Không tạo final đã sửa vì pause correction không có đủ frame/donor đạt kiểm tra; Echo và full-audio lip-sync không được chạy lại."
-                     + (" MuseTalk đã chạy pass silence-conditioned donor." if silence_donor_record else "")),
+                     + (" Đã chạy pass MuseTalk donor im lặng." if silence_donor_record and silence_donor_record.get("models_rerun")
+                        else " Đã tái sử dụng donor im lặng đã xác minh." if silence_donor_record else "")),
         }
         echo.write_json_atomic(report_path, report)
         raise RuntimeError("Pause correction bị bỏ qua: {}. Report: {}".format(correction["status"], report_path))
@@ -454,9 +615,16 @@ def reprocess(
         "export": exported,
         "export_wall_seconds": round(export_seconds, 3),
         "postprocess_wall_seconds": round(time.perf_counter() - started, 3),
-        "models_rerun": silence_donor_record is not None,
-        "models_rerun_scope": "Echo and full-audio lip-sync were not rerun; silence-conditioned mode performs a separate MuseTalk donor inference.",
-        "musetalk_silence_conditioned_donor_rendered": silence_donor_record is not None,
+        "models_rerun": bool(silence_donor_record and silence_donor_record.get("models_rerun")),
+        "models_rerun_scope": (
+            "Echo and full-audio lip-sync were not rerun; the existing provenance-verified silence-conditioned donor was reused."
+            if silence_donor_record and not silence_donor_record.get("models_rerun") else
+            "Echo and full-audio lip-sync were not rerun; a separate silence-conditioned MuseTalk donor inference was rendered."
+            if silence_donor_record else "Echo and MuseTalk were not rerun."
+        ),
+        "musetalk_silence_conditioned_donor_rendered": bool(
+            silence_donor_record and silence_donor_record.get("models_rerun")
+        ),
         "report_path": str(report_path),
         "audio_policy": "use the job's unshifted audio; AAC stream is copied through correction and HD export",
         "scope_note": ("Only output pauses whose exact MuseTalk ping-pong source frame is also verified silent are restored. Other pause frames remain unchanged and are reported uncovered; visual closure still requires human review."
@@ -481,6 +649,8 @@ def make_parser() -> argparse.ArgumentParser:
                         help="mouth-only donors: legacy quiet-source bank or same-motion-base silent MuseTalk pass with exact mapped-frame-only selection.")
     parser.add_argument("--output-label", default=None,
                         help="Optional suffix (1-48 letters/digits/_/-; starts with a letter/digit) so a new attempt writes beside prior outputs without overwriting them.")
+    parser.add_argument("--reuse-silence-donor-label", default=None,
+                        help="Reuse and provenance-check existing donor MP4/WAV/log with this prior output label; requires a different --output-label and silence-conditioned mode.")
     parser.add_argument("--musetalk-dir", default=None, help="MuseTalk checkout containing existing FaceParsing code and weights; omit for automatic discovery.")
     parser.add_argument("--musetalk-python", default=None, help="Python executable of the installed MuseTalk runtime; omit for automatic discovery.")
     parser.add_argument("--ffmpeg", default="ffmpeg")
@@ -494,7 +664,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         report = reprocess(
             args.job_dir, args.motion_base, args.ffmpeg, args.ffprobe,
             args.pause_correction_region, args.musetalk_dir, args.musetalk_python,
-            args.mouth_donor_mode, args.output_label,
+            args.mouth_donor_mode, args.output_label, args.reuse_silence_donor_label,
         )
     except Exception as error:
         print("ERROR: {}".format(error), file=sys.stderr)
