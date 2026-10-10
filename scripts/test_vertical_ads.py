@@ -282,6 +282,29 @@ def pause_frame_indices(
     ]
 
 
+def _mouth_only_pause_coverage_failure(record: Mapping[str, Any], correction_region: str) -> Optional[str]:
+    """Reject mouth-only output unless every requested video pause frame passed final QC."""
+    if correction_region != "mouth-only" or record.get("requested_policy") == "off":
+        return None
+    if "requested_output_pause_frame_count" not in record:
+        if record.get("requested_intervals"):
+            return "Mouth-only pause frame coverage is unknown because the requested in-video frame count is missing. No HD final was promoted."
+        return None
+    requested = int(record.get("requested_output_pause_frame_count", 0) or 0)
+    if requested == 0:
+        return None
+    corrected = int(record.get("corrected_pause_frame_count", 0) or 0)
+    if record.get("pause_coverage_status") != "full" or corrected != requested:
+        return (
+            "Mouth-only pause correction has incomplete coverage: {}/{} in-video pause frames; "
+            "coverage status is {}. No HD final was promoted."
+        ).format(corrected, requested, record.get("pause_coverage_status", "unknown"))
+    quality = record.get("output_mouth_closure_qc") or {}
+    if quality.get("status") != "passed" or record.get("output_promoted") is not True:
+        return "Mouth-only pause correction did not pass final encoded-frame mouth QC. No HD final was promoted."
+    return None
+
+
 def quiet_source_frame_indices(
     intervals: Sequence[Mapping[str, float]], source_frame_count: int, fps: int = FPS,
 ) -> List[int]:
@@ -2468,6 +2491,20 @@ def run_workflow(args: argparse.Namespace, job_dir: Path, report: Dict[str, Any]
                     print("Pause frame indices beyond rendered video (audio kept intact): {}".format(
                         closure_record["pause_frame_indices_outside_rendered_video"],
                     ))
+        if (args.pause_correction_region == "mouth-only"
+                and "requested_output_pause_frame_count" not in closure_record):
+            rendered_frames = count_video_frames(muse_data["path"], ffprobe)
+            requested_frames = pause_frame_indices(
+                closure_record.get("requested_intervals", []), muse_data["actual_audio_seconds"], FPS,
+                frame_count=rendered_frames,
+            )
+            closure_record.update({
+                "requested_output_pause_frame_count": len(requested_frames),
+                "corrected_pause_frame_count": 0,
+                "corrected_pause_frame_fraction": 0.0,
+                "pause_coverage_status": "none" if requested_frames else "no_in_video_pause_frames",
+                "uncorrected_output_pause_frame_indices": requested_frames,
+            })
         closure_wall = time.perf_counter() - closure_started
         closure_record["requested_policy"] = args.pause_mouth_closure
         closure_record["source_mouth_mode"] = source_mouth_mode or "unknown"
@@ -2478,6 +2515,22 @@ def run_workflow(args: argparse.Namespace, job_dir: Path, report: Dict[str, Any]
         _append_phase(report, "pause_mouth_closure_video_{}_wall".format(index), closure_wall,
                       "Unshifted-WAV pause detection and verified quiet-source correction; parser/alignment failures stay untouched and AAC is copied unchanged.",
                       video_index=index)
+        coverage_failure = _mouth_only_pause_coverage_failure(
+            closure_record, args.pause_correction_region,
+        )
+        if coverage_failure:
+            failed_video_entry = dict(muse_meta)
+            failed_video_entry["audio_conditioning"] = muse_data["audio_conditioning"]
+            report["status"] = "failed_pause_mouth_coverage"
+            report["videos"] = outputs + [failed_video_entry]
+            report["pause_mouth_coverage_failure"] = {
+                "video_index": index,
+                "reason": coverage_failure,
+                "pause_correction": closure_record,
+                "note": "MuseTalk intermediates and diagnostics are preserved; HD export was not run.",
+            }
+            echo.write_json_atomic(report_path, report)
+            raise RuntimeError(coverage_failure)
         output_name = "vertical_ad_1080x1920.mp4" if video_count == 1 else "vertical_ad_1080x1920_{}.mp4".format(variant)
         final_output = job_dir / output_name
         export_seconds, exported = export_hd_video(
@@ -2609,9 +2662,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         write_phase_csv(job_dir / "phase_timings.csv", report.get("phase_timings", []))
         return 130
     except Exception as exc:
-        report.update({"status": "failed", "error_type": type(exc).__name__, "error": str(exc),
+        status = report.get("status")
+        report.update({"error_type": type(exc).__name__, "error": str(exc),
                        "logs": str(outer_log), "partial_outputs_preserved": True,
                        "whole_job_wall_seconds": round(time.perf_counter() - started, 3)})
+        if status != "failed_pause_mouth_coverage":
+            report["status"] = "failed"
         echo.write_json_atomic(report_path, report)
         write_phase_csv(job_dir / "phase_timings.csv", report.get("phase_timings", []))
         print("Vertical ads run failed: {}".format(exc), file=console_err)

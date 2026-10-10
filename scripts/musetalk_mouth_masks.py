@@ -611,10 +611,88 @@ def run_extraction(
     }
     corrected_frames = 0
     started = time.perf_counter()
-    mask_directory.mkdir(parents=True, exist_ok=False)
-    donor_directory.mkdir(parents=True, exist_ok=False)
     zero_mask = np.zeros((height, width), dtype=np.uint8)
     zero_donor = np.zeros((height, width, 3), dtype=np.uint8)
+
+    def build_report() -> Dict[str, Any]:
+        donor_count = len(donor_cache)
+        coverage_status = ("none" if not corrected_frames else
+                           "full" if corrected_frames == len(requests) else "partial")
+        report = {
+            "status": ("applied" if coverage_status == "full" else
+                       "partially_applied" if coverage_status == "partial" else
+                       "no_confident_mouth_donor_alignment"),
+            "coverage_status": coverage_status,
+            "donor_mode": donor_mode,
+            "parser": "MuseTalk FaceParsing.net raw argmax; labels 11, 12, 13",
+            "landmark_aperture_gate": {
+                "detector": "face-alignment 68-point landmarks",
+                "detector_status": landmark_detector_error or ("ready" if landmark_detector is not None else "unavailable"),
+                "measurement": "maximum central inner-lip vertical gap projected perpendicular to mouth axis, divided by mouth-corner width",
+                "maximum_closed_threshold": MAX_MOUTH_APERTURE_RATIO,
+                "minimum_mouth_width_pixels": MIN_MOUTH_WIDTH_PIXELS,
+                "unavailable_or_uncertain_policy": "fail closed; a parser-only result cannot certify a closed-mouth donor",
+            },
+            "mask_region": "semantic lip classes, 3x3 dilation, 5x5 Gaussian feather sigma=0.9 at native resolution",
+            "mask_alignment": "face-box scale with mouth-center anchored translation; conservative face/mouth proxy gates reject visibly displaced candidates",
+            "donor_validation": (
+                "only the exact ping-pong-mapped frame from the silence-conditioned MuseTalk pass is eligible; parser inner-mouth fraction must be <= {:.2f} and landmark aperture must be <= {:.3f}; no fallback donor is permitted".format(MAX_INNER_MOUTH_FRACTION, MAX_MOUTH_APERTURE_RATIO)
+                if donor_mode == "silence-conditioned-exact-source" else
+                "source frame lies fully within verified quiet-source interval; parser inner-mouth fraction must be <= {:.2f} and landmark aperture must be <= {:.3f}".format(MAX_INNER_MOUTH_FRACTION, MAX_MOUTH_APERTURE_RATIO)
+            ),
+            "donor_selection_policy": (
+                "Use only the exact mapped donor frame if parser fraction <= {:.2f}, landmark aperture <= {:.3f}, and face/mouth geometry gates pass; never fall back to another frame.".format(MAX_INNER_MOUTH_FRACTION, MAX_MOUTH_APERTURE_RATIO)
+                if donor_mode == "silence-conditioned-exact-source" else
+                "Require parser fraction <= {:.2f} and landmark aperture <= {:.3f}; rank eligible donors by lowest face/mouth geometry score, then lowest inner_mouth_fraction.".format(MAX_INNER_MOUTH_FRACTION, MAX_MOUTH_APERTURE_RATIO)
+            ),
+            "face_mouth_alignment_gate": {
+                "maximum_normalized_face_center_delta": 0.025,
+                "maximum_face_scale_delta": 0.07,
+                "maximum_relative_mouth_center_delta": [0.025, 0.04],
+                "maximum_relative_mouth_width_delta": 0.08,
+                "transform_anchor": "mouth_bbox_center_with_face_bbox_scale",
+            },
+            "lip_color_policy": "Bounded per-class median Lab L/a/b match from overlapping parsed upper/lower lip pixels; inner-mouth label 11 is untouched; skip if fewer than {} total or {} per-class matching samples.".format(MIN_COLOR_MATCH_LIP_PIXELS, MIN_COLOR_MATCH_PIXELS_PER_LIP_CLASS),
+            "diagnostic_scope": (
+                "All eligible donors were validated and none passed the closed-mouth gates; requested output frames were not parsed because no patch could be prepared."
+                if not donor_cache else
+                "Per-frame records describe parser and measured-landmark donor eligibility/patch preparation; final composited frames require a separate post-FFmpeg aperture validation and passing thresholds do not guarantee universal subjective quality."
+            ),
+            "frame_time_basis": "timestamp_seconds is the output video frame start: output_frame_index / FPS; frame_interval_seconds gives its full 1/FPS interval.",
+            "donor_video_frame_count": donor_frame_count,
+            "donor_source_frame_count": donor_source_frame_count,
+            "donor_trailing_truncation_verified": trailing_truncation_verified,
+            "missing_trailing_donor_frame_index": (
+                donor_source_frame_count - 1 if trailing_truncation_verified else None
+            ),
+            "missing_trailing_frame_policy": "leave any pause mapped to the absent last source frame unchanged; do not pad, shift, interpolate, or choose another donor",
+            "frame_diagnostics": [frame_diagnostics[index] for index in sorted(frame_diagnostics)],
+            "requested_output_pause_frames": len(requests),
+            "corrected_output_pause_frames": corrected_frames,
+            "corrected_output_frame_indices": corrected_indices,
+            "corrected_pause_frame_fraction": round(corrected_frames / float(len(requests)), 6),
+            "uncovered_output_pause_frame_count": len(requests) - corrected_frames,
+            "selected_donor_by_output_frame": selected_donor_by_output_frame,
+            "quiet_source_candidate_frames": len(source_candidates) if donor_mode == "quiet-source" else 0,
+            "exact_neutral_donor_candidate_frames": len(source_candidates) if donor_mode != "quiet-source" else 0,
+            "valid_closed_donor_frames": donor_count,
+            "selected_donor_frame_count": sum(selected_donors.values()),
+            "selected_donor_frame_counts": {str(index): count for index, count in sorted(selected_donors.items())},
+            "uncorrected_output_pause_frame_indices": sorted(set(requests) - set(corrected_indices)),
+            "mean_mask_pixels": round(float(np.mean(mask_areas)), 2) if mask_areas else 0.0,
+            "mean_mask_fraction_of_frame": round(float(np.mean(mask_areas)) / float(width * height), 8) if mask_areas else 0.0,
+            "skipped_frame_reasons": dict(sorted(reasons.items())),
+            "inference_wall_seconds": round(time.perf_counter() - started, 3),
+            "experimental_pose_proxy": True,
+            "speech_and_nonmask_pixels_policy": (
+                "leave MuseTalk content unchanged; only nonzero semantic lip alpha may use the exact mapped silence-conditioned donor frame"
+                if donor_mode == "silence-conditioned-exact-source" else
+                "leave MuseTalk content unchanged; only nonzero semantic lip alpha may use a verified quiet-source donor"
+            ),
+            "unshifted_output_audio_policy": "map MuseTalk input audio stream 0:a:0 with stream copy; do not gate or replace output audio",
+        }
+        return report
+
     try:
         for donor_index in source_candidates:
             if _exact_source_donor_missing_reason(
@@ -673,6 +751,20 @@ def run_extraction(
             donor_validation[donor_index] = {
                 "status": "available", "reason": None, "closed_mouth_metric": closed_metric,
             }
+
+        if not donor_cache:
+            skip_reason = "no_validated_closed_donor_frame_available"
+            reasons[skip_reason] += len(requests)
+            for diagnostic in frame_diagnostics.values():
+                diagnostic["skip_reason"] = skip_reason
+            # Target parsing cannot produce a patch without at least one donor
+            # that passed both closure checks; return the diagnostics now.
+            report = build_report()
+            report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            return report
+
+        mask_directory.mkdir(parents=True, exist_ok=False)
+        donor_directory.mkdir(parents=True, exist_ok=False)
 
         for output_index in range(output_frame_count):
             mask = zero_mask
@@ -830,78 +922,7 @@ def run_extraction(
         rendered_capture.release()
         reference_capture.release()
 
-    donor_count = len(donor_cache)
-    coverage_status = ("none" if not corrected_frames else
-                       "full" if corrected_frames == len(requests) else "partial")
-    report = {
-        "status": ("applied" if coverage_status == "full" else
-                   "partially_applied" if coverage_status == "partial" else
-                   "no_confident_mouth_donor_alignment"),
-        "coverage_status": coverage_status,
-        "donor_mode": donor_mode,
-        "parser": "MuseTalk FaceParsing.net raw argmax; labels 11, 12, 13",
-        "landmark_aperture_gate": {
-            "detector": "face-alignment 68-point landmarks",
-            "detector_status": landmark_detector_error or ("ready" if landmark_detector is not None else "unavailable"),
-            "measurement": "maximum central inner-lip vertical gap projected perpendicular to mouth axis, divided by mouth-corner width",
-            "maximum_closed_threshold": MAX_MOUTH_APERTURE_RATIO,
-            "minimum_mouth_width_pixels": MIN_MOUTH_WIDTH_PIXELS,
-            "unavailable_or_uncertain_policy": "fail closed; a parser-only result cannot certify a closed-mouth donor",
-        },
-        "mask_region": "semantic lip classes, 3x3 dilation, 5x5 Gaussian feather sigma=0.9 at native resolution",
-        "mask_alignment": "face-box scale with mouth-center anchored translation; conservative face/mouth proxy gates reject visibly displaced candidates",
-        "donor_validation": (
-            "only the exact ping-pong-mapped frame from the silence-conditioned MuseTalk pass is eligible; parser inner-mouth fraction must be <= {:.2f} and landmark aperture must be <= {:.3f}; no fallback donor is permitted".format(MAX_INNER_MOUTH_FRACTION, MAX_MOUTH_APERTURE_RATIO)
-            if donor_mode == "silence-conditioned-exact-source" else
-            "source frame lies fully within verified quiet-source interval; parser inner-mouth fraction must be <= {:.2f} and landmark aperture must be <= {:.3f}".format(MAX_INNER_MOUTH_FRACTION, MAX_MOUTH_APERTURE_RATIO)
-        ),
-        "donor_selection_policy": (
-            "Use only the exact mapped donor frame if parser fraction <= {:.2f}, landmark aperture <= {:.3f}, and face/mouth geometry gates pass; never fall back to another frame.".format(MAX_INNER_MOUTH_FRACTION, MAX_MOUTH_APERTURE_RATIO)
-            if donor_mode == "silence-conditioned-exact-source" else
-            "Require parser fraction <= {:.2f} and landmark aperture <= {:.3f}; rank eligible donors by lowest face/mouth geometry score, then lowest inner_mouth_fraction.".format(MAX_INNER_MOUTH_FRACTION, MAX_MOUTH_APERTURE_RATIO)
-        ),
-        "face_mouth_alignment_gate": {
-            "maximum_normalized_face_center_delta": 0.025,
-            "maximum_face_scale_delta": 0.07,
-            "maximum_relative_mouth_center_delta": [0.025, 0.04],
-            "maximum_relative_mouth_width_delta": 0.08,
-            "transform_anchor": "mouth_bbox_center_with_face_bbox_scale",
-        },
-        "lip_color_policy": "Bounded per-class median Lab L/a/b match from overlapping parsed upper/lower lip pixels; inner-mouth label 11 is untouched; skip if fewer than {} total or {} per-class matching samples.".format(MIN_COLOR_MATCH_LIP_PIXELS, MIN_COLOR_MATCH_PIXELS_PER_LIP_CLASS),
-        "diagnostic_scope": "Per-frame records describe parser and measured-landmark donor eligibility/patch preparation; final composited frames require a separate post-FFmpeg aperture validation and passing thresholds do not guarantee universal subjective quality.",
-        "frame_time_basis": "timestamp_seconds is the output video frame start: output_frame_index / FPS; frame_interval_seconds gives its full 1/FPS interval.",
-        "donor_video_frame_count": donor_frame_count,
-        "donor_source_frame_count": donor_source_frame_count,
-        "donor_trailing_truncation_verified": trailing_truncation_verified,
-        "missing_trailing_donor_frame_index": (
-            donor_source_frame_count - 1 if trailing_truncation_verified else None
-        ),
-        "missing_trailing_frame_policy": "leave any pause mapped to the absent last source frame unchanged; do not pad, shift, interpolate, or choose another donor",
-        "frame_diagnostics": [frame_diagnostics[index] for index in sorted(frame_diagnostics)],
-        "requested_output_pause_frames": len(requests),
-        "corrected_output_pause_frames": corrected_frames,
-        "corrected_output_frame_indices": corrected_indices,
-        "corrected_pause_frame_fraction": round(corrected_frames / float(len(requests)), 6),
-        "uncovered_output_pause_frame_count": len(requests) - corrected_frames,
-        "selected_donor_by_output_frame": selected_donor_by_output_frame,
-        "quiet_source_candidate_frames": len(source_candidates) if donor_mode == "quiet-source" else 0,
-        "exact_neutral_donor_candidate_frames": len(source_candidates) if donor_mode != "quiet-source" else 0,
-        "valid_closed_donor_frames": donor_count,
-        "selected_donor_frame_count": sum(selected_donors.values()),
-        "selected_donor_frame_counts": {str(index): count for index, count in sorted(selected_donors.items())},
-        "uncorrected_output_pause_frame_indices": sorted(set(requests) - set(corrected_indices)),
-        "mean_mask_pixels": round(float(np.mean(mask_areas)), 2) if mask_areas else 0.0,
-        "mean_mask_fraction_of_frame": round(float(np.mean(mask_areas)) / float(width * height), 8) if mask_areas else 0.0,
-        "skipped_frame_reasons": dict(sorted(reasons.items())),
-        "inference_wall_seconds": round(time.perf_counter() - started, 3),
-        "experimental_pose_proxy": True,
-        "speech_and_nonmask_pixels_policy": (
-            "leave MuseTalk content unchanged; only nonzero semantic lip alpha may use the exact mapped silence-conditioned donor frame"
-            if donor_mode == "silence-conditioned-exact-source" else
-            "leave MuseTalk content unchanged; only nonzero semantic lip alpha may use a verified quiet-source donor"
-        ),
-        "unshifted_output_audio_policy": "map MuseTalk input audio stream 0:a:0 with stream copy; do not gate or replace output audio",
-    }
+    report = build_report()
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return report
 

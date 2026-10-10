@@ -556,9 +556,11 @@ def reprocess(
             if not silence_donor_record.get("models_rerun") else
             "REUSED avatar cache from the source job report; separate silence-conditioned MuseTalk donor pass rendered"
         )
-    if correction["status"] not in ("applied", "partially_applied"):
+    coverage_failure = ads._mouth_only_pause_coverage_failure(correction, correction_region)
+    if correction["status"] not in ("applied", "partially_applied") or coverage_failure:
+        failed_coverage = bool(coverage_failure)
         report = {
-            "status": "skipped",
+            "status": "failed_pause_mouth_coverage" if failed_coverage else "skipped",
             "reason": correction["status"],
             "correction_region": correction_region,
             "mouth_donor_mode": mouth_donor_mode,
@@ -570,6 +572,9 @@ def reprocess(
                                  else "same_motion_base_silence_conditioned_musetalk_exact_pingpong_frame"
                                  if mouth_donor_mode == "silence-conditioned" else
                                  "verified_quiet_source_mouth_donor_bank"),
+            "final_output": None,
+            "output_promoted": False,
+            "coverage_failure": coverage_failure,
             "silence_conditioned_donor_render": silence_donor_record,
             "pause_correction": correction,
             "note": ("Không tạo final đã sửa vì pause correction không có đủ frame/donor đạt kiểm tra; Echo và full-audio lip-sync không được chạy lại."
@@ -577,6 +582,8 @@ def reprocess(
                         else " Đã tái sử dụng donor im lặng đã xác minh." if silence_donor_record else "")),
         }
         echo.write_json_atomic(report_path, report)
+        if coverage_failure:
+            raise RuntimeError("{} Report: {}".format(coverage_failure, report_path))
         raise RuntimeError("Pause correction bị bỏ qua: {}. Report: {}".format(correction["status"], report_path))
 
     export_seconds, exported = ads.export_hd_video(
@@ -670,6 +677,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("ERROR: {}".format(error), file=sys.stderr)
         return 1
     correction = report["pause_correction"]
+    coverage_failure = ads._mouth_only_pause_coverage_failure(
+        correction, str(report.get("correction_region", "full-frame")),
+    )
+    if coverage_failure:
+        print("ERROR: {}".format(coverage_failure), file=sys.stderr)
+        return 1
     coverage = correction.get("pause_coverage_status")
     if coverage is not None:
         coverage_label = "đầy đủ" if coverage == "full" else "một phần" if coverage == "partial" else "không có frame nào"

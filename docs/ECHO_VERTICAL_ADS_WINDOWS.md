@@ -76,9 +76,9 @@ Offset `-40/0/+40 ms` được áp dụng **sau gate**, vì vậy khoảng pause
 
 Theo mặc định, sau inference pause correction khôi phục đúng frame Echo mà MuseTalk đã chọn tại thời điểm đó bằng chu kỳ `frame_list + frame_list[::-1]`. Chỉ làm khi cả frame output và frame nguồn tương ứng nằm trọn trong các khoảng im lặng đã xác minh. Nhờ vậy thân, đầu và nền giữ đúng chuyển động của timestamp trong chu kỳ gốc. Các pause không trùng thời điểm nguồn im lặng được giữ nguyên và ghi vào `uncovered_intervals`. Fade ngắn chỉ áp dụng bên trong những run khớp nguồn; audio AAC được stream-copy. Đây là correction toàn khung và vẫn là mặc định để giữ tương thích.
 
-Có thêm chế độ **thử nghiệm** `mouth-only` để so A/B mà không thay toàn khung: dùng model FaceParsing và checkpoint đã có trong MuseTalk để đọc nhãn môi 11/12/13, chỉ lấy donor từ các frame của chính motion base nằm hoàn toàn trong khoảng im lặng và qua kiểm tra miệng khép, rồi warp theo bounding box khuôn mặt. Ở job đã phân tích trước đây bank có 18 frame (0,72 giây mẫu nguồn); có thể tái sử dụng donor gần pose cho nhiều frame pause đầu ra, nên đây không phải giới hạn tổng thời lượng pause. Thời lượng được sửa thực tế phụ thuộc mask/geometry và phải đọc từ report (`covered_duration_seconds`, `uncovered_duration_seconds`). Bộ so khớp tư thế chỉ là proxy hình học, chưa được kiểm chứng bằng video thật. Frame target, donor hoặc mask không đạt ngưỡng sẽ được bỏ qua và ghi lý do/coverage; không fallback sang khung hình đầy đủ. Audio giữ nguyên qua stream-copy. Vì kết quả cuối là H.264 4:2:0, vùng màu có thể sai khác nhẹ ở mép feather do nén/chroma subsampling; chế độ này chưa được nhìn A/B trên máy RTX 3060 và không đảm bảo khẩu hình 100%.
+Có thêm chế độ **thử nghiệm** `mouth-only` để so A/B mà không thay toàn khung: dùng FaceParsing để đọc nhãn môi 11/12/13, kiểm tra donor môi khép bằng parser và landmark, căn theo hình học mặt/miệng, rồi chỉ ghép vùng môi. Nếu không donor nào đạt kiểm tra, helper ghi diagnostics rồi dừng trước khi chạy parser trên toàn bộ frame pause. Frame target hoặc donor không đạt ngưỡng sẽ được bỏ qua và ghi lý do. Core mới yêu cầu phủ đủ mọi frame pause trong phần video và QC khẩu độ trên video đã encode trước khi cho phép xuất HD; coverage `none` hoặc `partial` sẽ dừng job, giữ intermediate/report và không công bố output như đã sửa. Đây là kiểm tra hình học, không bảo đảm cảm quan hoàn hảo; cần xem video trên máy RTX 3060. Audio giữ nguyên qua stream-copy. Vì kết quả cuối là H.264 4:2:0, mép feather vẫn có thể khác màu nhẹ do nén/chroma subsampling.
 
-Correction này không làm dịu đầu khi đang nói và không đảm bảo mọi pause được sửa: khi frame nguồn tại timestamp tương ứng đang nói, output được giữ nguyên. Kiểm tra `uncovered_intervals` và output trực quan; việc phát hiện silence không đảm bảo miệng khép tuyệt đối.
+Correction này không làm dịu đầu khi đang nói. Chế độ mặc định `full-frame` chỉ phủ pause khớp frame nguồn; phần còn lại có thể vẫn mấp máy và được ghi trong `uncovered_intervals`. Với `mouth-only`, coverage không đủ sẽ chặn xuất HD; đây là quality gate để tránh nhầm một video chưa sửa thành output đạt. Ngay cả khi phép đo aperture qua ngưỡng, cần xem video vì số đo không chứng nhận độ tự nhiên chủ quan.
 
 Report `motion_audio_alignment` so SHA-256 audio Echo dùng để tạo cử chỉ với audio hiện tại. Khi mismatch hoặc không có manifest, auto bỏ qua pause correction; hãy tạo Echo speech base mới nếu cần cử chỉ bám audio. `--pause-mouth-closure off` tắt cả conditioning gate và correction sau render. Full-frame chỉ phủ pause khớp frame nguồn, nên phần còn lại có thể vẫn mấp máy; report phải được xem cùng `uncovered_intervals`. Whisper context, giới hạn 25 FPS và sai số model vẫn khiến khẩu hình lệch; hãy nghe/xem A/B trước khi chạy dài.
 
@@ -158,7 +158,26 @@ Nếu tự dò không chọn đúng MuseTalk Python/checkout, thêm `--musetalk-
 - `vertical_ad_1080x1920_pause_mouth_only_reprocessed.mp4`: bản xem 9:16.
 - `logs\mouth_mask_extraction_reprocess.log`: log parser/helper.
 
-So bản này với `vertical_ad_1080x1920.mp4` gốc của job. Chuyển động đầu/vai ngoài vùng môi phải tiếp tục chạy. Nếu report báo coverage thấp hoặc không có donor đạt kiểm tra, đó là skip có chủ ý; không hạ ngưỡng bằng tay. Report và test hiện tại chỉ xác nhận hợp đồng dữ liệu/compositing trên synthetic clip; chưa xác nhận chất lượng hình ảnh hay thời gian trên RTX 3060. Giữ `--pause-correction-region` mặc định `full-frame` cho các lệnh `test_vertical_ads.bat` cho đến khi xem xong A/B.
+So bản này với `vertical_ad_1080x1920.mp4` gốc của job. Chuyển động đầu/vai ngoài vùng môi phải tiếp tục chạy. Nếu coverage không đủ hoặc không có donor đạt kiểm tra, core mới ghi report thất bại và không xuất video final; không hạ ngưỡng bằng tay. Report và test hiện tại chỉ xác nhận hợp đồng dữ liệu/compositing trên synthetic clip; chưa xác nhận chất lượng hình ảnh hay thời gian trên RTX 3060. Giữ `--pause-correction-region` mặc định `full-frame` cho các lệnh `test_vertical_ads.bat` cho đến khi duyệt A/B.
+
+### Dùng lại job hiện tại khi frame nguồn yên không có donor môi khép
+
+Nếu report cũ ghi `no_confident_mouth_donor_alignment`, `valid_closed_donor_frames=0` và `corrected_pause_frame_count=0`, video HD cũ thực chất chưa được sửa môi nghỉ. Không chạy lại toàn bộ 55 giây. Dùng chế độ `silence-conditioned` để tạo một donor pass ngắn từ chính motion base, sau đó thử ghép trên intermediate speech đã có; avatar cache trong job được tái sử dụng. Lượt donor vẫn có thể không đạt nếu MuseTalk không khép môi đủ ở frame tương ứng; khi đó report sẽ nêu lý do và không tạo final.
+
+Với job đang được kiểm tra:
+
+```bat
+set "JOB=output\vertical_ads\job_20261010_224236_c886c7c9"
+set "ECHO_BASE=output\echo_flash\a10_0682611f141d\motion_base.mp4"
+dir "%JOB%\vertical_ad_report.json"
+dir "%JOB%\intermediate\audio_unshifted_video_1.mp4"
+dir "%JOB%\intermediate\audio_unshifted_16k_mono.wav"
+dir "%JOB%\intermediate\echo_reference_audio_16k_mono.wav"
+dir "%ECHO_BASE%"
+python -u scripts\reprocess_pause_correction.py --job-dir "%JOB%" --motion-base "%ECHO_BASE%" --pause-correction-region mouth-only --mouth-donor-mode silence-conditioned --output-label silence_v1
+```
+
+Lệnh này không chạy lại Echo hay MuseTalk cho toàn bộ lời thoại; chỉ tạo một pass MuseTalk im lặng trên motion base 5,16 giây, rồi dùng cache và intermediate hiện có. Đọc `%JOB%\pause_mouth_only_silence_v1_reprocess_report.json`. Chỉ khi report báo coverage `full` và `output_mouth_closure_qc.status` là `passed` mới mở `%JOB%\vertical_ad_1080x1920_pause_mouth_only_silence_v1_reprocessed.mp4`. Nếu lệnh dừng, không có final là đúng: gửi report thất bại để xem frame donor nào còn mở hoặc lệch geometry.
 
 ### Dùng lại donor MuseTalk đã render nhưng bị thiếu một frame cuối
 

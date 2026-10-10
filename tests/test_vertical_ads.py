@@ -152,6 +152,33 @@ class VerticalAdsTests(unittest.TestCase):
         self.assertAlmostEqual(row["normalized_wall_seconds_per_60_audio_seconds_extrapolation"], 3 * 60 / 55.584, places=3)
         self.assertEqual(ads.report_filename("calibrate"), "lip_calibration_report.json")
 
+    def test_mouth_only_pause_coverage_requires_full_frame_coverage_and_final_qc(self):
+        requested = {"requested_output_pause_frame_count": 3}
+        self.assertIn("incomplete coverage", ads._mouth_only_pause_coverage_failure({
+            **requested, "corrected_pause_frame_count": 0, "pause_coverage_status": "none",
+        }, "mouth-only"))
+        self.assertIn("incomplete coverage", ads._mouth_only_pause_coverage_failure({
+            **requested, "corrected_pause_frame_count": 2, "pause_coverage_status": "partial",
+        }, "mouth-only"))
+        self.assertIn("final encoded-frame mouth QC", ads._mouth_only_pause_coverage_failure({
+            **requested, "corrected_pause_frame_count": 3, "pause_coverage_status": "full",
+            "output_mouth_closure_qc": {"status": "passed"}, "output_promoted": False,
+        }, "mouth-only"))
+        self.assertIsNone(ads._mouth_only_pause_coverage_failure({
+            **requested, "corrected_pause_frame_count": 3, "pause_coverage_status": "full",
+            "output_mouth_closure_qc": {"status": "passed"}, "output_promoted": True,
+        }, "mouth-only"))
+        self.assertIsNone(ads._mouth_only_pause_coverage_failure({
+            **requested, "corrected_pause_frame_count": 0, "pause_coverage_status": "none",
+        }, "full-frame"))
+        self.assertIn("coverage is unknown", ads._mouth_only_pause_coverage_failure({
+            "requested_intervals": [{"start_seconds": 0.2, "end_seconds": 0.4}],
+        }, "mouth-only"))
+        self.assertIsNone(ads._mouth_only_pause_coverage_failure({
+            **requested, "requested_policy": "off", "corrected_pause_frame_count": 0,
+            "pause_coverage_status": "none",
+        }, "mouth-only"))
+
     def test_quality_assessment_separates_file_checks_from_unverified_quality_claims(self):
         export = {
             "ffprobe_checks": {
@@ -761,6 +788,57 @@ class VerticalAdsTests(unittest.TestCase):
             self.assertIsNotNone(donor)
             self.assertLess(int(donor[40, 40, 0]), 50,
                             "the output-timed patch should be sourced from the selected quiet donor")
+
+    def test_mouth_only_extractor_skips_target_parser_when_closed_donor_bank_is_empty(self):
+        if mouth_masks.cv2 is None or mouth_masks.np is None:
+            self.skipTest("OpenCV/NumPy from the MuseTalk runtime are required for donor extraction checks")
+        cv2, np = mouth_masks.cv2, mouth_masks.np
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            width = height = 200
+            fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+            reference_video = root / "reference.avi"
+            rendered_video = root / "rendered.avi"
+            for path, count in ((reference_video, 2), (rendered_video, 4)):
+                writer = cv2.VideoWriter(str(path), fourcc, 25.0, (width, height))
+                self.assertTrue(writer.isOpened())
+                for _ in range(count):
+                    writer.write(np.full((height, width, 3), (80, 100, 120), dtype=np.uint8))
+                writer.release()
+
+            open_mouth_labels = np.zeros((height, width), dtype=np.uint8)
+            cv2.ellipse(open_mouth_labels, (100, 90), (45, 60), 0, 0, 360, 1, -1)
+            open_mouth_labels[121:125, 87:98] = 12
+            open_mouth_labels[121:125, 98:113] = 13
+            request_path = root / "request.json"
+            request_path.write_text(json.dumps({
+                "fps": 25, "width": width, "height": height, "output_frame_count": 4,
+                "quiet_source_frame_indices": [0, 1],
+                "output_pause_frames": [
+                    {"output_frame_index": 2, "exact_source_frame_index": 2},
+                    {"output_frame_index": 3, "exact_source_frame_index": 3},
+                ],
+            }), encoding="utf-8")
+            mask_dir, donor_dir, report_path = root / "masks", root / "donors", root / "report.json"
+            with mock.patch.object(mouth_masks, "_raw_label_map", return_value=open_mouth_labels) as parse:
+                report = mouth_masks.run_extraction(
+                    rendered_video, reference_video, mask_dir, donor_dir, report_path, request_path,
+                    parser=object(), torch=object(), landmark_detector=self._static_landmark_detector(4.0),
+                )
+
+            self.assertEqual(parse.call_count, 2, "only the two donor candidates should be parsed")
+            self.assertEqual(report["status"], "no_confident_mouth_donor_alignment")
+            self.assertEqual(report["coverage_status"], "none")
+            self.assertEqual(report["corrected_output_pause_frames"], 0)
+            self.assertEqual(report["uncovered_output_pause_frame_count"], 2)
+            self.assertEqual(report["skipped_frame_reasons"]["no_validated_closed_donor_frame_available"], 2)
+            self.assertTrue(all(
+                item["skip_reason"] == "no_validated_closed_donor_frame_available"
+                for item in report["frame_diagnostics"]
+            ))
+            self.assertTrue(report_path.is_file())
+            self.assertFalse(mask_dir.exists())
+            self.assertFalse(donor_dir.exists())
 
     @unittest.skipUnless(FFMPEG and FFPROBE, "FFmpeg/ffprobe are required for silence donor tests")
     def test_silence_wav_is_exact_motion_base_frame_duration_pcm16(self):
@@ -1440,20 +1518,15 @@ class VerticalAdsTests(unittest.TestCase):
                 "pause_frame_indices_outside_rendered_video": [1388, 1389],
             },
         }
-        stdout = io.StringIO()
-        with mock.patch.object(reprocess_pause, "reprocess", return_value=partial_result), contextlib.redirect_stdout(stdout):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(reprocess_pause, "reprocess", return_value=partial_result), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             status = reprocess_pause.main([
                 "--job-dir", "job", "--motion-base", "motion.mp4", "--pause-correction-region", "mouth-only",
             ])
-        self.assertEqual(status, 0)
-        output = stdout.getvalue()
-        self.assertIn("độ phủ frame pause trong video một phần. Frame có patch đã composite: 189/190 (99.5%)", output)
-        self.assertIn("chưa xác nhận trực quan miệng đã khép tự nhiên", output)
-        self.assertIn("Pause-time bên trong video nằm ngoài patch frame đầy đủ: 0.040s", output)
-        self.assertIn("31.280–31.320s", output)
-        self.assertIn("[782]", output)
-        self.assertIn("[1388, 1389]", output)
-        self.assertIn("Audio pause nằm sau frame video cuối: 0.064s qua 1 đoạn", output)
+        self.assertEqual(status, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("incomplete coverage: 189/190", stderr.getvalue())
 
     def test_offline_reprocess_refuses_old_full_frame_donor_without_original_motion_base(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1477,6 +1550,69 @@ class VerticalAdsTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "Cần --motion-base gốc"):
                 reprocess_pause._verified_job_inputs(job, None)
+
+    @unittest.skipUnless(FFMPEG and FFPROBE, "FFmpeg/ffprobe are required for pause coverage promotion checks")
+    def test_mouth_only_reprocess_does_not_export_final_for_none_or_partial_coverage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            job = root / "job"
+            intermediate = job / "intermediate"
+            intermediate.mkdir(parents=True)
+            (job / "logs").mkdir()
+            (job / "vertical_ad_report.json").write_text("{}", encoding="utf-8")
+            base = root / "motion_base.mp4"
+            self._ffmpeg([
+                "-f", "lavfi", "-i", "color=red:s=64x80:r=25:d=0.16", "-frames:v", "4", "-an",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(base),
+            ])
+            rendered = intermediate / "audio_unshifted_video_1.mp4"
+            self._video(rendered, 0.16)
+            audio = intermediate / "audio_unshifted_16k_mono.wav"
+            self._write_pause_audio(audio)
+            echo_audio = intermediate / "echo_reference_audio_16k_mono.wav"
+            shutil.copyfile(audio, echo_audio)
+            motion_sha = ads.musetalk.sha256_file(base)
+            inputs = {
+                "report_path": job / "vertical_ad_report.json",
+                "report": {"pause_mouth_closure_policy": {"minimum_pause_seconds": 0.1}},
+                "video_entry": {}, "provenance": {"status": "verified"},
+                "motion_base": base, "reference_video": base,
+                "reference_policy": "exact_pingpong_source_frame_mapping",
+                "motion_metadata": {"width": 64, "height": 80, "fps": 25.0, "sha256": motion_sha},
+                "rendered_video": rendered, "restore_audio": False,
+                "unshifted_audio": audio, "echo_reference_audio": echo_audio,
+            }
+            cases = (
+                ("none", "no_confident_mouth_donor_alignment", "none", 0),
+                ("partial", "partially_applied", "partial", 1),
+            )
+            for label, status, coverage, corrected_count in cases:
+                correction = {
+                    "status": status, "correction_region": "mouth-only",
+                    "pause_coverage_status": coverage,
+                    "corrected_pause_frame_count": corrected_count,
+                    "requested_output_pause_frame_count": 2,
+                    "pause_frame_coverage_ratio": corrected_count / 2.0,
+                    "output_promoted": False,
+                    "output_mouth_closure_qc": {"status": "passed"} if coverage == "partial" else None,
+                }
+                with (
+                    mock.patch.object(reprocess_pause, "_verified_job_inputs", return_value=inputs),
+                    mock.patch.object(reprocess_pause.ads, "apply_pause_mouth_closure", return_value=correction),
+                    mock.patch.object(reprocess_pause.ads, "export_hd_video", side_effect=AssertionError("partial mouth-only output must not be exported")) as export,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "No HD final was promoted"):
+                        reprocess_pause.reprocess(
+                            job, base, FFMPEG, FFPROBE,
+                            correction_region="mouth-only", output_label=label,
+                        )
+                export.assert_not_called()
+                paths = reprocess_pause._reprocess_output_paths(job, "mouth-only", label)
+                self.assertFalse(paths["final_video"].exists())
+                report = json.loads(paths["report"].read_text(encoding="utf-8"))
+                self.assertEqual(report["status"], "failed_pause_mouth_coverage")
+                self.assertFalse(report["output_promoted"])
+                self.assertIsNone(report["final_output"])
 
     @unittest.skipUnless(FFMPEG and FFPROBE, "FFmpeg unavailable")
     def test_offline_reprocess_writes_corrected_native_and_hd_without_model_rerun(self):
@@ -1851,6 +1987,33 @@ class VerticalAdsTests(unittest.TestCase):
                 "-ar", "16000", "-ac", "1", "-f", "s16le", "-",
             ])
             self.assertEqual(decoded_output, decoded_source, "HD export must preserve the unshifted AAC packets exactly")
+
+            no_donor_record = {
+                "status": "no_confident_mouth_donor_alignment",
+                "correction_region": "mouth-only",
+                "pause_coverage_status": "none",
+                "corrected_pause_frame_count": 0,
+                "requested_output_pause_frame_count": 10,
+                "pause_frame_coverage_ratio": 0.0,
+            }
+            failed_args = list(common) + [
+                "--pause-correction-region", "mouth-only", "--output-root", str(root / "failed_mouth_out"),
+            ]
+            failed_stdout, failed_stderr = io.StringIO(), io.StringIO()
+            with (
+                mock.patch.object(ads.musetalk, "run_backend_process", backend),
+                mock.patch.object(ads, "_preflight_mouth_qc_detector", return_value={"status": "ready"}),
+                mock.patch.object(ads, "apply_pause_mouth_closure", return_value=no_donor_record),
+                mock.patch.object(ads, "export_hd_video", side_effect=AssertionError("uncovered pauses must not be exported")) as export,
+                contextlib.redirect_stdout(failed_stdout), contextlib.redirect_stderr(failed_stderr),
+            ):
+                self.assertEqual(ads.main(failed_args), 1)
+            export.assert_not_called()
+            failed_report = json.loads(next((root / "failed_mouth_out").rglob("vertical_ad_report.json")).read_text())
+            self.assertEqual(failed_report["status"], "failed_pause_mouth_coverage")
+            self.assertEqual(failed_report["pause_mouth_coverage_failure"]["pause_correction"]["pause_coverage_status"], "none")
+            self.assertIn("No HD final was promoted", failed_report["error"])
+            self.assertFalse(list((root / "failed_mouth_out").rglob("vertical_ad_1080x1920*.mp4")))
 
             manifest["fingerprint_inputs"]["audio_sha256"] = "0" * 64
             (root / "run_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
