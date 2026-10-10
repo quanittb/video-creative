@@ -327,7 +327,89 @@ class VerticalAdsTests(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertEqual(reason, "face_center_mismatch")
 
-    def test_mouth_only_extractor_prefers_tighter_donor_and_reports_frame_diagnostics(self):
+        slight_shift = np.zeros_like(labels)
+        cv2.ellipse(slight_shift, (106, 90), (45, 60), 0, 0, 360, 1, -1)
+        slight_shift[121:125, 93:119] = 12
+        donor, reason = mouth_masks.describe_face_and_mouth(slight_shift)
+        self.assertEqual(reason, "ok")
+        allowed, _, reason = mouth_masks.compare_face_geometry(target, donor, 200, 200)
+        self.assertFalse(allowed, "a 3% face-center shift should be rejected before patching the mouth")
+        self.assertEqual(reason, "face_center_mismatch")
+
+    def test_mouth_only_transform_anchors_translation_on_lips(self):
+        if mouth_masks.cv2 is None or mouth_masks.np is None:
+            self.skipTest("OpenCV/NumPy from the MuseTalk runtime are required for mouth alignment checks")
+        np = mouth_masks.np
+        donor = np.zeros((100, 100), dtype=np.uint8)
+        donor[49, 49] = 255
+        warped = mouth_masks._warp_donor_to_target(
+            donor, [20, 10, 80, 90], [20, 10, 80, 90],
+            [45, 47, 55, 53], [48, 47, 58, 53],
+            interpolation=mouth_masks.cv2.INTER_NEAREST,
+        )
+        self.assertEqual(int(warped[49, 52]), 255)
+        self.assertEqual(int(np.count_nonzero(warped)), 1)
+
+    def test_mouth_only_color_match_reduces_lip_seam_without_touching_inner_mouth(self):
+        if mouth_masks.cv2 is None or mouth_masks.np is None:
+            self.skipTest("OpenCV/NumPy from the MuseTalk runtime are required for lip-color checks")
+        cv2, np = mouth_masks.cv2, mouth_masks.np
+        target = np.full((40, 64, 3), (100, 120, 150), dtype=np.uint8)
+        donor = np.full((40, 64, 3), (100, 120, 150), dtype=np.uint8)
+        target_labels = np.ones((40, 64), dtype=np.uint8)
+        donor_labels = np.ones((40, 64), dtype=np.uint8)
+        alpha = np.zeros((40, 64), dtype=np.uint8)
+        target_lips = np.zeros((40, 64), dtype=bool)
+        donor_lips = np.zeros((40, 64), dtype=bool)
+        inner_mouth = np.zeros((40, 64), dtype=bool)
+        target_lips[18:21, 24:40] = True
+        donor_lips[18:21, 24:40] = True
+        inner_mouth[19, 29:35] = True
+        target_labels[target_lips] = 12
+        donor_labels[donor_lips] = 12
+        target_labels[20, 24:40] = 13
+        donor_labels[20, 24:40] = 13
+        target_labels[inner_mouth] = 11
+        donor_labels[inner_mouth] = 11
+        feather = np.asarray([32, 64, 96, 128, 160, 192, 224, 255] * 2, dtype=np.uint8)
+        alpha[18:21, 24:40] = feather
+        target[target_lips] = (95, 110, 180)
+        donor[donor_lips] = (105, 112, 168)
+        target[inner_mouth] = (12, 10, 15)
+        donor[inner_mouth] = (8, 7, 9)
+
+        def median_lab(frame):
+            lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+            return np.median(lab[target_lips & ~inner_mouth], axis=0)
+
+        before_delta = np.abs(median_lab(target).astype(float) - median_lab(donor).astype(float))
+        corrected, diagnostic = mouth_masks._match_donor_lip_color(
+            donor, target, alpha, target_labels, donor_labels,
+        )
+        after_delta = np.abs(median_lab(target).astype(float) - median_lab(corrected).astype(float))
+
+        self.assertEqual(diagnostic["status"], "applied")
+        self.assertEqual(diagnostic["sample_pixel_count"], int(np.count_nonzero(target_lips & ~inner_mouth)))
+        self.assertTrue(np.all(after_delta < before_delta))
+        self.assertTrue(np.all(after_delta <= 2.0), "bounded Lab matching should remove synthetic lip color/brightness mismatch")
+        self.assertTrue(np.array_equal(corrected[inner_mouth], donor[inner_mouth]),
+                        "inner-mouth pixels must remain exactly from the closed donor")
+        self.assertTrue(np.array_equal(corrected[~donor_lips], donor[~donor_lips]),
+                        "color matching must not alter pixels outside semantic donor lips")
+
+        alpha_weight = alpha.astype(np.float32)[..., None] / 255.0
+        composite = np.rint(
+            target.astype(np.float32) * (1.0 - alpha_weight)
+            + corrected.astype(np.float32) * alpha_weight
+        ).astype(np.uint8)
+        self.assertTrue(np.array_equal(composite[alpha == 0], target[alpha == 0]),
+                        "zero-alpha area around the lip seam must preserve the rendered face exactly")
+        patch_delta = composite.astype(np.int16) - target.astype(np.int16)
+        edge_steps = np.abs(np.diff(patch_delta[18, 23:41], axis=0))
+        self.assertLessEqual(int(edge_steps[:-1].max()), 8,
+                             "a feathered synthetic lip seam should not introduce a hard color edge")
+
+    def test_mouth_only_extractor_prefers_best_aligned_closed_donor_and_reports_frame_diagnostics(self):
         if mouth_masks.cv2 is None or mouth_masks.np is None:
             self.skipTest("OpenCV/NumPy from the MuseTalk runtime are required for donor extraction checks")
         cv2, np = mouth_masks.cv2, mouth_masks.np
@@ -354,23 +436,26 @@ class VerticalAdsTests(unittest.TestCase):
             cv2.ellipse(tight_labels, (100, 90), (45, 60), 0, 0, 360, 1, -1)
             tight_labels[121:125, 87:98] = 12
             tight_labels[121:125, 98:113] = 13
-            more_open_labels = tight_labels.copy()
-            more_open_labels[121:124, 98:108] = 11
-            target_labels = tight_labels.copy()
-            target_labels[120:130, 87:113] = 11
+            aligned_labels = np.zeros_like(tight_labels)
+            cv2.ellipse(aligned_labels, (101, 90), (45, 60), 0, 0, 360, 1, -1)
+            aligned_labels[121:125, 88:99] = 12
+            aligned_labels[121:125, 99:114] = 13
+            aligned_labels[122:124, 99:103] = 11
+            target_labels = aligned_labels.copy()
+            target_labels[122:123, 99:103] = 11
             target_mask, target_geometry, _ = mouth_masks.build_feathered_mouth_mask(target_labels)
             self.assertIsNotNone(target_mask)
             tight_donor, _ = mouth_masks.describe_face_and_mouth(tight_labels)
-            open_donor, _ = mouth_masks.describe_face_and_mouth(more_open_labels)
+            aligned_donor, _ = mouth_masks.describe_face_and_mouth(aligned_labels)
             self.assertIsNotNone(tight_donor)
-            self.assertIsNotNone(open_donor)
+            self.assertIsNotNone(aligned_donor)
             tight_allowed, tight_score, _ = mouth_masks.compare_face_geometry(target_geometry, tight_donor, width, height)
-            open_allowed, open_score, _ = mouth_masks.compare_face_geometry(target_geometry, open_donor, width, height)
+            aligned_allowed, aligned_score, _ = mouth_masks.compare_face_geometry(target_geometry, aligned_donor, width, height)
             self.assertTrue(tight_allowed)
-            self.assertTrue(open_allowed)
-            self.assertLess(tight_donor["inner_mouth_fraction"], open_donor["inner_mouth_fraction"])
-            self.assertLessEqual(open_donor["inner_mouth_fraction"], mouth_masks.MAX_INNER_MOUTH_FRACTION)
-            self.assertAlmostEqual(tight_score, open_score, places=6)
+            self.assertTrue(aligned_allowed)
+            self.assertLess(tight_donor["inner_mouth_fraction"], aligned_donor["inner_mouth_fraction"])
+            self.assertLessEqual(aligned_donor["inner_mouth_fraction"], mouth_masks.MAX_INNER_MOUTH_FRACTION)
+            self.assertLess(aligned_score, tight_score)
             request_path = root / "request.json"
             request_path.write_text(json.dumps({
                 "fps": 25,
@@ -386,7 +471,7 @@ class VerticalAdsTests(unittest.TestCase):
             mask_dir, donor_dir = root / "masks", root / "donors"
             report_path = root / "report.json"
             with mock.patch.object(
-                mouth_masks, "_raw_label_map", side_effect=[tight_labels, more_open_labels, target_labels, np.zeros_like(tight_labels)],
+                mouth_masks, "_raw_label_map", side_effect=[tight_labels, aligned_labels, target_labels, np.zeros_like(tight_labels)],
             ):
                 report = mouth_masks.run_extraction(
                     rendered_video, reference_video, mask_dir, donor_dir, report_path, request_path,
@@ -398,8 +483,8 @@ class VerticalAdsTests(unittest.TestCase):
             self.assertEqual(report["corrected_output_frame_indices"], [1])
             self.assertEqual(report["uncorrected_output_pause_frame_indices"], [2])
             self.assertEqual(report["uncovered_output_pause_frame_count"], 1)
-            self.assertEqual(report["selected_donor_by_output_frame"], {"1": 0})
-            self.assertEqual(report["selected_donor_frame_counts"], {"0": 1})
+            self.assertEqual(report["selected_donor_by_output_frame"], {"1": 1})
+            self.assertEqual(report["selected_donor_frame_counts"], {"1": 1})
             self.assertIn("patch preparation only", report["diagnostic_scope"])
             prepared, skipped = report["frame_diagnostics"]
             self.assertEqual(prepared["output_frame_index"], 1)
@@ -413,12 +498,18 @@ class VerticalAdsTests(unittest.TestCase):
             self.assertIsNotNone(prepared["target_geometry"]["mouth_bbox"])
             self.assertGreater(prepared["mask_pixel_count"], 0)
             self.assertEqual(prepared["alpha_written_pixel_count"], prepared["mask_pixel_count"])
-            self.assertEqual(prepared["selected_donor_frame_index"], 0)
+            self.assertEqual(prepared["selected_donor_frame_index"], 1,
+                             "after both donors pass the closed-mouth gate, geometry fit outranks extra closure")
             donor_metric = prepared["selected_donor_closed_mouth_metric"]
             self.assertEqual(donor_metric["name"], "inner_mouth_fraction")
             self.assertTrue(donor_metric["passed"])
             self.assertLessEqual(donor_metric["value"], donor_metric["maximum_closed_threshold"])
-            self.assertEqual(prepared["selected_donor_geometry_score"], round(tight_score, 6))
+            self.assertEqual(prepared["selected_donor_geometry_score"], round(aligned_score, 6))
+            self.assertEqual(prepared["selected_donor_geometry_deltas"]["normalized_face_center_delta"], [0.0, 0.0])
+            self.assertIsNotNone(prepared["selected_donor_geometry"]["mouth_bbox"])
+            self.assertEqual(prepared["lip_color_adjustment"]["status"], "applied")
+            self.assertEqual(set(prepared["lip_color_adjustment"]["sample_pixel_counts_by_label"]), {"12", "13"})
+            self.assertEqual(set(prepared["lip_color_adjustment"]["class_adjustments"]), {"12", "13"})
             self.assertEqual(skipped["output_frame_index"], 2)
             self.assertEqual(skipped["exact_source_frame_index"], 2)
             self.assertEqual(skipped["timestamp_seconds"], 0.08)

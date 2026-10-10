@@ -28,7 +28,11 @@ except ImportError:  # Allows non-MuseTalk workflows and syntax tests to import 
 MOUTH_LABELS = (11, 12, 13)
 INNER_MOUTH_LABEL = 11
 MUSE_TALK_PARSE_SIZE = (512, 512)
-MAX_INNER_MOUTH_FRACTION = 0.30
+MAX_INNER_MOUTH_FRACTION = 0.18
+MIN_COLOR_MATCH_LIP_PIXELS = 8
+MIN_COLOR_MATCH_PIXELS_PER_LIP_CLASS = 4
+MAX_LIP_LUMINANCE_SHIFT = 12.0
+MAX_LIP_CHROMA_SHIFT = 18.0
 
 
 def _require_image_dependencies() -> None:
@@ -130,10 +134,9 @@ def is_closed_donor(descriptor: Mapping[str, Any]) -> bool:
     return float(descriptor.get("inner_mouth_fraction", 1.0)) <= MAX_INNER_MOUTH_FRACTION
 
 
-def compare_face_geometry(
+def _face_mouth_geometry_deltas(
     target: Mapping[str, Any], donor: Mapping[str, Any], width: int, height: int,
-) -> Tuple[bool, float, str]:
-    """Conservative normalized face-box/mouth-shape proxy for donor alignment."""
+) -> Dict[str, List[float] | float]:
     tf = target["face_bbox"]
     df = donor["face_bbox"]
     tm = target["mouth_center_relative_to_face"]
@@ -148,11 +151,30 @@ def compare_face_geometry(
     target_mouth_width = float(target["mouth_size_relative_to_face"][0])
     donor_mouth_width = float(donor["mouth_size_relative_to_face"][0])
     mouth_width_delta = abs(target_mouth_width - donor_mouth_width)
-    if center_delta[0] > 0.045 or center_delta[1] > 0.045:
+    return {
+        "normalized_face_center_delta": [center_delta[0], center_delta[1]],
+        "face_scale_delta": [scale_delta[0], scale_delta[1]],
+        "relative_mouth_center_delta": [mouth_delta[0], mouth_delta[1]],
+        "relative_mouth_width_delta": mouth_width_delta,
+    }
+
+
+def compare_face_geometry(
+    target: Mapping[str, Any], donor: Mapping[str, Any], width: int, height: int,
+) -> Tuple[bool, float, str]:
+    """Conservative normalized face-box/mouth-shape proxy for donor alignment."""
+    deltas = _face_mouth_geometry_deltas(target, donor, width, height)
+    center_delta = deltas["normalized_face_center_delta"]
+    scale_delta = deltas["face_scale_delta"]
+    mouth_delta = deltas["relative_mouth_center_delta"]
+    mouth_width_delta = deltas["relative_mouth_width_delta"]
+    # Mouth patches are small: the old face-box gates allowed several pixels
+    # of displacement at the mouth, which leaves a visible lip/skin outline.
+    if center_delta[0] > 0.025 or center_delta[1] > 0.025:
         return False, float("inf"), "face_center_mismatch"
-    if scale_delta[0] > 0.12 or scale_delta[1] > 0.12:
+    if scale_delta[0] > 0.07 or scale_delta[1] > 0.07:
         return False, float("inf"), "face_scale_mismatch"
-    if mouth_delta[0] > 0.07 or mouth_delta[1] > 0.10 or mouth_width_delta > 0.18:
+    if mouth_delta[0] > 0.025 or mouth_delta[1] > 0.04 or mouth_width_delta > 0.08:
         return False, float("inf"), "mouth_pose_proxy_mismatch"
     score = (
         center_delta[0] + center_delta[1]
@@ -218,14 +240,107 @@ def _geometry_report(descriptor: Optional[Mapping[str, Any]]) -> Optional[Dict[s
 
 def _warp_donor_to_target(
     donor_frame: np.ndarray, donor_bbox: Sequence[int], target_bbox: Sequence[int],
+    donor_anchor_bbox: Optional[Sequence[int]] = None,
+    target_anchor_bbox: Optional[Sequence[int]] = None,
+    interpolation: Optional[int] = None,
 ) -> np.ndarray:
     _require_image_dependencies()
     dh, dw = donor_frame.shape[:2]
     tx0, ty0, tx1, ty1 = [float(value) for value in target_bbox]
     dx0, dy0, dx1, dy1 = [float(value) for value in donor_bbox]
     sx, sy = (tx1 - tx0) / (dx1 - dx0), (ty1 - ty0) / (dy1 - dy0)
-    matrix = np.asarray([[sx, 0.0, tx0 - sx * dx0], [0.0, sy, ty0 - sy * dy0]], dtype=np.float32)
-    return cv2.warpAffine(donor_frame, matrix, (dw, dh), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    offset_x, offset_y = tx0 - sx * dx0, ty0 - sy * dy0
+    if donor_anchor_bbox is not None and target_anchor_bbox is not None:
+        dmx0, dmy0, dmx1, dmy1 = [float(value) for value in donor_anchor_bbox]
+        tmx0, tmy0, tmx1, tmy1 = [float(value) for value in target_anchor_bbox]
+        donor_center = ((dmx0 + dmx1) * 0.5, (dmy0 + dmy1) * 0.5)
+        target_center = ((tmx0 + tmx1) * 0.5, (tmy0 + tmy1) * 0.5)
+        # Preserve face-derived scale but anchor the transform on the lips;
+        # this avoids carrying the face-box translation error into the patch.
+        offset_x = target_center[0] - sx * donor_center[0]
+        offset_y = target_center[1] - sy * donor_center[1]
+    matrix = np.asarray([[sx, 0.0, offset_x], [0.0, sy, offset_y]], dtype=np.float32)
+    flags = cv2.INTER_LINEAR if interpolation is None else interpolation
+    return cv2.warpAffine(donor_frame, matrix, (dw, dh), flags=flags, borderMode=cv2.BORDER_REPLICATE)
+
+
+def _match_donor_lip_color(
+    donor_bgr: np.ndarray,
+    target_bgr: np.ndarray,
+    alpha: np.ndarray,
+    target_labels: np.ndarray,
+    donor_labels: np.ndarray,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Match bounded donor lip color to the target's visible lip pixels.
+
+    Upper/lower lip classes are matched independently in Lab. Inner-mouth
+    pixels are deliberately preserved; bounded shifts avoid blurring or
+    recoloring pixels outside the semantic lip patch.
+    """
+    _require_image_dependencies()
+    if (donor_bgr.shape != target_bgr.shape or donor_bgr.ndim != 3
+            or donor_bgr.shape[2] != 3 or alpha.shape != target_labels.shape
+            or target_labels.shape != donor_labels.shape):
+        return donor_bgr, {"status": "skipped", "reason": "color_match_shape_mismatch", "sample_pixel_count": 0}
+
+    alpha_mask = alpha > 0
+    lip_samples = {
+        label: (target_labels == label) & (donor_labels == label) & alpha_mask
+        for label in (12, 13)
+    }
+    sample_counts = {str(label): int(np.count_nonzero(mask)) for label, mask in lip_samples.items()}
+    sample_count = sum(sample_counts.values())
+    if sample_count < MIN_COLOR_MATCH_LIP_PIXELS:
+        return donor_bgr, {
+            "status": "skipped", "reason": "insufficient_corresponding_lip_pixels",
+            "sample_pixel_count": sample_count, "sample_pixel_counts_by_label": sample_counts,
+        }
+
+    target_lab = cv2.cvtColor(target_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    donor_lab = cv2.cvtColor(donor_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    adjusted_lab = donor_lab.copy()
+    lip_adjustments: Dict[str, Dict[str, Any]] = {}
+    donor_lips = np.isin(donor_labels, (12, 13)) & alpha_mask
+    for label, sample_mask in lip_samples.items():
+        count = sample_counts[str(label)]
+        if count < MIN_COLOR_MATCH_PIXELS_PER_LIP_CLASS:
+            return donor_bgr, {
+                "status": "skipped", "reason": "insufficient_corresponding_lip_class_pixels",
+                "sample_pixel_count": sample_count, "sample_pixel_counts_by_label": sample_counts,
+            }
+        target_median = np.median(target_lab[sample_mask], axis=0)
+        donor_median = np.median(donor_lab[sample_mask], axis=0)
+        requested_shift = target_median - donor_median
+        applied_shift = np.asarray([
+            np.clip(requested_shift[0], -MAX_LIP_LUMINANCE_SHIFT, MAX_LIP_LUMINANCE_SHIFT),
+            np.clip(requested_shift[1], -MAX_LIP_CHROMA_SHIFT, MAX_LIP_CHROMA_SHIFT),
+            np.clip(requested_shift[2], -MAX_LIP_CHROMA_SHIFT, MAX_LIP_CHROMA_SHIFT),
+        ])
+        donor_class = (donor_labels == label) & alpha_mask
+        for channel in range(3):
+            adjusted_lab[donor_class, channel] = np.clip(
+                adjusted_lab[donor_class, channel] + applied_shift[channel], 0, 255,
+            )
+        lip_adjustments[str(label)] = {
+            "sample_pixel_count": count,
+            "requested_delta_lab": [round(float(value), 3) for value in requested_shift],
+            "applied_delta_lab": [round(float(value), 3) for value in applied_shift],
+        }
+    converted_bgr = cv2.cvtColor(np.rint(adjusted_lab).astype(np.uint8), cv2.COLOR_LAB2BGR)
+    adjusted_bgr = donor_bgr.copy()
+    adjusted_bgr[donor_lips] = converted_bgr[donor_lips]
+    return adjusted_bgr, {
+        "status": "applied",
+        "method": "bounded_per_class_median_Lab_color_match",
+        "sample_pixel_count": sample_count,
+        "sample_pixel_counts_by_label": sample_counts,
+        "class_adjustments": lip_adjustments,
+        "maximum_absolute_shift_lab": [
+            MAX_LIP_LUMINANCE_SHIFT, MAX_LIP_CHROMA_SHIFT, MAX_LIP_CHROMA_SHIFT,
+        ],
+        "luminance_adjusted": True,
+        "inner_mouth_adjusted": False,
+    }
 
 
 def run_extraction(
@@ -258,7 +373,7 @@ def run_extraction(
     reference_capture = cv2.VideoCapture(str(reference_video))
     if not rendered_capture.isOpened() or not reference_capture.isOpened():
         raise RuntimeError("Could not open rendered or quiet-source video for mask extraction.")
-    donor_cache: Dict[int, Tuple[np.ndarray, Dict[str, Any]]] = {}
+    donor_cache: Dict[int, Tuple[np.ndarray, Dict[str, Any], Dict[str, Any]]] = {}
     reasons: Counter[str] = Counter()
     selected_donors: Counter[int] = Counter()
     mask_areas: List[int] = []
@@ -279,8 +394,11 @@ def run_extraction(
             "alpha_written_pixel_count": 0,
             "donor_alignment_rejection_reasons": {},
             "selected_donor_frame_index": None,
+            "selected_donor_geometry": None,
+            "selected_donor_geometry_deltas": None,
             "selected_donor_closed_mouth_metric": None,
             "selected_donor_geometry_score": None,
+            "lip_color_adjustment": None,
         }
         for output_index, item in requests.items()
     }
@@ -308,7 +426,7 @@ def run_extraction(
             if not is_closed_donor(descriptor):
                 reasons["quiet_donor_mouth_not_closed"] += 1
                 continue
-            donor_cache[donor_index] = (donor_frame, descriptor)
+            donor_cache[donor_index] = (donor_frame, descriptor, labels)
 
         for output_index in range(output_frame_count):
             mask = zero_mask
@@ -330,9 +448,9 @@ def run_extraction(
                     else:
                         diagnostic["target_geometry"] = _geometry_report(target_descriptor)
                         diagnostic["mask_pixel_count"] = int(np.count_nonzero(target_mask))
-                        best: Optional[Tuple[float, float, int, np.ndarray, Dict[str, Any]]] = None
+                        best: Optional[Tuple[float, float, int, np.ndarray, Dict[str, Any], np.ndarray]] = None
                         alignment_rejections: Counter[str] = Counter()
-                        for donor_index, (donor_frame, donor_descriptor) in donor_cache.items():
+                        for donor_index, (donor_frame, donor_descriptor, donor_labels) in donor_cache.items():
                             allowed, score, rejection_reason = compare_face_geometry(
                                 target_descriptor, donor_descriptor, width, height,
                             )
@@ -340,7 +458,10 @@ def run_extraction(
                                 alignment_rejections[rejection_reason] += 1
                                 continue
                             inner_fraction = float(donor_descriptor.get("inner_mouth_fraction", 1.0))
-                            candidate = (inner_fraction, score, donor_index, donor_frame, donor_descriptor)
+                            # Eligibility already enforces a closed-mouth gate;
+                            # rank geometrically aligned candidates first so a
+                            # very closed but visibly shifted donor cannot win.
+                            candidate = (score, inner_fraction, donor_index, donor_frame, donor_descriptor, donor_labels)
                             if best is None or candidate[:3] < best[:3]:
                                 best = candidate
                         if best is None:
@@ -351,9 +472,17 @@ def run_extraction(
                             )
                             diagnostic["donor_alignment_rejection_reasons"] = dict(sorted(alignment_rejections.items()))
                         else:
-                            _, geometry_score, donor_index, donor_frame, donor_descriptor = best
+                            geometry_score, _, donor_index, donor_frame, donor_descriptor, donor_labels = best
                             diagnostic["selected_donor_frame_index"] = donor_index
                             diagnostic["selected_donor_geometry_score"] = round(geometry_score, 6)
+                            diagnostic["selected_donor_geometry"] = _geometry_report(donor_descriptor)
+                            diagnostic["selected_donor_geometry_deltas"] = {
+                                key: ([round(float(value), 6) for value in values]
+                                      if isinstance(values, list) else round(float(values), 6))
+                                for key, values in _face_mouth_geometry_deltas(
+                                    target_descriptor, donor_descriptor, width, height,
+                                ).items()
+                            }
                             donor_inner_fraction = float(donor_descriptor.get("inner_mouth_fraction", 1.0))
                             diagnostic["selected_donor_closed_mouth_metric"] = {
                                 "name": "inner_mouth_fraction",
@@ -361,36 +490,51 @@ def run_extraction(
                                 "maximum_closed_threshold": MAX_INNER_MOUTH_FRACTION,
                                 "passed": is_closed_donor(donor_descriptor),
                             }
-                            aligned_donor = _warp_donor_to_target(
-                                donor_frame, donor_descriptor["face_bbox"], target_descriptor["face_bbox"],
+                            donor_mouth_bbox = donor_descriptor["mouth_bbox"]
+                            target_mouth_bbox = target_descriptor["mouth_bbox"]
+                            alignment_args = (
+                                donor_descriptor["face_bbox"], target_descriptor["face_bbox"],
+                                donor_mouth_bbox, target_mouth_bbox,
                             )
-                            # Composite donor pixels only through a parser-derived
-                            # alpha mask around the target's current lip classes.
-                            # maskedmerge consumes an all-zero frame for every
-                            # non-corrected timestamp, leaving those frames untouched.
-                            mask = target_mask
-                            target_frame_path = mask_directory / ("{:08d}.png".format(output_index))
-                            if not cv2.imwrite(str(target_frame_path), mask):
-                                raise RuntimeError("Could not write semantic lip alpha for output frame {}.".format(output_index))
-                            # Use an output-timed donor sequence because the best
-                            # closed source frame can differ at each pause timestamp.
-                            donor_path = donor_directory / ("{:08d}.png".format(output_index))
-                            if not cv2.imwrite(str(donor_path), aligned_donor):
-                                reasons["donor_patch_write_failed"] += 1
-                                mask = zero_mask
-                                diagnostic["skip_reason"] = "donor_patch_write_failed"
-                                if not cv2.imwrite(str(target_frame_path), zero_mask):
-                                    raise RuntimeError("Could not write zero lip alpha after donor failure.")
+                            aligned_donor = _warp_donor_to_target(donor_frame, *alignment_args)
+                            aligned_donor_labels = _warp_donor_to_target(
+                                donor_labels, *alignment_args, interpolation=cv2.INTER_NEAREST,
+                            )
+                            aligned_donor, color_adjustment = _match_donor_lip_color(
+                                aligned_donor, target_frame, target_mask, labels, aligned_donor_labels,
+                            )
+                            diagnostic["lip_color_adjustment"] = color_adjustment
+                            if color_adjustment["status"] != "applied":
+                                reasons["donor_target_lip_color_unverified"] += 1
+                                diagnostic["skip_reason"] = "donor_target_lip_color_unverified"
                             else:
-                                corrected_frames += 1
-                                corrected_indices.append(output_index)
-                                selected_donors[donor_index] += 1
-                                selected_donor_by_output_frame[str(output_index)] = donor_index
-                                mask_areas.append(int(np.count_nonzero(mask)))
-                                diagnostic["patch_prepared"] = True
-                                diagnostic["status"] = "patch_prepared"
-                                diagnostic["skip_reason"] = None
-                                diagnostic["alpha_written_pixel_count"] = int(np.count_nonzero(mask))
+                                # Composite donor pixels only through a parser-derived
+                                # alpha mask around the target's current lip classes.
+                                # maskedmerge consumes an all-zero frame for every
+                                # non-corrected timestamp, leaving those frames untouched.
+                                mask = target_mask
+                                target_frame_path = mask_directory / ("{:08d}.png".format(output_index))
+                                if not cv2.imwrite(str(target_frame_path), mask):
+                                    raise RuntimeError("Could not write semantic lip alpha for output frame {}.".format(output_index))
+                                # Use an output-timed donor sequence because the best
+                                # closed source frame can differ at each pause timestamp.
+                                donor_path = donor_directory / ("{:08d}.png".format(output_index))
+                                if not cv2.imwrite(str(donor_path), aligned_donor):
+                                    reasons["donor_patch_write_failed"] += 1
+                                    mask = zero_mask
+                                    diagnostic["skip_reason"] = "donor_patch_write_failed"
+                                    if not cv2.imwrite(str(target_frame_path), zero_mask):
+                                        raise RuntimeError("Could not write zero lip alpha after donor failure.")
+                                else:
+                                    corrected_frames += 1
+                                    corrected_indices.append(output_index)
+                                    selected_donors[donor_index] += 1
+                                    selected_donor_by_output_frame[str(output_index)] = donor_index
+                                    mask_areas.append(int(np.count_nonzero(mask)))
+                                    diagnostic["patch_prepared"] = True
+                                    diagnostic["status"] = "patch_prepared"
+                                    diagnostic["skip_reason"] = None
+                                    diagnostic["alpha_written_pixel_count"] = int(np.count_nonzero(mask))
             if output_index not in requests or not np.any(mask):
                 mask = zero_mask
                 path = mask_directory / ("{:08d}.png".format(output_index))
@@ -415,9 +559,17 @@ def run_extraction(
         "coverage_status": coverage_status,
         "parser": "MuseTalk FaceParsing.net raw argmax; labels 11, 12, 13; no extra model",
         "mask_region": "semantic lip classes, 3x3 dilation, 5x5 Gaussian feather sigma=0.9 at native resolution",
-        "mask_alignment": "normalized face-box scale/translation plus mouth-center/width proxy; rejected above conservative thresholds",
+        "mask_alignment": "face-box scale with mouth-center anchored translation; conservative face/mouth proxy gates reject visibly displaced candidates",
         "donor_validation": "source frame lies fully within verified quiet-source interval and inner-mouth label 11 is <= {:.2f} of parsed lip mask".format(MAX_INNER_MOUTH_FRACTION),
-        "donor_selection_policy": "Keep the existing closed-mouth and face-geometry gates; rank geometry-valid quiet donors by lowest inner_mouth_fraction, then lowest normalized face-geometry score.",
+        "donor_selection_policy": "Require a quiet donor with inner_mouth_fraction <= {:.2f}; rank eligible donors by lowest face/mouth geometry score, then lowest inner_mouth_fraction.".format(MAX_INNER_MOUTH_FRACTION),
+        "face_mouth_alignment_gate": {
+            "maximum_normalized_face_center_delta": 0.025,
+            "maximum_face_scale_delta": 0.07,
+            "maximum_relative_mouth_center_delta": [0.025, 0.04],
+            "maximum_relative_mouth_width_delta": 0.08,
+            "transform_anchor": "mouth_bbox_center_with_face_bbox_scale",
+        },
+        "lip_color_policy": "Bounded per-class median Lab L/a/b match from overlapping parsed upper/lower lip pixels; inner-mouth label 11 is untouched; skip if fewer than {} total or {} per-class matching samples.".format(MIN_COLOR_MATCH_LIP_PIXELS, MIN_COLOR_MATCH_PIXELS_PER_LIP_CLASS),
         "diagnostic_scope": "Per-frame records describe parser/donor patch preparation only; they do not visually validate that the output mouth appears closed or natural.",
         "frame_time_basis": "timestamp_seconds is the output video frame start: output_frame_index / FPS; frame_interval_seconds gives its full 1/FPS interval.",
         "frame_diagnostics": [frame_diagnostics[index] for index in sorted(frame_diagnostics)],
