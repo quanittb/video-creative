@@ -4,6 +4,24 @@ Bộ này giữ EchoMimic V3 Flash + MuseTalk v1.5 đã chạy được. Khung c
 
 TikTok khuyến nghị video dọc 9:16, ít nhất 540×960: [thông số chính thức](https://ads.tiktok.com/resources/help/article/tiktok-auction-in-feed-ads?lang=en-GB-8). Khổ xuất đáp ứng kích thước đó; bộ này chưa thêm phụ đề, sản phẩm, CTA hoặc đăng quảng cáo.
 
+## Đánh giá chất lượng và tiêu chí phát hành
+
+Mỗi output có `quality_assessment/<tên-video>.json`; riêng bước đo khẩu độ miệng sau khi ghép có artifact `quality_assessment/<tên-intermediate>_pause_mouth_qc.json`. `vertical_ad_report.json` cũng nhúng cùng trạng thái đánh giá. Các kiểm tra ffprobe/audio/frame và phép đo khẩu độ môi là **kiểm tra khách quan có phạm vi hẹp**. Kể cả khi chúng đều đạt, trường `certification_status` vẫn là `not_certified`: pipeline hiện không chấm độ khớp phoneme, độ tự nhiên/chuyển động liền mạch, độ giống video tham khảo hay khả năng tổng quát hóa.
+
+Khi chạy render với `--pause-correction-region mouth-only`, controller kiểm tra import và khởi tạo detector 68 điểm trong đúng Python của MuseTalk **trước khi bắt đầu sinh Echo/MuseTalk** (`dry-run` chỉ kiểm tra cấu hình). Nếu detector không sẵn sàng, job dừng sớm và ghi `logs\mouth_qc_detector_preflight.log`; không chờ đến sau một lượt render dài mới phát hiện thiếu dependency. Chế độ `full-frame`, `pause-mouth-closure off` và workflow khác giữ nguyên hành vi.
+
+Để phát hành cho nhiều nhân vật/ngôn ngữ, duyệt tối thiểu ma trận coverage riêng cho từng tập sản phẩm mục tiêu; không suy rộng kết quả từ một video hoặc một người:
+
+| Chiều kiểm tra | Bộ mẫu phải có | Điều kiện duyệt |
+| --- | --- | --- |
+| Nhân vật/diện mạo | Mỗi danh tính được hỗ trợ, gồm khác biệt về tông da, hình dạng mặt, râu/tóc và phụ kiện nếu có | Miệng không méo/nhòe; identity giữ ổn định trong toàn clip |
+| Ngôn ngữ/phát âm | Người nói bản ngữ cho từng ngôn ngữ quảng bá; mẫu âm vị, phụ âm môi, tốc độ và giọng khác nhau | Xem-nghe đồng bộ trên toàn câu, không chỉ trên nguyên âm hoặc một câu mẫu |
+| Tư thế/chuyển động | Chính diện, góc quay dự kiến dùng, cử động đầu/vai, vùng miệng bị che nếu nằm trong phạm vi hỗ trợ | Không nhòe/nhảy ở môi; frame chuyển tiếp và chu kỳ lặp không giật hoặc đứng hình |
+| Âm thanh/ngắt nghỉ | Mỗi voice/accent được hỗ trợ; câu nói, plosive, khoảng nghỉ ngắn/dài và nền âm thực tế | Miệng theo tiếng nói; đóng trong khoảng nghỉ; tiếng không bị lệch hoặc cắt |
+| So với video tham khảo | Cùng ảnh/audio/khung hình test, chấm độc lập ở tốc độ bình thường và từng frame rủi ro | Người duyệt chấp nhận chuyển động, chi tiết mặt, màu và độ liền mạch; ghi lại lỗi theo từng mẫu |
+
+Release chỉ được tuyên bố cho những tổ hợp nhân vật × ngôn ngữ × tư thế/âm thanh đã chạy và được duyệt. MuseTalk upstream mô tả hỗ trợ các ngôn ngữ ví dụ như Trung, Anh, Nhật nhưng cũng công khai giới hạn jitter do sinh từng frame và khả năng giữ chi tiết nhận dạng môi; vì vậy không thể coi một lần chạy đạt hình dạng môi lúc im lặng là chứng nhận tự nhiên hoặc hỗ trợ mọi ngôn ngữ. Xem [tài liệu MuseTalk chính thức](https://github.com/TMElyralab/MuseTalk#limitations).
+
 ## Cập nhật core trên Windows
 
 Đóng pipeline đang chạy rồi cập nhật source dự án có phiên bản mới của `scripts\test_vertical_ads.py`. Không cần cài lại venv, tải model hay xóa cache MuseTalk/Echo. Các thay đổi chỉ nằm trong controller/exporter của dự án; không sửa repo MuseTalk/WanGP hoặc checkpoint.

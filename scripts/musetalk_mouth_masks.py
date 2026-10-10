@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from collections import Counter
@@ -19,9 +20,12 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 try:
     import cv2
-    import numpy as np
 except ImportError:  # Allows non-MuseTalk workflows and syntax tests to import this module.
     cv2 = None
+
+try:
+    import numpy as np
+except ImportError:  # Geometry-only offline checks do not need NumPy.
     np = None
 
 
@@ -29,6 +33,8 @@ MOUTH_LABELS = (11, 12, 13)
 INNER_MOUTH_LABEL = 11
 MUSE_TALK_PARSE_SIZE = (512, 512)
 MAX_INNER_MOUTH_FRACTION = 0.18
+MAX_MOUTH_APERTURE_RATIO = 0.025
+MIN_MOUTH_WIDTH_PIXELS = 12.0
 MIN_COLOR_MATCH_LIP_PIXELS = 8
 MIN_COLOR_MATCH_PIXELS_PER_LIP_CLASS = 4
 MAX_LIP_LUMINANCE_SHIFT = 12.0
@@ -130,8 +136,131 @@ def describe_face_and_mouth(labels: np.ndarray) -> Tuple[Optional[Dict[str, Any]
 
 
 def is_closed_donor(descriptor: Mapping[str, Any]) -> bool:
-    """Reject source-silent frames whose parsed mouth still looks open."""
-    return float(descriptor.get("inner_mouth_fraction", 1.0)) <= MAX_INNER_MOUTH_FRACTION
+    """Require both semantic parsing and measured lip landmarks to indicate closure."""
+    try:
+        aperture_ratio = float(descriptor["mouth_aperture_ratio"])
+        parser_fraction = float(descriptor["inner_mouth_fraction"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (
+        descriptor.get("mouth_aperture_status") == "measured"
+        and parser_fraction <= MAX_INNER_MOUTH_FRACTION
+        and math.isfinite(aperture_ratio)
+        and aperture_ratio <= MAX_MOUTH_APERTURE_RATIO
+    )
+
+
+def measure_mouth_aperture(
+    landmarks: Any,
+    image_shape: Optional[Sequence[int]] = None,
+    min_mouth_width_pixels: float = MIN_MOUTH_WIDTH_PIXELS,
+) -> Tuple[Optional[float], str, Optional[float]]:
+    """Measure inner-lip opening normalized by mouth width from 68-point landmarks.
+
+    This pure geometry helper deliberately accepts NumPy-like input without importing
+    the face detector or Torch. Missing, malformed, or low-resolution landmarks fail
+    closed so parser labels alone cannot certify a donor as neutral.
+    """
+    try:
+        points = [[float(value) for value in point] for point in landmarks]
+    except (TypeError, ValueError):
+        return None, "invalid_landmarks", None
+    if len(points) != 68 or any(len(point) != 2 for point in points):
+        return None, "invalid_landmark_shape", None
+    if not all(math.isfinite(value) for point in points for value in point):
+        return None, "non_finite_landmarks", None
+    if image_shape is not None:
+        if len(image_shape) < 2:
+            return None, "invalid_image_shape", None
+        image_height, image_width = int(image_shape[0]), int(image_shape[1])
+        if image_height < 1 or image_width < 1:
+            return None, "invalid_image_shape", None
+        mouth_points = points[48:68]
+        if (
+            any(point[0] < 0 or point[0] >= image_width for point in mouth_points)
+            or any(point[1] < 0 or point[1] >= image_height for point in mouth_points)
+        ):
+            return None, "mouth_landmarks_out_of_frame", None
+
+    left_corner, right_corner = points[48], points[54]
+    mouth_axis = [right_corner[0] - left_corner[0], right_corner[1] - left_corner[1]]
+    mouth_width = math.hypot(mouth_axis[0], mouth_axis[1])
+    if not math.isfinite(mouth_width) or mouth_width < float(min_mouth_width_pixels):
+        return None, "mouth_width_too_small", mouth_width if math.isfinite(mouth_width) else None
+    axis = [mouth_axis[0] / mouth_width, mouth_axis[1] / mouth_width]
+    normal = [-axis[1], axis[0]]
+    if abs(normal[1]) < 0.25:
+        return None, "mouth_orientation_uncertain", mouth_width
+    # Orient the normal toward the lower lip in image coordinates, including rolled heads.
+    if normal[1] < 0:
+        normal = [-normal[0], -normal[1]]
+    upper_lower_pairs = ((61, 67), (62, 66), (63, 65))
+    gaps = [((points[lower][0] - points[upper][0]) * normal[0]
+             + (points[lower][1] - points[upper][1]) * normal[1])
+            for upper, lower in upper_lower_pairs]
+    if not all(math.isfinite(gap) for gap in gaps):
+        return None, "invalid_lip_geometry", mouth_width
+    if max(gaps) <= 0.0:
+        return None, "non_positive_inner_lip_aperture", mouth_width
+    aperture_ratio = max(0.0, max(gaps)) / mouth_width
+    return float(aperture_ratio), "measured", mouth_width
+
+
+def detect_mouth_aperture(detector: Any, image_bgr: np.ndarray) -> Tuple[Optional[float], str, Optional[float]]:
+    """Run an injected face-alignment detector and measure its largest face."""
+    _require_image_dependencies()
+    if detector is None:
+        return None, "landmark_detector_unavailable", None
+    if image_bgr is None or image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
+        return None, "invalid_image", None
+    try:
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        predictions = detector.get_landmarks(image_rgb)
+    except Exception as error:
+        return None, "landmark_detector_error:" + type(error).__name__, None
+    if predictions is None:
+        return None, "face_landmarks_not_detected", None
+    valid: List[Tuple[float, Sequence[Sequence[float]]]] = []
+    for prediction in predictions:
+        try:
+            points = [[float(value) for value in point] for point in prediction]
+        except (TypeError, ValueError):
+            continue
+        if len(points) != 68 or any(len(point) != 2 for point in points):
+            continue
+        if not all(math.isfinite(value) for point in points for value in point):
+            continue
+        jaw = points[:17]
+        area = float(
+            (max(point[0] for point in jaw) - min(point[0] for point in jaw))
+            * (max(point[1] for point in jaw) - min(point[1] for point in jaw))
+        )
+        if area > 0:
+            valid.append((area, points))
+    if not valid:
+        return None, "face_landmarks_invalid", None
+    valid.sort(key=lambda item: item[0], reverse=True)
+    aperture, reason, mouth_width = measure_mouth_aperture(valid[0][1], image_bgr.shape[:2])
+    if len(valid) > 1 and valid[1][0] >= valid[0][0] * 0.9:
+        return None, "ambiguous_multiple_faces", mouth_width
+    return aperture, reason, mouth_width
+
+
+def _face_alignment_detector(torch: Any) -> Tuple[Optional[Any], Optional[str]]:
+    """Load the already-declared face-alignment dependency only in the MuseTalk process."""
+    try:
+        import face_alignment
+
+        landmark_types = face_alignment.LandmarksType
+        landmark_type = getattr(landmark_types, "TWO_D", None)
+        if landmark_type is None:
+            landmark_type = getattr(landmark_types, "_2D", None)
+        if landmark_type is None:
+            return None, "face_alignment_2d_landmark_type_unavailable"
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        return face_alignment.FaceAlignment(landmark_type, flip_input=False, device=device), None
+    except Exception as error:
+        return None, "face_alignment_init_error:" + type(error).__name__
 
 
 def _exact_mapped_donor(
@@ -261,6 +390,7 @@ def _geometry_report(descriptor: Optional[Mapping[str, Any]]) -> Optional[Dict[s
     keys = (
         "face_bbox", "face_bbox_normalized", "mouth_bbox", "mouth_center_relative_to_face",
         "mouth_size_relative_to_face", "mouth_area_pixels", "inner_mouth_fraction",
+        "mouth_aperture_ratio", "mouth_aperture_status", "mouth_width_pixels_landmarked",
     )
     return {key: descriptor[key] for key in keys if key in descriptor}
 
@@ -379,6 +509,8 @@ def run_extraction(
     request_path: Path,
     parser: Any,
     torch: Any,
+    landmark_detector: Any = None,
+    landmark_detector_error: Optional[str] = None,
 ) -> Dict[str, Any]:
     _require_image_dependencies()
     request = json.loads(request_path.read_text(encoding="utf-8"))
@@ -471,6 +603,7 @@ def run_extraction(
             "selected_donor_geometry": None,
             "selected_donor_geometry_deltas": None,
             "selected_donor_closed_mouth_metric": None,
+            "selected_donor_mouth_aperture_metric": None,
             "selected_donor_geometry_score": None,
             "lip_color_adjustment": None,
         }
@@ -509,10 +642,24 @@ def run_extraction(
                     "closed_mouth_metric": None,
                 }
                 continue
+            aperture, aperture_reason, mouth_width = detect_mouth_aperture(landmark_detector, donor_frame)
+            descriptor["mouth_aperture_ratio"] = aperture
+            descriptor["mouth_aperture_status"] = "measured" if aperture is not None else aperture_reason
+            descriptor["mouth_width_pixels_landmarked"] = mouth_width
+            landmark_metric = {
+                "name": "inner_lip_gap_over_mouth_width",
+                "value": round(aperture, 6) if aperture is not None else None,
+                "mouth_width_pixels": round(mouth_width, 3) if mouth_width is not None else None,
+                "maximum_closed_threshold": MAX_MOUTH_APERTURE_RATIO,
+                "status": "measured" if aperture is not None else aperture_reason,
+                "passed": aperture is not None and aperture <= MAX_MOUTH_APERTURE_RATIO,
+            }
             closed_metric = {
                 "name": "inner_mouth_fraction",
                 "value": round(float(descriptor.get("inner_mouth_fraction", 1.0)), 6),
                 "maximum_closed_threshold": MAX_INNER_MOUTH_FRACTION,
+                "parser_passed": float(descriptor.get("inner_mouth_fraction", 1.0)) <= MAX_INNER_MOUTH_FRACTION,
+                "landmark_mouth_aperture": landmark_metric,
                 "passed": is_closed_donor(descriptor),
             }
             if not is_closed_donor(descriptor):
@@ -612,8 +759,18 @@ def run_extraction(
                                 "name": "inner_mouth_fraction",
                                 "value": round(donor_inner_fraction, 6),
                                 "maximum_closed_threshold": MAX_INNER_MOUTH_FRACTION,
+                                "parser_passed": donor_inner_fraction <= MAX_INNER_MOUTH_FRACTION,
+                                "landmark_mouth_aperture": {
+                                    "name": "inner_lip_gap_over_mouth_width",
+                                    "value": round(float(donor_descriptor["mouth_aperture_ratio"]), 6),
+                                    "mouth_width_pixels": round(float(donor_descriptor["mouth_width_pixels_landmarked"]), 3),
+                                    "maximum_closed_threshold": MAX_MOUTH_APERTURE_RATIO,
+                                    "status": "measured",
+                                    "passed": float(donor_descriptor["mouth_aperture_ratio"]) <= MAX_MOUTH_APERTURE_RATIO,
+                                },
                                 "passed": is_closed_donor(donor_descriptor),
                             }
+                            diagnostic["selected_donor_mouth_aperture_metric"] = diagnostic["selected_donor_closed_mouth_metric"]["landmark_mouth_aperture"]
                             donor_mouth_bbox = donor_descriptor["mouth_bbox"]
                             target_mouth_bbox = target_descriptor["mouth_bbox"]
                             alignment_args = (
@@ -682,18 +839,26 @@ def run_extraction(
                    "no_confident_mouth_donor_alignment"),
         "coverage_status": coverage_status,
         "donor_mode": donor_mode,
-        "parser": "MuseTalk FaceParsing.net raw argmax; labels 11, 12, 13; no extra model",
+        "parser": "MuseTalk FaceParsing.net raw argmax; labels 11, 12, 13",
+        "landmark_aperture_gate": {
+            "detector": "face-alignment 68-point landmarks",
+            "detector_status": landmark_detector_error or ("ready" if landmark_detector is not None else "unavailable"),
+            "measurement": "maximum central inner-lip vertical gap projected perpendicular to mouth axis, divided by mouth-corner width",
+            "maximum_closed_threshold": MAX_MOUTH_APERTURE_RATIO,
+            "minimum_mouth_width_pixels": MIN_MOUTH_WIDTH_PIXELS,
+            "unavailable_or_uncertain_policy": "fail closed; a parser-only result cannot certify a closed-mouth donor",
+        },
         "mask_region": "semantic lip classes, 3x3 dilation, 5x5 Gaussian feather sigma=0.9 at native resolution",
         "mask_alignment": "face-box scale with mouth-center anchored translation; conservative face/mouth proxy gates reject visibly displaced candidates",
         "donor_validation": (
-            "only the exact ping-pong-mapped frame from the silence-conditioned MuseTalk pass is eligible; inner-mouth label 11 must be <= {:.2f} of parsed lip mask; no fallback donor is permitted".format(MAX_INNER_MOUTH_FRACTION)
+            "only the exact ping-pong-mapped frame from the silence-conditioned MuseTalk pass is eligible; parser inner-mouth fraction must be <= {:.2f} and landmark aperture must be <= {:.3f}; no fallback donor is permitted".format(MAX_INNER_MOUTH_FRACTION, MAX_MOUTH_APERTURE_RATIO)
             if donor_mode == "silence-conditioned-exact-source" else
-            "source frame lies fully within verified quiet-source interval and inner-mouth label 11 is <= {:.2f} of parsed lip mask".format(MAX_INNER_MOUTH_FRACTION)
+            "source frame lies fully within verified quiet-source interval; parser inner-mouth fraction must be <= {:.2f} and landmark aperture must be <= {:.3f}".format(MAX_INNER_MOUTH_FRACTION, MAX_MOUTH_APERTURE_RATIO)
         ),
         "donor_selection_policy": (
-            "Use only the exact mapped donor frame if inner_mouth_fraction <= {:.2f} and face/mouth geometry gates pass; never fall back to another frame.".format(MAX_INNER_MOUTH_FRACTION)
+            "Use only the exact mapped donor frame if parser fraction <= {:.2f}, landmark aperture <= {:.3f}, and face/mouth geometry gates pass; never fall back to another frame.".format(MAX_INNER_MOUTH_FRACTION, MAX_MOUTH_APERTURE_RATIO)
             if donor_mode == "silence-conditioned-exact-source" else
-            "Require a quiet donor with inner_mouth_fraction <= {:.2f}; rank eligible donors by lowest face/mouth geometry score, then lowest inner_mouth_fraction.".format(MAX_INNER_MOUTH_FRACTION)
+            "Require parser fraction <= {:.2f} and landmark aperture <= {:.3f}; rank eligible donors by lowest face/mouth geometry score, then lowest inner_mouth_fraction.".format(MAX_INNER_MOUTH_FRACTION, MAX_MOUTH_APERTURE_RATIO)
         ),
         "face_mouth_alignment_gate": {
             "maximum_normalized_face_center_delta": 0.025,
@@ -703,7 +868,7 @@ def run_extraction(
             "transform_anchor": "mouth_bbox_center_with_face_bbox_scale",
         },
         "lip_color_policy": "Bounded per-class median Lab L/a/b match from overlapping parsed upper/lower lip pixels; inner-mouth label 11 is untouched; skip if fewer than {} total or {} per-class matching samples.".format(MIN_COLOR_MATCH_LIP_PIXELS, MIN_COLOR_MATCH_PIXELS_PER_LIP_CLASS),
-        "diagnostic_scope": "Per-frame records describe parser/donor patch preparation only; they do not visually validate that the output mouth appears closed or natural.",
+        "diagnostic_scope": "Per-frame records describe parser and measured-landmark donor eligibility/patch preparation; final composited frames require a separate post-FFmpeg aperture validation and passing thresholds do not guarantee universal subjective quality.",
         "frame_time_basis": "timestamp_seconds is the output video frame start: output_frame_index / FPS; frame_interval_seconds gives its full 1/FPS interval.",
         "donor_video_frame_count": donor_frame_count,
         "donor_source_frame_count": donor_source_frame_count,
@@ -741,14 +906,80 @@ def run_extraction(
     return report
 
 
+def validate_output_pause_frames(
+    video_path: Path,
+    frame_indices: Sequence[int],
+    landmark_detector: Any,
+    max_aperture_ratio: float = MAX_MOUTH_APERTURE_RATIO,
+) -> Dict[str, Any]:
+    """Measure the final encoded pause frames; every requested frame must pass."""
+    _require_image_dependencies()
+    indices = sorted(set(int(index) for index in frame_indices))
+    if not indices:
+        return {
+            "status": "not_applicable", "method": "face-alignment 68-point inner-lip aperture",
+            "requested_frame_count": 0, "passed_frame_count": 0, "failed_frame_indices": [],
+            "frame_measurements": [],
+        }
+    if landmark_detector is None:
+        return {
+            "status": "failed", "reason": "landmark_detector_unavailable",
+            "method": "face-alignment 68-point inner-lip aperture",
+            "requested_frame_count": len(indices), "passed_frame_count": 0,
+            "failed_frame_indices": indices, "frame_measurements": [],
+        }
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError("Could not open the final pause-corrected video for mouth-aperture validation.")
+    measurements: List[Dict[str, Any]] = []
+    try:
+        for frame_index in indices:
+            frame = _read_frame(capture, frame_index)
+            if frame is None:
+                measurements.append({
+                    "frame_index": frame_index, "status": "failed", "reason": "frame_unreadable",
+                    "aperture_ratio": None, "mouth_width_pixels": None, "passed": False,
+                })
+                continue
+            aperture, reason, mouth_width = detect_mouth_aperture(landmark_detector, frame)
+            passed = aperture is not None and aperture <= max_aperture_ratio
+            measurements.append({
+                "frame_index": frame_index,
+                "status": "measured" if aperture is not None else "failed",
+                "reason": None if aperture is not None else reason,
+                "aperture_ratio": round(aperture, 6) if aperture is not None else None,
+                "mouth_width_pixels": round(mouth_width, 3) if mouth_width is not None else None,
+                "maximum_closed_threshold": max_aperture_ratio,
+                "passed": passed,
+            })
+    finally:
+        capture.release()
+    failed = [item["frame_index"] for item in measurements if not item["passed"]]
+    return {
+        "status": "passed" if not failed else "failed",
+        "method": "face-alignment 68-point inner-lip aperture normalized by mouth-corner width on final encoded frame",
+        "maximum_closed_threshold": max_aperture_ratio,
+        "requested_frame_count": len(indices),
+        "passed_frame_count": len(indices) - len(failed),
+        "failed_frame_indices": failed,
+        "frame_measurements": measurements,
+        "quality_scope": "A pass means each measured pause frame is under the aperture threshold; it is a geometric QC gate, not a guarantee of subjective naturalness across every character, pose, codec, or language.",
+    }
+
+
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rendered-video", required=True, type=Path)
-    parser.add_argument("--reference-video", required=True, type=Path)
-    parser.add_argument("--mask-directory", required=True, type=Path)
-    parser.add_argument("--donor-directory", required=True, type=Path)
-    parser.add_argument("--report", required=True, type=Path)
-    parser.add_argument("--request", required=True, type=Path)
+    parser.add_argument("--rendered-video", type=Path)
+    parser.add_argument("--reference-video", type=Path)
+    parser.add_argument("--mask-directory", type=Path)
+    parser.add_argument("--donor-directory", type=Path)
+    parser.add_argument("--report", type=Path)
+    parser.add_argument("--request", type=Path)
+    parser.add_argument("--validate-output-video", type=Path)
+    parser.add_argument("--validate-request", type=Path)
+    parser.add_argument("--validation-report", type=Path)
+    parser.add_argument("--check-landmark-detector", action="store_true",
+                        help="Initialize the 68-point detector and exit; use before expensive inference.")
     return parser
 
 
@@ -756,6 +987,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = make_parser().parse_args(argv)
     try:
         import torch
+        landmark_detector, detector_error = _face_alignment_detector(torch)
+        if args.check_landmark_detector:
+            report = {
+                "status": "ready" if landmark_detector is not None and detector_error is None else "failed",
+                "detector": "face-alignment 68-point landmarks",
+                "initialization_error": detector_error,
+                "quality_scope": "Dependency/model initialization only; no image or video quality is certified.",
+            }
+            print(json.dumps(report, ensure_ascii=False))
+            return 0 if report["status"] == "ready" else 2
+        if args.validate_output_video is not None:
+            if args.validate_request is None or args.validation_report is None:
+                raise ValueError("Final-output validation requires --validate-request and --validation-report.")
+            request = json.loads(args.validate_request.read_text(encoding="utf-8"))
+            indices = [int(item["output_frame_index"]) for item in request.get("output_pause_frames", [])]
+            report = validate_output_pause_frames(
+                args.validate_output_video.resolve(), indices, landmark_detector,
+            )
+            if detector_error:
+                report["detector_initialization_error"] = detector_error
+            args.validation_report.parent.mkdir(parents=True, exist_ok=True)
+            args.validation_report.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            print(json.dumps(report, ensure_ascii=False))
+            return 0 if report["status"] in ("passed", "not_applicable") else 2
+        required = (args.rendered_video, args.reference_video, args.mask_directory,
+                    args.donor_directory, args.report, args.request)
+        if any(value is None for value in required):
+            raise ValueError("Extraction mode requires --rendered-video, --reference-video, --mask-directory, --donor-directory, --report, and --request.")
         from musetalk.utils.face_parsing import FaceParsing
 
         parser = FaceParsing()
@@ -763,7 +1022,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.rendered_video.resolve(), args.reference_video.resolve(),
             args.mask_directory.resolve(), args.donor_directory.resolve(),
             args.report.resolve(), args.request.resolve(),
-            parser, torch,
+            parser, torch, landmark_detector, detector_error,
         )
         print(json.dumps(report, ensure_ascii=False))
         return 0

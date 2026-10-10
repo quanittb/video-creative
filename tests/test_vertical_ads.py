@@ -26,6 +26,95 @@ FFPROBE = shutil.which("ffprobe")
 
 
 class VerticalAdsTests(unittest.TestCase):
+    @staticmethod
+    def _mouth_landmarks(aperture_pixels: float = 0.0):
+        points = [[0.0, 0.0] for _ in range(68)]
+        points[48] = (40, 50)
+        points[54] = (80, 50)
+        points[61], points[62], points[63] = (51, 48), (60, 48), (69, 48)
+        points[67], points[66], points[65] = (
+            (51, 48 + aperture_pixels), (60, 48 + aperture_pixels), (69, 48 + aperture_pixels),
+        )
+        return points
+
+    @staticmethod
+    def _static_landmark_detector(aperture_pixels: float = 0.5):
+        landmarks = [list(point) for point in VerticalAdsTests._mouth_landmarks(aperture_pixels)]
+        # A finite, non-degenerate jaw outline lets the detector wrapper rank this as one face.
+        for index in range(17):
+            landmarks[index] = (30 + index * 3.75, 40 + 20 * math.sin(index * math.pi / 16))
+
+        class Detector:
+            def get_landmarks(self, _rgb):
+                return [landmarks]
+
+        return Detector()
+
+    def test_landmark_mouth_aperture_rejects_gap_accepts_closed_and_fails_invalid(self):
+        closed, reason, width = mouth_masks.measure_mouth_aperture(
+            self._mouth_landmarks(0.5), (120, 120),
+        )
+        self.assertEqual(reason, "measured")
+        self.assertAlmostEqual(width, 40.0)
+        self.assertLessEqual(closed, mouth_masks.MAX_MOUTH_APERTURE_RATIO)
+
+        open_gap, reason, _ = mouth_masks.measure_mouth_aperture(
+            self._mouth_landmarks(4.0), (120, 120),
+        )
+        self.assertEqual(reason, "measured")
+        self.assertGreater(open_gap, mouth_masks.MAX_MOUTH_APERTURE_RATIO)
+
+        invalid, reason, _ = mouth_masks.measure_mouth_aperture([[1.0, 2.0]], (120, 120))
+        self.assertIsNone(invalid)
+        self.assertEqual(reason, "invalid_landmark_shape")
+        invalid, reason, _ = mouth_masks.measure_mouth_aperture(
+            self._mouth_landmarks(float("nan")), (120, 120),
+        )
+        self.assertIsNone(invalid)
+        self.assertEqual(reason, "non_finite_landmarks")
+        for aperture_pixels in (0.0, -1.0):
+            invalid, reason, _ = mouth_masks.measure_mouth_aperture(
+                self._mouth_landmarks(aperture_pixels), (120, 120),
+            )
+            self.assertIsNone(invalid)
+            self.assertEqual(reason, "non_positive_inner_lip_aperture")
+
+        self.assertFalse(mouth_masks.is_closed_donor({"inner_mouth_fraction": 0.0}))
+        self.assertTrue(mouth_masks.is_closed_donor({
+            "inner_mouth_fraction": 0.0,
+            "mouth_aperture_status": "measured",
+            "mouth_aperture_ratio": closed,
+        }))
+        self.assertFalse(mouth_masks.is_closed_donor({
+            "inner_mouth_fraction": 0.0,
+            "mouth_aperture_status": "measured",
+            "mouth_aperture_ratio": open_gap,
+        }))
+
+    @unittest.skipUnless(FFMPEG and mouth_masks.cv2 is not None and mouth_masks.np is not None,
+                         "OpenCV and FFmpeg are required for final-frame mouth QC")
+    def test_final_output_mouth_qc_fails_when_any_pause_frame_is_open_or_uncertain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            video = Path(directory) / "final.mp4"
+            frame = mouth_masks.np.full((120, 120, 3), 120, dtype=mouth_masks.np.uint8)
+            writer = mouth_masks.cv2.VideoWriter(
+                str(video), mouth_masks.cv2.VideoWriter_fourcc(*"mp4v"), 25.0, (120, 120),
+            )
+            self.assertTrue(writer.isOpened())
+            for _ in range(3):
+                writer.write(frame)
+            writer.release()
+
+            qc = mouth_masks.validate_output_pause_frames(
+                video, [0, 1], self._static_landmark_detector(aperture_pixels=4.0),
+            )
+            self.assertEqual(qc["status"], "failed")
+            self.assertEqual(qc["failed_frame_indices"], [0, 1])
+            self.assertEqual(qc["passed_frame_count"], 0)
+            unavailable = mouth_masks.validate_output_pause_frames(video, [0], None)
+            self.assertEqual(unavailable["status"], "failed")
+            self.assertEqual(unavailable["reason"], "landmark_detector_unavailable")
+
     def test_profiles_cli_and_phase_metrics(self):
         args = ads.make_parser().parse_args(["run"])
         self.assertEqual((args.profile, args.mouth_mode), ("A10", "speech"))
@@ -62,6 +151,73 @@ class VerticalAdsTests(unittest.TestCase):
         self.assertFalse(row["normalized_60s_is_measured"])
         self.assertAlmostEqual(row["normalized_wall_seconds_per_60_audio_seconds_extrapolation"], 3 * 60 / 55.584, places=3)
         self.assertEqual(ads.report_filename("calibrate"), "lip_calibration_report.json")
+
+    def test_quality_assessment_separates_file_checks_from_unverified_quality_claims(self):
+        export = {
+            "ffprobe_checks": {
+                "width": True, "height": True, "fps_25": True,
+                "aac_packet_payload_hashes_match_source": True,
+            },
+        }
+        pause = {
+            "output_mouth_closure_qc": {
+                "status": "passed",
+                "method": "68-point inner-lip aperture",
+            },
+            "output_mouth_closure_qc_report": "job/quality_assessment/qc.json",
+        }
+        assessment = ads._build_quality_assessment(export, pause, "mouth-only")
+        self.assertEqual(assessment["certification_status"], "not_certified")
+        self.assertEqual(
+            assessment["objective_checks"]["container_audio_frame_integrity"]["status"],
+            "passed",
+        )
+        self.assertEqual(assessment["objective_checks"]["pause_mouth_geometry"]["status"], "passed")
+        for claim in (
+            "speech_lip_sync", "temporal_smoothness", "similarity_to_reference_video",
+            "cross_character_generalization", "cross_language_generalization",
+        ):
+            self.assertTrue(assessment["unverified_claims"][claim].startswith("unverified:"))
+
+    def test_mouth_qc_detector_preflight_runs_in_musetalk_python_and_fails_fast(self):
+        default_args = ads.make_parser().parse_args(["run"])
+        mouth_only_args = ads.make_parser().parse_args(["run", "--pause-correction-region", "mouth-only"])
+        disabled_args = ads.make_parser().parse_args([
+            "run", "--pause-correction-region", "mouth-only", "--pause-mouth-closure", "off",
+        ])
+        dry_run_args = ads.make_parser().parse_args([
+            "dry-run", "--pause-correction-region", "mouth-only",
+        ])
+        self.assertFalse(ads._mouth_qc_detector_preflight_required(default_args))
+        self.assertTrue(ads._mouth_qc_detector_preflight_required(mouth_only_args))
+        self.assertFalse(ads._mouth_qc_detector_preflight_required(disabled_args))
+        self.assertFalse(ads._mouth_qc_detector_preflight_required(dry_run_args))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = type("Paths", (), {"root": root / "musetalk", "python": Path(sys.executable)})()
+            calls = []
+
+            def backend(command, cwd, environment, log_path):
+                calls.append((command, cwd, log_path))
+                return 0, 0.25
+
+            with (
+                mock.patch.object(ads.musetalk, "build_backend_environment", return_value={}),
+                mock.patch.object(ads.musetalk, "run_backend_process", side_effect=backend),
+            ):
+                result = ads._preflight_mouth_qc_detector(paths, "ffmpeg", root / "job")
+            self.assertEqual(result["status"], "ready")
+            self.assertIn("--check-landmark-detector", calls[0][0])
+            self.assertEqual(calls[0][1], paths.root)
+            self.assertIn("mouth_qc_detector_preflight.log", calls[0][2].name)
+
+            with (
+                mock.patch.object(ads.musetalk, "build_backend_environment", return_value={}),
+                mock.patch.object(ads.musetalk, "run_backend_process", return_value=(2, 0.1)),
+                self.assertRaisesRegex(RuntimeError, "stopping before Echo/MuseTalk inference"),
+            ):
+                ads._preflight_mouth_qc_detector(paths, "ffmpeg", root / "failed_job")
 
     def test_reprocess_output_label_namespaces_all_outputs_and_rejects_paths(self):
         job = Path("job")
@@ -360,7 +516,9 @@ class VerticalAdsTests(unittest.TestCase):
         alpha, descriptor, reason = mouth_masks.build_feathered_mouth_mask(labels)
         self.assertEqual(reason, "ok")
         self.assertIsNotNone(descriptor)
-        self.assertTrue(mouth_masks.is_closed_donor(descriptor))
+        self.assertFalse(mouth_masks.is_closed_donor(descriptor), "parser labels alone must not certify a visually closed donor")
+        measured_closed = dict(descriptor, mouth_aperture_status="measured", mouth_aperture_ratio=0.01)
+        self.assertTrue(mouth_masks.is_closed_donor(measured_closed))
         self.assertEqual(alpha.shape, labels.shape)
         self.assertGreater(np.count_nonzero(alpha), 0)
         self.assertLess(np.count_nonzero(alpha), labels.size * 0.02)
@@ -552,7 +710,7 @@ class VerticalAdsTests(unittest.TestCase):
             ):
                 report = mouth_masks.run_extraction(
                     rendered_video, reference_video, mask_dir, donor_dir, report_path, request_path,
-                    parser=object(), torch=object(),
+                    parser=object(), torch=object(), landmark_detector=self._static_landmark_detector(),
                 )
 
             self.assertEqual(report["status"], "partially_applied")
@@ -562,7 +720,7 @@ class VerticalAdsTests(unittest.TestCase):
             self.assertEqual(report["uncovered_output_pause_frame_count"], 1)
             self.assertEqual(report["selected_donor_by_output_frame"], {"1": 1})
             self.assertEqual(report["selected_donor_frame_counts"], {"1": 1})
-            self.assertIn("patch preparation only", report["diagnostic_scope"])
+            self.assertIn("patch preparation", report["diagnostic_scope"])
             prepared, skipped = report["frame_diagnostics"]
             self.assertEqual(prepared["output_frame_index"], 1)
             self.assertEqual(prepared["exact_source_frame_index"], 1)
@@ -579,6 +737,8 @@ class VerticalAdsTests(unittest.TestCase):
                              "after both donors pass the closed-mouth gate, geometry fit outranks extra closure")
             donor_metric = prepared["selected_donor_closed_mouth_metric"]
             self.assertEqual(donor_metric["name"], "inner_mouth_fraction")
+            self.assertEqual(donor_metric["maximum_closed_threshold"], mouth_masks.MAX_INNER_MOUTH_FRACTION)
+            self.assertEqual(donor_metric["landmark_mouth_aperture"]["name"], "inner_lip_gap_over_mouth_width")
             self.assertTrue(donor_metric["passed"])
             self.assertLessEqual(donor_metric["value"], donor_metric["maximum_closed_threshold"])
             self.assertEqual(prepared["selected_donor_geometry_score"], round(aligned_score, 6))
@@ -850,6 +1010,7 @@ class VerticalAdsTests(unittest.TestCase):
                 report = mouth_masks.run_extraction(
                     rendered_video, donor_video, root / "alpha", root / "donors",
                     root / "report.json", request, parser=object(), torch=object(),
+                    landmark_detector=self._static_landmark_detector(),
                 )
             self.assertEqual(parser.call_count, 3, "the helper should parse only available exact donors and targets, never scan/fallback to others")
             frames = {item["output_frame_index"]: item for item in report["frame_diagnostics"]}
@@ -1031,6 +1192,7 @@ class VerticalAdsTests(unittest.TestCase):
                 "frame_diagnostics": [{"output_frame_index": 1, "source_frame_index": 1,
                                        "donor_frame_index": 1, "skip_reason": None}],
             }
+            qc_status = ["passed"]
 
             def png_chunk(kind: bytes, data: bytes) -> bytes:
                 return (struct.pack(">I", len(data)) + kind + data
@@ -1056,6 +1218,18 @@ class VerticalAdsTests(unittest.TestCase):
                                  + png_chunk(b"IDAT", image_data) + png_chunk(b"IEND", b""))
 
             def fake_helper(command, cwd, environment, log_path):
+                if "--validate-output-video" in command:
+                    request_path = Path(command[command.index("--validate-request") + 1])
+                    request = json.loads(request_path.read_text(encoding="utf-8"))
+                    report_path = Path(command[command.index("--validation-report") + 1])
+                    frame_count = len(request["output_pause_frames"])
+                    report_path.write_text(json.dumps({
+                        "status": qc_status[0],
+                        "requested_frame_count": frame_count,
+                        "passed_frame_count": frame_count if qc_status[0] == "passed" else 0,
+                        "failed_frame_indices": [] if qc_status[0] == "passed" else [1],
+                    }), encoding="utf-8")
+                    return 0 if qc_status[0] == "passed" else 2, 0.01
                 request_path = Path(command[command.index("--request") + 1])
                 request = json.loads(request_path.read_text(encoding="utf-8"))
                 donor_dir = Path(command[command.index("--donor-directory") + 1])
@@ -1095,7 +1269,12 @@ class VerticalAdsTests(unittest.TestCase):
             self.assertEqual(correction["source_audio_packet_count"], correction["corrected_audio_packet_count"])
             self.assertEqual(correction["mouth_donor_mode"], "silence-conditioned")
             self.assertEqual(correction["mouth_mask_extraction"]["frame_diagnostics"][0]["donor_frame_index"], 1)
-            self.assertIn("not visually validate", correction["mouth_mask_extraction"]["diagnostic_scope"])
+            self.assertEqual(correction["output_mouth_closure_qc"]["status"], "passed")
+            self.assertEqual(correction["measured_pause_mouth_closure"], "passed_geometric_aperture_gate")
+            qc_report_path = Path(correction["output_mouth_closure_qc_report"])
+            self.assertTrue(qc_report_path.is_file())
+            self.assertEqual(json.loads(qc_report_path.read_text(encoding="utf-8"))["status"], "passed")
+            self.assertIn("quality_assessment", qc_report_path.parts)
             self.assertEqual(ads.count_video_frames(output_path, FFPROBE), 4)
             source_info = ads.probe_media(rendered, FFPROBE)
             output_info = ads.probe_media(output_path, FFPROBE)
@@ -1103,6 +1282,29 @@ class VerticalAdsTests(unittest.TestCase):
             output_audio = ads.stream_by_type(output_info, "audio")
             self.assertGreater(ads.media_duration(source_info, source_audio), 0.16)
             self.assertEqual(ads.audio_packet_hashes(rendered, FFPROBE), ads.audio_packet_hashes(output_path, FFPROBE))
+
+            qc_status[0] = "failed"
+            rejected_output = root / "mouth_qc_rejected.mp4"
+            with (
+                mock.patch.object(ads.musetalk, "discover_musetalk_paths", return_value=fake_paths),
+                mock.patch.object(ads.musetalk, "run_backend_process", side_effect=fake_helper),
+            ):
+                rejected = ads.apply_pause_mouth_closure(
+                    rendered, base, audio_wav, rejected_output, FFMPEG, FFPROBE, 0.20,
+                    min_pause_seconds=0.08,
+                    reference_audio=audio_wav,
+                    reference_audio_provenance={
+                        "status": "verified", "manifest_audio_sha256": digest,
+                        "source_sha256": digest, "current_audio_sha256": digest,
+                    },
+                    requested_policy="auto", correction_region="mouth-only",
+                    mouth_donor_mode="silence-conditioned",
+                    silence_conditioned_donor_video=donor_video,
+                )
+            self.assertEqual(rejected["status"], "failed_output_mouth_qc")
+            self.assertFalse(rejected["output_promoted"])
+            self.assertFalse(rejected_output.exists())
+            self.assertFalse(rejected_output.with_name("." + rejected_output.stem + ".partial.mp4").exists())
 
             hd_path = root / "vertical_ad.mp4"
             _, hd_report = ads.export_hd_video(

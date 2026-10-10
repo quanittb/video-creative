@@ -943,6 +943,10 @@ def apply_pause_mouth_closure(
     if temporary.exists():
         raise FileExistsError("Pause-correction temporary already exists: {}".format(temporary))
     mouth_temp_root: Optional[Path] = None
+    mouth_helper_paths: Any = None
+    mouth_helper_environment: Optional[Mapping[str, str]] = None
+    mouth_helper_log: Optional[Path] = None
+    mouth_request_path: Optional[Path] = None
     try:
         if correction_region == "mouth-only":
             output_frame_count = int(rendered_frame_count or 0)
@@ -1000,9 +1004,11 @@ def apply_pause_mouth_closure(
             mask_directory = mouth_temp_root / "alpha"
             donor_directory = mouth_temp_root / "donors"
             request_path = mouth_temp_root / "request.json"
+            mouth_request_path = request_path
             helper_report_path = mouth_temp_root / "report.json"
             request_path.write_text(json.dumps(request, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             paths = musetalk.discover_musetalk_paths(musetalk_dir, musetalk_python)
+            mouth_helper_paths = paths
             helper_path = SCRIPT_ROOT / "musetalk_mouth_masks.py"
             helper_command = [
                 str(paths.python), str(helper_path),
@@ -1014,7 +1020,9 @@ def apply_pause_mouth_closure(
                 "--request", str(request_path),
             ]
             helper_environment = musetalk.build_backend_environment(ffmpeg, musetalk_root=paths.root)
+            mouth_helper_environment = helper_environment
             helper_log = helper_log_path or destination.with_name(destination.stem + "_mouth_mask.log")
+            mouth_helper_log = helper_log
             helper_return_code, helper_seconds = musetalk.run_backend_process(
                 helper_command, paths.root, helper_environment, helper_log,
             )
@@ -1126,6 +1134,9 @@ def apply_pause_mouth_closure(
             raise ValueError("Pause correction changed the MuseTalk audio codec despite stream-copy mode.")
         if abs(corrected_audio_duration - source_audio_duration) > 0.01:
             raise ValueError("Pause correction changed the MuseTalk audio duration unexpectedly.")
+        record["source_frame_count"] = frame_count
+        record["output_audio_codec"] = str(corrected_audio.get("codec_name"))
+        record["output_audio_duration_seconds"] = round(corrected_audio_duration, 6)
         if correction_region == "mouth-only":
             source_packet_hashes = audio_packet_hashes(rendered_video, ffprobe)
             corrected_packet_hashes = audio_packet_hashes(temporary, ffprobe)
@@ -1139,6 +1150,68 @@ def apply_pause_mouth_closure(
             record["corrected_audio_packet_count"] = len(corrected_packet_hashes)
             record["audio_packet_payload_hashes_match"] = True
             record["audio_unchanged"] = True
+            if (correction_region == "mouth-only" and corrected_frame_indices
+                    and mouth_helper_paths is not None and mouth_helper_environment is not None
+                    and mouth_request_path is not None and mouth_temp_root is not None):
+                job_root = (destination.parent.parent
+                            if destination.parent.name.lower() == "intermediate"
+                            else destination.parent)
+                validation_report_path = job_root / "quality_assessment" / (
+                    destination.stem + "_pause_mouth_qc.json"
+                )
+                validation_report_path.parent.mkdir(parents=True, exist_ok=True)
+                record["output_mouth_closure_qc_report"] = str(validation_report_path.resolve())
+                validation_log = (
+                    mouth_helper_log.with_name(mouth_helper_log.stem + "_final_qc.log")
+                    if mouth_helper_log is not None else
+                    destination.with_name(destination.stem + "_mouth_output_qc.log")
+                )
+                validation_command = [
+                    str(mouth_helper_paths.python), str(SCRIPT_ROOT / "musetalk_mouth_masks.py"),
+                    "--validate-output-video", str(temporary.resolve()),
+                    "--validate-request", str(mouth_request_path.resolve()),
+                    "--validation-report", str(validation_report_path.resolve()),
+                ]
+                validation_return_code, validation_seconds = musetalk.run_backend_process(
+                    validation_command, mouth_helper_paths.root, mouth_helper_environment, validation_log,
+                )
+                if not validation_report_path.is_file():
+                    output_mouth_qc = {
+                        "status": "failed", "reason": "final_qc_report_missing",
+                        "helper_exit_code": validation_return_code,
+                        "helper_log": str(validation_log),
+                    }
+                else:
+                    output_mouth_qc = json.loads(validation_report_path.read_text(encoding="utf-8"))
+                    output_mouth_qc["helper_process_wall_seconds"] = round(validation_seconds, 3)
+                record["output_mouth_closure_qc"] = output_mouth_qc
+                if validation_return_code != 0 or output_mouth_qc.get("status") != "passed":
+                    failed_indices = output_mouth_qc.get("failed_frame_indices", [])
+                    record.update({
+                        "status": "failed_output_mouth_qc",
+                        "pause_coverage_status": "failed_quality_gate",
+                        "video_pause_frame_coverage_status": "failed_quality_gate",
+                        "pause_frame_coverage_status": "failed_quality_gate",
+                        "output_promoted": False,
+                        "output": None,
+                        "fallback": "final encoded correction discarded; original MuseTalk intermediate remains available and must not be described as pause-corrected",
+                        "output_mouth_closure_qc_error": (
+                            "Measured closed frames: {}/{}; failed indices: {}. QC report/log: {}".format(
+                                output_mouth_qc.get("passed_frame_count", 0),
+                                output_mouth_qc.get("requested_frame_count", len(output_pause_frames)),
+                                failed_indices,
+                                validation_report_path if validation_report_path.is_file() else validation_log,
+                            )
+                        ),
+                    })
+                    temporary.unlink(missing_ok=True)
+                    return record
+                record["measured_pause_mouth_closure"] = "passed_geometric_aperture_gate"
+                record["output_promoted"] = True
+                record["pause_coverage_basis"] = (
+                    "final encoded pause frames passed the measured inner-lip aperture threshold; "
+                    "this is geometric QC, not a universal subjective-quality guarantee"
+                )
         os.replace(str(temporary), str(destination))
     except Exception:
         temporary.unlink(missing_ok=True)
@@ -1147,9 +1220,6 @@ def apply_pause_mouth_closure(
         if mouth_temp_root is not None:
             shutil.rmtree(mouth_temp_root, ignore_errors=True)
     record["output"] = str(destination.resolve())
-    record["source_frame_count"] = frame_count
-    record["output_audio_codec"] = str(corrected_audio.get("codec_name"))
-    record["output_audio_duration_seconds"] = round(corrected_audio_duration, 6)
     return record
 
 
@@ -1523,6 +1593,43 @@ def _find_musetalk_paths(args: argparse.Namespace) -> musetalk.MuseTalkPaths:
     return paths
 
 
+def _preflight_mouth_qc_detector(
+    paths: musetalk.MuseTalkPaths,
+    ffmpeg: str,
+    job_dir: Path,
+) -> Dict[str, Any]:
+    """Initialize mouth-QC dependencies before paying for an Echo/MuseTalk render."""
+    helper = SCRIPT_ROOT / "musetalk_mouth_masks.py"
+    log_path = job_dir / "logs" / "mouth_qc_detector_preflight.log"
+    environment = musetalk.build_backend_environment(ffmpeg, musetalk_root=paths.root)
+    command = [str(paths.python), str(helper), "--check-landmark-detector"]
+    exit_code, wall_seconds = musetalk.run_backend_process(
+        command, paths.root, environment, log_path,
+    )
+    result = {
+        "status": "ready" if exit_code == 0 else "failed",
+        "detector": "face-alignment 68-point landmarks",
+        "exit_code": exit_code,
+        "wall_seconds": round(wall_seconds, 3),
+        "log_path": str(log_path.resolve()),
+        "scope": "Dependency/model initialization only; no output quality is certified.",
+    }
+    if exit_code != 0:
+        raise RuntimeError(
+            "Mouth-only QC requires an initialized 68-point face-alignment detector; "
+            "stopping before Echo/MuseTalk inference. See {}.".format(log_path)
+        )
+    return result
+
+
+def _mouth_qc_detector_preflight_required(args: argparse.Namespace) -> bool:
+    return (
+        args.action != "dry-run"
+        and args.pause_correction_region == "mouth-only"
+        and args.pause_mouth_closure != "off"
+    )
+
+
 def _preflight_without_base(args: argparse.Namespace, echo_root: Path, job_dir: Path) -> Dict[str, Any]:
     echo_profile = echo.PROFILES[args.profile]
     audio_seconds, audio_info = expected_audio_duration(resolve_project_path(args.audio), args.duration, args.ffprobe)
@@ -1773,6 +1880,69 @@ def _write_output_metrics(video_entry: Dict[str, Any], output_record: Mapping[st
     video_entry["normalized_60s_is_measured"] = abs(actual_seconds - 60.0) <= 0.16
 
 
+def _build_quality_assessment(
+    output_record: Mapping[str, Any],
+    pause_record: Mapping[str, Any],
+    correction_region: str,
+) -> Dict[str, Any]:
+    """Report automated facts separately from perceptual claims this pipeline cannot verify."""
+    export_checks = dict(output_record.get("ffprobe_checks") or {})
+    required_checks = {
+        key: value for key, value in export_checks.items()
+        if key != "aac_packet_payload_hashes_match_source"
+    }
+    container_status = (
+        "passed" if required_checks and all(value is True for value in required_checks.values())
+        else "failed" if any(value is False for value in required_checks.values())
+        else "unverified"
+    )
+    packet_check = export_checks.get("aac_packet_payload_hashes_match_source")
+    packet_status = "passed" if packet_check is True else "not_applicable" if packet_check is None else "failed"
+
+    mouth_qc = pause_record.get("output_mouth_closure_qc")
+    if correction_region != "mouth-only" or pause_record.get("requested_policy") == "off":
+        mouth_status = "not_requested"
+    elif isinstance(mouth_qc, Mapping):
+        mouth_status = str(mouth_qc.get("status") or "unverified")
+    else:
+        mouth_status = "unverified"
+
+    unverified = {
+        "speech_lip_sync": "unverified: no phoneme-level or SyncNet score is calculated.",
+        "temporal_smoothness": "unverified: frame/container checks do not score motion jitter or seam continuity.",
+        "similarity_to_reference_video": "unverified: no reference-video perceptual comparison is performed.",
+        "cross_character_generalization": "unverified: results apply only to the character in this job.",
+        "cross_language_generalization": "unverified: results apply only to the audio/language in this job.",
+        "subjective_visual_quality": "unverified: a person must review the final encoded video.",
+    }
+    return {
+        "schema_version": 1,
+        "certification_status": "not_certified",
+        "scope": (
+            "This report records objective file checks and, when requested, measured pause-mouth geometry. "
+            "It does not certify perceptual lip sync, natural motion, resemblance to a reference, or "
+            "generalization to other people or languages."
+        ),
+        "objective_checks": {
+            "container_audio_frame_integrity": {
+                "status": container_status,
+                "ffprobe_checks": export_checks,
+            },
+            "encoded_audio_packet_integrity": {
+                "status": packet_status,
+                "note": "Exact packet-payload preservation is checked when the source is AAC; otherwise audio is encoded as AAC and this comparison is not applicable.",
+            },
+            "pause_mouth_geometry": {
+                "status": mouth_status,
+                "report": pause_record.get("output_mouth_closure_qc_report"),
+                "measurement": (mouth_qc or {}).get("method") if isinstance(mouth_qc, Mapping) else None,
+                "quality_boundary": "A geometric aperture pass does not prove natural lips, speech synchronization, or a seamless result.",
+            },
+        },
+        "unverified_claims": unverified,
+    }
+
+
 def _prepare_conditioning_audio(
     args: argparse.Namespace,
     job_dir: Path,
@@ -1964,6 +2134,24 @@ def run_workflow(args: argparse.Namespace, job_dir: Path, report: Dict[str, Any]
             "nominal_pingpong_cycle_seconds": 2 * profile.max_duration_seconds,
             "note": "Run action relies on each existing pipeline's own validations; no separate dry-run inference is performed.",
         }
+    if _mouth_qc_detector_preflight_required(args):
+        detector_started = time.perf_counter()
+        report["preflight"]["mouth_qc_detector"] = {"status": "checking"}
+        echo.write_json_atomic(report_path, report)
+        try:
+            report["preflight"]["mouth_qc_detector"] = _preflight_mouth_qc_detector(
+                paths, ffmpeg, job_dir,
+            )
+        except Exception as error:
+            report["preflight"]["mouth_qc_detector"] = {
+                "status": "failed", "error": str(error),
+                "log_path": str((job_dir / "logs" / "mouth_qc_detector_preflight.log").resolve()),
+            }
+            raise
+        _append_phase(
+            report, "mouth_qc_detector_preflight_wall", time.perf_counter() - detector_started,
+            "Imports MuseTalk environment dependencies and initializes the landmark detector before inference.",
+        )
     preflight_seconds = time.perf_counter() - preflight_started
     _append_phase(report, "preflight", preflight_seconds, "File/runtime/configuration checks only; no inference in dry-run.")
     if args.action == "dry-run":
@@ -2241,6 +2429,19 @@ def run_workflow(args: argparse.Namespace, job_dir: Path, report: Dict[str, Any]
                 musetalk_python=args.musetalk_python,
                 helper_log_path=job_dir / "logs" / ("mouth_mask_extraction_video_{}.log".format(index)),
             )
+            if closure_record.get("status") == "failed_output_mouth_qc":
+                report["status"] = "failed_pause_mouth_output_qc"
+                report["pause_mouth_output_qc_failure"] = {
+                    "video_index": index,
+                    "pause_correction": closure_record,
+                    "note": "Không xuất bản video đã sửa vì các frame pause cuối không vượt qua đo khẩu độ môi hoặc detector không khả dụng.",
+                }
+                echo.write_json_atomic(report_path, report)
+                raise RuntimeError(
+                    "Final pause-mouth QC failed; no corrected output was promoted. {}".format(
+                        closure_record.get("output_mouth_closure_qc_error", "See pause_mouth_output_qc_failure in the report."),
+                    )
+                )
             if closure_record["status"] in ("applied", "partially_applied"):
                 muse_data["path"] = corrected_intermediate
             if closure_record.get("correction_region") == "mouth-only":
@@ -2248,7 +2449,7 @@ def run_workflow(args: argparse.Namespace, job_dir: Path, report: Dict[str, Any]
                 corrected_count = closure_record.get("corrected_pause_frame_count", 0)
                 requested_count = closure_record.get("requested_output_pause_frame_count", 0)
                 fraction = closure_record.get("pause_frame_coverage_ratio", 0.0)
-                print("Mouth-only pause patches composited: {} ({}/{} in-video pause frames, {:.1%}); this does not visually validate mouth closure.".format(
+                print("Mouth-only pause patches composited: {} ({}/{} in-video pause frames, {:.1%}); final frames also pass a measured geometric aperture gate, not subjective visual approval.".format(
                     coverage.upper(), corrected_count, requested_count, fraction,
                 ))
                 video_gaps = closure_record.get("video_uncovered_intervals", [])
@@ -2293,6 +2494,15 @@ def run_workflow(args: argparse.Namespace, job_dir: Path, report: Dict[str, Any]
         _write_output_metrics(video_entry, exported)
         video_entry["audio_normalization_seconds"] = manifest.get("audio_normalization_seconds")
         video_entry["backend_process_seconds"] = manifest.get("backend_process_seconds")
+        assessment = _build_quality_assessment(
+            exported, closure_record, args.pause_correction_region,
+        )
+        assessment_path = job_dir / "quality_assessment" / (
+            Path(exported["path"]).stem + ".json"
+        )
+        echo.write_json_atomic(assessment_path, assessment)
+        video_entry["quality_assessment"] = assessment
+        video_entry["quality_assessment_path"] = str(assessment_path.resolve())
         outputs.append(video_entry)
         report["videos"] = outputs
         echo.write_json_atomic(report_path, report)
