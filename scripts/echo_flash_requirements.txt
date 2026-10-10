@@ -1,0 +1,16 @@
+# Additional pinned dependencies for the isolated Python 3.11 venv.
+# Install the matching Windows CUDA PyTorch triplet first (see docs/ECHOMIMIC_V3_FLASH_WINDOWS.md).
+accelerate==1.1.1
+diffusers==0.32.2
+einops==0.8.0
+huggingface-hub==0.26.2
+librosa==0.10.2.post1
+numpy==1.26.4
+omegaconf==2.3.0
+Pillow==10.2.0
+pyloudnorm==0.1.1
+scipy==1.14.1
+safetensors==0.4.5
+sentencepiece==0.2.0
+soundfile==0.12.1
+transformers==4.46.3
