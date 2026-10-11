@@ -47,6 +47,13 @@ class StudioBridgeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "phải nằm trong assets/characters"):
             studio_bridge._resolve_character_image({"source": str(self.project_root / "README.md")})
 
+    def test_output_name_is_a_safe_mp4_basename(self):
+        self.assertEqual(studio_bridge._resolve_output_name("output/campaign-final.mp4"), "campaign-final.mp4")
+        self.assertEqual(studio_bridge._resolve_output_name("campaign-final"), "campaign-final.mp4")
+        for unsafe in ("../outside.mp4", r"..\outside.mp4", "folder/name.mp4", "name.exe"):
+            with self.subTest(unsafe=unsafe), self.assertRaises(ValueError):
+                studio_bridge._resolve_output_name(unsafe)
+
     def test_dry_run_calls_pipeline_preflight_and_never_reports_fake_video(self):
         events = []
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -63,13 +70,16 @@ class StudioBridgeTests(unittest.TestCase):
                 patch.object(studio_bridge, "emit_log"),
                 patch.object(studio_bridge, "emit_progress"),
             ):
-                result = studio_bridge.run_pipeline_job({"id": "dry_run_test", "dry_run": True})
+                result = studio_bridge.run_pipeline_job({
+                    "id": "dry_run_test", "dry_run": True, "output": "output/campaign-final.mp4",
+                })
 
         self.assertEqual(result, 0)
         command = popen.call_args.args[0]
         self.assertIn("dry-run", command)
         self.assertIn("scripts/test_vertical_ads.py", command[2])
         self.assertNotIn("test_option_b_avatar.py", command)
+        self.assertEqual(command[command.index("--output-name") + 1], "campaign-final.mp4")
         validated = [data for name, data in events if name == "job_validated"]
         completed = [data for name, data in events if name == "job_completed"]
         self.assertEqual(validated, [{"job_id": "dry_run_test", "status": "validated", "output": None}])

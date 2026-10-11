@@ -597,6 +597,22 @@ def _verified_output_from_log(output_root: Path, log_lines: list[str]) -> Option
     return None
 
 
+def _resolve_output_name(value: Any) -> Optional[str]:
+    """Accept a single safe MP4 filename, including legacy output/name.mp4 manifests."""
+    if value is None or not str(value).strip():
+        return None
+    name = str(value).strip().replace("\\", "/")
+    if name.startswith("output/"):
+        name = name[len("output/"):]
+    if "/" in name or name in {".", ".."} or any(character in name for character in '<>:"|?*'):
+        raise ValueError("Tên file đầu ra chỉ được là tên MP4, không chứa đường dẫn hoặc ký tự đặc biệt.")
+    if not name.lower().endswith(".mp4"):
+        if Path(name).suffix:
+            raise ValueError("File đầu ra phải có phần mở rộng .mp4.")
+        name += ".mp4"
+    return name
+
+
 def run_pipeline_job(job_spec: Dict[str, Any]) -> int:
     """Run a real vertical Echo Flash + MuseTalk render or a preflight-only dry run."""
     job_id = str(job_spec.get("id") or "job_direct")
@@ -612,6 +628,7 @@ def run_pipeline_job(job_spec: Dict[str, Any]) -> int:
 
     try:
         image_path = _resolve_character_image(job_spec)
+        output_name = _resolve_output_name(job_spec.get("output"))
         if job_spec.get("dry_run"):
             audio_path, remove_preflight_audio = _preflight_audio(job_spec, job_id)
             action = "dry-run"
@@ -641,6 +658,8 @@ def run_pipeline_job(job_spec: Dict[str, Any]) -> int:
         "--output-root", str(output_root),
         "--batch-size", str(max(1, min(4, int(job_spec.get("batch_size") or 2)))),
     ]
+    if output_name:
+        cmd.extend(["--output-name", output_name])
     duration = job_spec.get("duration")
     if duration is not None:
         try:

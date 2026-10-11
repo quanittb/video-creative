@@ -44,7 +44,7 @@ export const HeaderBar: React.FC<Props> = ({
         <h1 className="text-sm font-bold tracking-wider text-slate-100 flex items-center gap-2">
           <span>VIDEO CREATIVE STUDIO</span>
           <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-studio-elevated text-studio-cyan border border-studio-border">
-            LOCAL v1.0
+            LOCAL
           </span>
         </h1>
 
@@ -54,8 +54,8 @@ export const HeaderBar: React.FC<Props> = ({
             onClick={onNavigateSettings}
             title={
               license.is_activated
-                ? "Thiết bị đã được kích hoạt bản quyền vĩnh viễn"
-                : `Bản dùng thử: Còn ${license.days_remaining} ngày. Nhấp để xem cài đặt bản quyền.`
+                ? "Ứng dụng đang mở khóa cục bộ; trạng thái này không được xác minh qua máy chủ cấp phép."
+                : `Bản dùng thử: Còn ${license.days_remaining} ngày. Nhấp để xem cài đặt thử nghiệm.`
             }
             className={`px-2 py-0.5 rounded text-[10px] font-semibold flex items-center gap-1 border transition-colors ${
               license.is_activated
@@ -66,7 +66,7 @@ export const HeaderBar: React.FC<Props> = ({
             {license.is_activated ? (
               <>
                 <ShieldCheck className="w-3 h-3 text-emerald-400" />
-                <span>Bản quyền Vĩnh viễn</span>
+                <span>Mở khóa cục bộ</span>
               </>
             ) : (
               <>

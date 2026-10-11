@@ -53,7 +53,7 @@ export const BatchView: React.FC<Props> = ({ onBatchQueued, invokeCommand, isTes
   ]);
 
   const [selectedIds, setSelectedIds] = useState<Set<string>>(
-    new Set(["draft_1", "draft_2"])
+    new Set()
   );
   const [manifestPath, setManifestPath] = useState("");
   const [isImporting, setIsImporting] = useState(false);
@@ -105,7 +105,23 @@ export const BatchView: React.FC<Props> = ({ onBatchQueued, invokeCommand, isTes
       return;
     }
 
+    const invalidItem = toEnqueue.find((item) => {
+      const outputName = item.output.trim();
+      return !item.name.trim()
+        || !item.script.trim()
+        || !outputName
+        || /[\\/:*?"<>|]/.test(outputName)
+        || outputName === "."
+        || outputName === ".."
+        || (/\.[^.]+$/.test(outputName) && !/\.mp4$/i.test(outputName));
+    });
+    if (invalidItem) {
+      alert(`Mục “${invalidItem.name || "chưa đặt tên"}” cần có tên, kịch bản và tên file MP4 hợp lệ (không nhập thư mục).`);
+      return;
+    }
+
     setIsImporting(true);
+    let queuedCount = 0;
     try {
       for (const item of toEnqueue) {
         const vObj = TTS_VOICES.find((v) => v.id === item.voice);
@@ -116,15 +132,22 @@ export const BatchView: React.FC<Props> = ({ onBatchQueued, invokeCommand, isTes
           voice: item.voice,
           gender: vObj?.gender,
           voice_provider: vObj?.provider,
+          output: item.output.trim().toLowerCase().endsWith(".mp4") ? item.output.trim() : `${item.output.trim()}.mp4`,
           dry_run: isTestMode,
         });
+        queuedCount += 1;
       }
 
-      onBatchQueued();
-      setBanner(`Đã thêm thành công ${toEnqueue.length} video vào Hàng đợi tuần tự!`);
+      await onBatchQueued();
+      setBanner(`Đã thêm ${queuedCount} video vào Hàng đợi tuần tự.`);
       setTimeout(() => setBanner(null), 4000);
     } catch (err: any) {
-      alert(`Lỗi thêm batch: ${err}`);
+      if (queuedCount > 0) {
+        await onBatchQueued();
+        setBanner(`Đã thêm ${queuedCount}/${toEnqueue.length} video. Phần còn lại chưa được gửi: ${err?.message || err}`);
+      } else {
+        alert(`Lỗi thêm batch: ${err?.message || err}`);
+      }
     } finally {
       setIsImporting(false);
     }
@@ -370,7 +393,7 @@ export const BatchView: React.FC<Props> = ({ onBatchQueued, invokeCommand, isTes
           </div>
           <div className="flex items-center gap-2 text-slate-500">
             <Clock className="w-3.5 h-3.5" />
-            <span>Render tuần tự để giới hạn mức sử dụng GPU.</span>
+            <span>Chọn thủ công các mục muốn gửi; render tuần tự để giới hạn mức sử dụng GPU.</span>
           </div>
         </div>
       </div>

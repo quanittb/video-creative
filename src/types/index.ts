@@ -141,6 +141,7 @@ export interface LicenseStatus {
 
 export interface UpdateInfo {
   has_update: boolean;
+  check_status: "checked" | "unavailable";
   current_version: string;
   latest_version: string;
   mandatory: boolean;

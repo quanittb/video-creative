@@ -1687,6 +1687,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--output-root", type=Path, default=PROJECT_ROOT / "output" / "vertical_ads")
+    parser.add_argument("--output-name", default=None,
+                        help="Tên file MP4 cuối cùng (chỉ basename); dùng bởi hàng đợi Studio.")
     parser.add_argument("--echo-dir", type=Path, default=None)
     parser.add_argument("--echo-python", default=None)
     parser.add_argument("--musetalk-dir", default=None)
@@ -2664,7 +2666,11 @@ def run_workflow(args: argparse.Namespace, job_dir: Path, report: Dict[str, Any]
             }
             echo.write_json_atomic(report_path, report)
             raise RuntimeError(coverage_failure)
-        output_name = "vertical_ad_1080x1920.mp4" if video_count == 1 else "vertical_ad_1080x1920_{}.mp4".format(variant)
+        if args.output_name:
+            output_stem = Path(args.output_name).stem
+            output_name = args.output_name if video_count == 1 else "{}_{}.mp4".format(output_stem, variant)
+        else:
+            output_name = "vertical_ad_1080x1920.mp4" if video_count == 1 else "vertical_ad_1080x1920_{}.mp4".format(variant)
         final_output = job_dir / output_name
         export_seconds, exported = export_hd_video(
             muse_data["path"], final_output, ffmpeg, ffprobe, muse_data["actual_audio_seconds"],
@@ -2743,6 +2749,13 @@ def report_filename(action: str) -> str:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = make_parser()
     args = parser.parse_args(argv)
+    if args.output_name:
+        output_name = args.output_name.strip()
+        if (not output_name or output_name in {".", ".."} or "/" in output_name or "\\" in output_name
+                or any(character in output_name for character in '<>:"|?*')
+                or not output_name.lower().endswith(".mp4")):
+            parser.error("--output-name phải là một tên file MP4, không phải đường dẫn.")
+        args.output_name = output_name
     if args.duration is None:
         args.duration = 3.24 if args.action == "calibrate" else DEFAULT_DURATION
     try:

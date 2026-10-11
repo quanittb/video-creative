@@ -88,10 +88,14 @@ fn read_jobs_json() -> Vec<serde_json::Value> {
 fn save_jobs_json(jobs: &[serde_json::Value]) -> Result<(), String> {
     let jobs_file = get_jobs_file();
     if let Some(parent) = jobs_file.parent() {
-        let _ = fs::create_dir_all(parent);
+        fs::create_dir_all(parent).map_err(|error| {
+            format!("Không thể tạo thư mục lưu hàng đợi {}: {error}", parent.display())
+        })?;
     }
     let content = serde_json::to_string_pretty(jobs).map_err(|e| e.to_string())?;
-    fs::write(&jobs_file, content).map_err(|e| e.to_string())?;
+    fs::write(&jobs_file, content).map_err(|error| {
+        format!("Không thể ghi hàng đợi tại {}: {error}", jobs_file.display())
+    })?;
     Ok(())
 }
 
@@ -115,6 +119,7 @@ async fn create_job(
     source: Option<String>,
     gender: Option<String>,
     voice_provider: Option<String>,
+    output: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let mut jobs = read_jobs_json();
     let id = format!("vcs_{}", &uuid::Uuid::new_v4().to_string()[..8]);
@@ -143,7 +148,7 @@ async fn create_job(
             "voice_provider": voice_provider,
             "driving": driving,
             "multiplier": multiplier.unwrap_or(0.55),
-            "output": null,
+            "output": output,
             "dry_run": dry_run.unwrap_or(false)
         }
     });
@@ -418,6 +423,18 @@ fn start_render_worker(app: AppHandle, state: State<'_, AppState>) -> Result<Str
     let child_id_holder = state.worker_child_id.clone();
     let app_dir = get_app_dir();
     let python = get_python_exe(&app_dir);
+    let required_files = [
+        app_dir.join("core").join("job_manager.py"),
+        app_dir.join("runners").join("studio_bridge.py"),
+        app_dir.join("scripts").join("test_vertical_ads.py"),
+    ];
+    if let Some(missing) = required_files.iter().find(|path| !path.is_file()) {
+        *is_running = false;
+        return Err(format!(
+            "Bộ cài thiếu thành phần render cần thiết: {}. Cài lại gói ứng dụng đã đóng gói đầy đủ.",
+            missing.display()
+        ));
+    }
 
     std::thread::spawn(move || {
         use std::io::{BufRead, BufReader};
@@ -437,9 +454,19 @@ fn start_render_worker(app: AppHandle, state: State<'_, AppState>) -> Result<Str
                 let _ = app.emit("vcs-worker-error", format!("Failed to spawn worker: {e}"));
                 let mut r = running_flag.lock().unwrap();
                 *r = false;
+                let _ = app.emit("vcs-worker-status", serde_json::json!({ "running": false }));
                 return;
             }
         };
+
+        let stderr_reader = child.stderr.take().map(|stderr| {
+            let app = app.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().flatten() {
+                    let _ = app.emit("vcs-worker-log", format!("[stderr] {line}"));
+                }
+            })
+        });
 
         if let Ok(mut id_lock) = child_id_holder.lock() {
             *id_lock = Some(child.id());
@@ -464,7 +491,22 @@ fn start_render_worker(app: AppHandle, state: State<'_, AppState>) -> Result<Str
             }
         }
 
-        let _ = child.wait();
+        let child_status = child.wait();
+        if let Some(reader) = stderr_reader {
+            let _ = reader.join();
+        }
+        let stop_requested = matches!(running_flag.lock(), Ok(running) if !*running);
+        match child_status {
+            Ok(status) => {
+                if let Some(message) = worker_exit_error(status.success(), status.code(), stop_requested) {
+                    let _ = app.emit("vcs-worker-error", message);
+                }
+            }
+            Err(error) if !stop_requested => {
+                let _ = app.emit("vcs-worker-error", format!("Không thể đọc trạng thái render worker: {error}"));
+            }
+            Err(_) => {}
+        }
         let mut r = running_flag.lock().unwrap();
         *r = false;
         if let Ok(mut id_lock) = child_id_holder.lock() {
@@ -869,6 +911,7 @@ async fn verify_license_key(key: String) -> Result<LicenseStatus, String> {
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct UpdateInfo {
     pub has_update: bool,
+    pub check_status: String,
     pub current_version: String,
     pub latest_version: String,
     pub mandatory: bool,
@@ -893,9 +936,9 @@ fn parse_semver(v: &str) -> (u32, u32, u32) {
 }
 
 #[tauri::command]
-async fn check_app_updates() -> Result<UpdateInfo, String> {
-    tokio::task::spawn_blocking(|| {
-        let current_version = "1.0.0".to_string();
+async fn check_app_updates(app: AppHandle) -> Result<UpdateInfo, String> {
+    let current_version = app.package_info().version.to_string();
+    tokio::task::spawn_blocking(move || {
         let cur_parts = parse_semver(&current_version);
 
         // 1. Try querying version.json from raw GitHub branch
@@ -923,6 +966,7 @@ async fn check_app_updates() -> Result<UpdateInfo, String> {
 
                         return Ok(UpdateInfo {
                             has_update,
+                            check_status: "checked".to_string(),
                             current_version: current_version.clone(),
                             latest_version: v_str.to_string(),
                             mandatory,
@@ -969,6 +1013,7 @@ async fn check_app_updates() -> Result<UpdateInfo, String> {
 
                         return Ok(UpdateInfo {
                             has_update,
+                            check_status: "checked".to_string(),
                             current_version: current_version.clone(),
                             latest_version: tag.trim_start_matches('v').to_string(),
                             mandatory,
@@ -983,9 +1028,10 @@ async fn check_app_updates() -> Result<UpdateInfo, String> {
             }
         }
 
-        // Default: No updates found or repository empty
+        // Network/repository failures cannot be treated as proof that this is the latest version.
         Ok(UpdateInfo {
             has_update: false,
+            check_status: "unavailable".to_string(),
             current_version: current_version.clone(),
             latest_version: current_version,
             mandatory: false,
@@ -1024,7 +1070,11 @@ async fn save_custom_character(
     let ext = Path::new(&filename)
         .extension()
         .and_then(|e| e.to_str())
-        .unwrap_or("png");
+        .unwrap_or("png")
+        .to_ascii_lowercase();
+    if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp") {
+        return Err("Chỉ hỗ trợ ảnh PNG, JPG, JPEG hoặc WebP.".to_string());
+    }
 
     let clean_stem = Path::new(&filename)
         .file_stem()
@@ -1106,14 +1156,54 @@ async fn list_custom_characters() -> Result<Vec<serde_json::Value>, String> {
 
 #[tauri::command]
 async fn delete_custom_character(filename: String) -> Result<bool, String> {
+    if !is_safe_custom_character_filename(&filename) {
+        return Err("Tên ảnh nhân vật không hợp lệ.".to_string());
+    }
     let app_dir = get_app_dir();
-    let file_path = app_dir.join("assets").join("characters").join("custom").join(&filename);
+    let custom_dir = app_dir.join("assets").join("characters").join("custom");
+    let file_path = custom_dir.join(&filename);
+    if file_path.exists() {
+        let canonical_dir = custom_dir.canonicalize().map_err(|error| error.to_string())?;
+        let canonical_file = file_path.canonicalize().map_err(|error| error.to_string())?;
+        if canonical_file.parent() != Some(canonical_dir.as_path()) {
+            return Err("Đường dẫn ảnh nằm ngoài thư mục nhân vật tùy chọn.".to_string());
+        }
+    }
     if file_path.is_file() {
         fs::remove_file(&file_path).map_err(|e| e.to_string())?;
         Ok(true)
     } else {
         Ok(false)
     }
+}
+
+fn is_safe_custom_character_filename(filename: &str) -> bool {
+    if filename.is_empty()
+        || filename == "."
+        || filename == ".."
+        || filename.contains('/')
+        || filename.contains('\\')
+        || filename.chars().any(char::is_control)
+        || !filename.chars().all(|character| character.is_alphanumeric() || matches!(character, '_' | '-' | '.'))
+    {
+        return false;
+    }
+    let extension = Path::new(filename)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp")
+}
+
+fn worker_exit_error(success: bool, code: Option<i32>, stop_requested: bool) -> Option<String> {
+    if success || stop_requested {
+        return None;
+    }
+    Some(match code {
+        Some(code) => format!("Render worker đã dừng với mã lỗi {code}. Xem log để biết chi tiết."),
+        None => "Render worker đã dừng bất thường. Xem log để biết chi tiết.".to_string(),
+    })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1155,6 +1245,26 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_character_delete_accepts_image_basename_only() {
+        assert!(is_safe_custom_character_filename("portrait_20261011.webp"));
+        assert!(is_safe_custom_character_filename("nhân_vật-20261011.PNG"));
+        for unsafe_name in ["../jobs.json", r"..\jobs.json", "nested/portrait.png", "portrait.exe", ".."] {
+            assert!(!is_safe_custom_character_filename(unsafe_name), "accepted {unsafe_name}");
+        }
+    }
+
+    #[test]
+    fn worker_exit_error_reports_failures_but_not_success_or_manual_stop() {
+        assert!(worker_exit_error(true, Some(0), false).is_none());
+        assert!(worker_exit_error(false, Some(1), true).is_none());
+        assert_eq!(
+            worker_exit_error(false, Some(2), false).as_deref(),
+            Some("Render worker đã dừng với mã lỗi 2. Xem log để biết chi tiết.")
+        );
+        assert!(worker_exit_error(false, None, false).is_some());
+    }
 
     #[test]
     fn test_security_auth() {

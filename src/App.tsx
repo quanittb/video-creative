@@ -18,6 +18,7 @@ export const App: React.FC = () => {
   const [jobs, setJobs] = useState<RenderJob[]>([]);
   const [isWorkerRunning, setIsWorkerRunning] = useState<boolean>(false);
   const [workerLogs, setWorkerLogs] = useState<string[]>([]);
+  const [workerError, setWorkerError] = useState<string | null>(null);
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
   // Real render is the production default; preflight must be selected explicitly.
   const [isTestMode, setIsTestMode] = useState<boolean>(false);
@@ -45,6 +46,13 @@ export const App: React.FC = () => {
       setUpdateInfo(up);
     } catch (err) {
       console.error("Lỗi kiểm tra cập nhật:", err);
+      setUpdateInfo({
+        has_update: false,
+        check_status: "unavailable",
+        current_version: "",
+        latest_version: "",
+        mandatory: false,
+      });
     } finally {
       setIsCheckingUpdate(false);
     }
@@ -75,6 +83,7 @@ export const App: React.FC = () => {
     let unlistenLogs: (() => void) | undefined;
     let unlistenStatus: (() => void) | undefined;
     let unlistenEvents: (() => void) | undefined;
+    let unlistenWorkerError: (() => void) | undefined;
 
     (async () => {
       unlistenLogs = await listenToEvent<string>("vcs-worker-log", (line) => {
@@ -92,6 +101,11 @@ export const App: React.FC = () => {
           refreshState();
         }
       });
+
+      unlistenWorkerError = await listenToEvent<string>("vcs-worker-error", (message) => {
+        setWorkerError(message);
+        setIsWorkerRunning(false);
+      });
     })();
 
     // Polling job list every 3s via fast 0ms native Rust file read
@@ -106,19 +120,26 @@ export const App: React.FC = () => {
       if (unlistenLogs) unlistenLogs();
       if (unlistenStatus) unlistenStatus();
       if (unlistenEvents) unlistenEvents();
+      if (unlistenWorkerError) unlistenWorkerError();
     };
   }, [refreshState]);
 
   // Worker controls
   const handleToggleWorker = async () => {
-    if (isWorkerRunning) {
-      await invokeCommand("stop_render_worker");
+    setWorkerError(null);
+    try {
+      if (isWorkerRunning) {
+        await invokeCommand("stop_render_worker");
+        setIsWorkerRunning(false);
+      } else {
+        await invokeCommand("start_render_worker");
+        setIsWorkerRunning(true);
+      }
+      await refreshState();
+    } catch (error: any) {
+      setWorkerError(typeof error === "string" ? error : error?.message || "Không thể khởi chạy render worker.");
       setIsWorkerRunning(false);
-    } else {
-      await invokeCommand("start_render_worker");
-      setIsWorkerRunning(true);
     }
-    refreshState();
   };
 
   const handleCancelJob = async (id: string) => {
@@ -168,6 +189,13 @@ export const App: React.FC = () => {
           onRefresh={refreshState}
           isRefreshing={isRefreshing}
         />
+
+        {workerError && (
+          <div role="alert" className="px-4 py-2 bg-rose-950/70 border-b border-rose-700/60 text-rose-200 text-xs flex items-center justify-between gap-3">
+            <span>{workerError}</span>
+            <button type="button" onClick={() => setWorkerError(null)} aria-label="Đóng thông báo lỗi" className="text-rose-300 hover:text-white">×</button>
+          </div>
+        )}
 
         {/* Dynamic View Tab */}
         <main className="flex-1 flex overflow-hidden">

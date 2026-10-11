@@ -152,7 +152,7 @@ export const SettingsView: React.FC<Props> = ({
       await invokeCommand<LicenseStatus>("verify_license_key", { key: activationKey.trim() });
       setLicenseMessage({
         type: "success",
-        text: "Kích hoạt bản quyền thiết bị thành công! Ứng dụng đã được mở khóa vĩnh viễn.",
+        text: "Đã mở khóa ứng dụng cục bộ. Trạng thái này chưa được xác minh qua máy chủ cấp phép.",
       });
       setActivationKey("");
       await onRefreshLicense();
@@ -225,10 +225,10 @@ export const SettingsView: React.FC<Props> = ({
       <div>
         <h2 className="text-base font-bold text-slate-100 flex items-center gap-2">
           <ShieldCheck className="w-5 h-5 text-studio-accent" />
-          <span>Cài đặt Hệ thống & Bảo mật Bản quyền</span>
+          <span>Cài đặt Hệ thống & Cấp phép thử nghiệm</span>
         </h2>
         <p className="text-xs text-slate-400 mt-1">
-          Quản lý bản quyền kích hoạt máy trạm, cấu hình bộ cập nhật từ xa và tích hợp Google AI.
+          Kiểm tra model cục bộ, tình trạng phát hành phần mềm và tích hợp Google AI. Trạng thái license hiện chỉ là cơ chế mở khóa thử nghiệm local.
         </p>
       </div>
 
@@ -389,9 +389,9 @@ export const SettingsView: React.FC<Props> = ({
                 {isActivated ? <CheckCircle2 className="w-5 h-5" /> : <Lock className="w-5 h-5" />}
               </div>
               <div>
-                <h3 className="text-sm font-bold text-slate-100">Bản quyền & Kích hoạt Thiết bị</h3>
+                <h3 className="text-sm font-bold text-slate-100">Mở khóa thử nghiệm local</h3>
                 <p className="text-xs text-slate-400">
-                  {isActivated ? "Giấy phép vĩnh viễn" : "Bản quyền dùng thử 30 ngày"}
+                  {isActivated ? "Đã mở khóa cục bộ" : "Bản thử nghiệm 30 ngày trên máy này"}
                 </p>
               </div>
             </div>
@@ -403,27 +403,27 @@ export const SettingsView: React.FC<Props> = ({
                   : "bg-amber-950/80 text-amber-300 border-amber-700"
               }`}
             >
-              {isActivated ? "Đã Kích Hoạt Vĩnh Viễn" : `Dùng thử: Còn ${daysRemaining} ngày`}
+              {isActivated ? "Đã mở khóa local" : `Dùng thử: Còn ${daysRemaining} ngày`}
             </span>
           </div>
 
           {/* Device info */}
           <div className="space-y-2.5 text-xs font-mono bg-studio-elevated/60 p-3.5 rounded-lg border border-studio-border/40">
             <div className="flex items-center justify-between">
-              <span className="text-slate-400">Mã Thiết bị (Hardware ID):</span>
+              <span className="text-slate-400">Mã thiết bị tham khảo:</span>
               <span className="text-slate-200 font-semibold truncate max-w-[220px]" title={license?.device_id}>
                 {license?.device_id || "Đang nhận diện..."}
               </span>
             </div>
             <div className="flex items-center justify-between">
-              <span className="text-slate-400">Ngày kích hoạt lần đầu:</span>
+              <span className="text-slate-400">Ngày chạy lần đầu:</span>
               <span className="text-slate-300">{license?.first_run_date || "Hôm nay"}</span>
             </div>
             <div className="flex items-center justify-between">
-              <span className="text-slate-400">Trạng thái bảo vệ:</span>
-              <span className="text-emerald-400 font-semibold flex items-center gap-1">
+              <span className="text-slate-400">Trạng thái:</span>
+              <span className="text-amber-300 font-semibold flex items-center gap-1">
                 <ShieldCheck className="w-3.5 h-3.5" />
-                <span>Mã hóa phần cứng đa tầng</span>
+                <span>Mở khóa local, không có license server</span>
               </span>
             </div>
           </div>
@@ -449,7 +449,7 @@ export const SettingsView: React.FC<Props> = ({
                 />
               </div>
               <p className="text-[11px] text-slate-500 italic mt-0.5">
-                * Nếu không kích hoạt, sau 30 ngày ứng dụng sẽ tự động khóa lại trên thiết bị này.
+                * Đây là bộ đếm thử nghiệm cục bộ, không phải dịch vụ cấp phép có xác thực máy chủ.
               </p>
             </div>
           )}
@@ -459,7 +459,7 @@ export const SettingsView: React.FC<Props> = ({
             <form onSubmit={handleActivate} className="flex flex-col gap-3 pt-2">
               <label className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
                 <Key className="w-3.5 h-3.5 text-studio-cyan" />
-                <span>Mật khẩu kích hoạt bản quyền:</span>
+                <span>Mã mở khóa local:</span>
               </label>
 
               <div className="relative">
@@ -467,7 +467,7 @@ export const SettingsView: React.FC<Props> = ({
                   type={showKeyPassword ? "text" : "password"}
                   value={activationKey}
                   onChange={(e) => setActivationKey(e.target.value)}
-                  placeholder="Nhập mã bảo mật để kích hoạt vĩnh viễn..."
+                  placeholder="Nhập mã mở khóa cục bộ..."
                   className="w-full bg-studio-elevated border border-studio-border focus:border-studio-accent rounded-lg px-3.5 py-2.5 text-xs text-slate-100 placeholder-slate-500 outline-none pr-10 font-mono"
                 />
                 <button
@@ -509,7 +509,7 @@ export const SettingsView: React.FC<Props> = ({
                 ) : (
                   <>
                     <Unlock className="w-4 h-4" />
-                    <span>Kích Hoạt Bản Quyền Vĩnh Viễn</span>
+                    <span>Mở khóa ứng dụng local</span>
                   </>
                 )}
               </button>
@@ -519,10 +519,10 @@ export const SettingsView: React.FC<Props> = ({
               <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
               <div className="text-xs">
                 <p className="text-emerald-200 font-semibold">
-                  Thiết bị này đã được kích hoạt bản quyền vĩnh viễn
+                  Ứng dụng đã được mở khóa cục bộ
                 </p>
                 <p className="text-slate-400 mt-0.5">
-                  Tất cả các tính năng kết xuất AI, batch và giọng đọc đã được mở khóa đầy đủ.
+                  Trạng thái này chỉ nằm trên máy local, chưa được xác minh bởi dịch vụ cấp phép.
                 </p>
               </div>
             </div>
@@ -539,8 +539,8 @@ export const SettingsView: React.FC<Props> = ({
                 <DownloadCloud className="w-5 h-5" />
               </div>
               <div>
-                <h3 className="text-sm font-bold text-slate-100">Cập nhật Phần mềm Từ xa</h3>
-                <p className="text-xs text-slate-400">Kết nối repository quanittb/video-creative-release</p>
+                <h3 className="text-sm font-bold text-slate-100">Kiểm tra bản phát hành</h3>
+                <p className="text-xs text-slate-400">Kiểm tra GitHub Release; tải bản mới qua trình duyệt</p>
               </div>
             </div>
 
@@ -558,11 +558,11 @@ export const SettingsView: React.FC<Props> = ({
           <div className="space-y-2 text-xs font-mono bg-studio-elevated/60 p-3.5 rounded-lg border border-studio-border/40">
             <div className="flex items-center justify-between">
               <span className="text-slate-400">Phiên bản hiện tại:</span>
-              <span className="text-studio-cyan font-bold">v{updateInfo?.current_version || "1.0.0"}</span>
+              <span className="text-studio-cyan font-bold">{updateInfo?.current_version ? `v${updateInfo.current_version}` : "Chưa đọc được"}</span>
             </div>
             <div className="flex items-center justify-between">
               <span className="text-slate-400">Kênh phát hành:</span>
-              <span className="text-slate-200">GitHub Release (Chính thức)</span>
+              <span className="text-slate-200">GitHub Release đã cấu hình</span>
             </div>
           </div>
 
@@ -638,11 +638,25 @@ export const SettingsView: React.FC<Props> = ({
                 )}
               </div>
             </div>
-          ) : (
+          ) : updateInfo?.check_status === "checked" ? (
             <div className="bg-studio-elevated/40 border border-studio-border/50 rounded-lg p-3.5 flex items-center gap-3">
               <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
               <div className="text-xs text-slate-300">
-                <span>Ứng dụng đang ở phiên bản mới nhất (v{updateInfo?.current_version || "1.0.0"}). Không có bản cập nhật nào đang chờ.</span>
+                <span>Ứng dụng đang ở phiên bản mới nhất (v{updateInfo.current_version}). Không có bản cập nhật nào đang chờ.</span>
+              </div>
+            </div>
+          ) : updateInfo?.check_status === "unavailable" ? (
+            <div role="status" className="bg-amber-950/30 border border-amber-700/50 rounded-lg p-3.5 flex items-center gap-3">
+              <AlertTriangle className="w-4 h-4 text-amber-300 shrink-0" />
+              <div className="text-xs text-amber-100">
+                Không thể kiểm tra nguồn phát hành. Chưa xác định được ứng dụng có đang ở phiên bản mới nhất hay không.
+              </div>
+            </div>
+          ) : (
+            <div className="bg-studio-elevated/40 border border-studio-border/50 rounded-lg p-3.5 flex items-center gap-3">
+              <RefreshCw className={`w-4 h-4 text-slate-400 shrink-0 ${isCheckingUpdate ? "animate-spin" : ""}`} />
+              <div className="text-xs text-slate-300">
+                {isCheckingUpdate ? "Đang kiểm tra bản phát hành…" : "Chưa có kết quả kiểm tra. Nhấn “Kiểm tra bản mới” để bắt đầu."}
               </div>
             </div>
           )}

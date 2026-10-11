@@ -89,6 +89,7 @@ export async function invokeCommand<T>(cmd: string, args?: Record<string, any>):
         char: args?.char || "office",
         script: args?.script,
         voice: args?.voice,
+        output: args?.output,
         driving: args?.driving,
         multiplier: args?.multiplier,
         dry_run: args?.dry_run,
@@ -149,6 +150,7 @@ export async function invokeCommand<T>(cmd: string, args?: Record<string, any>):
   if (cmd === "check_app_updates") {
     return {
       has_update: false,
+      check_status: "unavailable",
       current_version: "1.0.0",
       latest_version: "1.0.0",
       mandatory: false,

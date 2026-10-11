@@ -1,8 +1,15 @@
 # 🎬 Video Creative Studio
 
-> Desktop studio for rendering vertical avatar videos with Echo Flash motion generation and MuseTalk lip synchronization.
+Desktop application for creating vertical avatar videos with the **Echo Flash → MuseTalk** pipeline. The Tauri app submits jobs to a local Python bridge; browser preview does not run inference or inspect the host GPU.
 
-The current production flow is available in the Tauri desktop app: choose one of the two front-facing sample characters (or upload a custom image), enter a script to synthesize speech, then render a verified 1080×1920 video. Browser preview cannot inspect the host GPU or run inference. Use **Settings → Model render Echo Flash + MuseTalk** to inspect and manage the local model assets.
+## Customer trial requirements
+
+- Use the desktop app on a machine where the Echo Flash and MuseTalk source checkouts, compatible Python environments/dependencies, FFmpeg, and required model files have already been installed and configured.
+- **Settings → Model render Echo Flash + MuseTalk** checks and manages catalogued model-weight files only. It does not install the core source checkouts, Python environments, or their packages.
+- The current Tauri bundle does not include those runtimes and assets. Building an installer does not by itself produce a self-contained customer-ready installation; prepare the machine/runtime separately before the trial.
+- In Studio, select a front-facing sample character or upload a custom image, enter a script and voice, then render. A successful job writes a verified 1080×1920 MP4 under the configured output directory.
+
+The legacy RunPod and batch workflow below is historical material; it is not used by the desktop Studio render button.
 
 ---
 
@@ -23,6 +30,8 @@ The current production flow is available in the Tauri desktop app: choose one of
 ---
 
 ## 📁 Project Directory Structure
+
+> **Historical reference:** this directory map describes the earlier cloud pipeline, not the current desktop implementation.
 
 ```
 video-creative-studio/
@@ -50,7 +59,7 @@ video-creative-studio/
 
 ## 🚀 How to Run on Cloud (RunPod RTX A4500 / RTX 4000 Ada)
 
-> **Legacy instructions:** this RunPod batch workflow predates the current desktop Echo Flash → MuseTalk flow. It is kept as historical material and does not describe the Studio render button.
+> **Historical workflow:** this RunPod batch workflow predates the current desktop Echo Flash → MuseTalk flow and does not describe the Studio render button.
 
 ### 1. Upload & Setup (1-Click)
 1. Deploy your Pod on RunPod (**RTX A4500 $0.26/h** or **RTX 4000 Ada $0.28/h**).

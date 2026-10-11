@@ -26,6 +26,11 @@ FFPROBE = shutil.which("ffprobe")
 
 
 class VerticalAdsTests(unittest.TestCase):
+    def test_output_name_cli_rejects_paths_and_non_mp4_extensions(self):
+        for output_name in ("../outside.mp4", r"..\outside.mp4", "name.exe"):
+            with self.subTest(output_name=output_name), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                ads.main(["dry-run", "--output-name", output_name])
+
     @staticmethod
     def _mouth_landmarks(aperture_pixels: float = 0.0):
         points = [[0.0, 0.0] for _ in range(68)]

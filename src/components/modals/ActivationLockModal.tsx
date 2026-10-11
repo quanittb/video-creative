@@ -50,7 +50,7 @@ export const ActivationLockModal: React.FC<Props> = ({
           </div>
           <div>
             <span className="text-[11px] font-mono font-bold uppercase tracking-widest text-rose-400 block mb-0.5">
-              Khóa Bảo Mật Thiết Bị
+              Trạng thái dùng thử
             </span>
             <h2 className="text-lg font-bold text-slate-100">
               Thời Gian Dùng Thử 30 Ngày Đã Hết Hạn
@@ -63,12 +63,12 @@ export const ActivationLockModal: React.FC<Props> = ({
           Ứng dụng <strong>Video Creative Studio</strong> đã hết thời hạn dùng thử trên thiết bị này. Tất cả các tính năng kết xuất AI, tạo video và xử lý hàng loạt đã được tạm khóa.
           <br />
           <br />
-          Vui lòng nhập <strong>mật khẩu bảo mật</strong> được cấp để mở khóa và kích hoạt bản quyền vĩnh viễn.
+          Nhập mã mở khóa cục bộ để tiếp tục dùng bản thử nghiệm. Mã được kiểm tra ngay trong ứng dụng; hiện chưa có máy chủ cấp phép hoặc cơ chế xác thực thương mại.
         </p>
 
         {/* Device ID info */}
         <div className="p-3 rounded-lg bg-studio-elevated/70 border border-studio-border/50 text-xs font-mono flex items-center justify-between">
-          <span className="text-slate-400">Mã phần cứng (Device ID):</span>
+          <span className="text-slate-400">Mã thiết bị tham khảo:</span>
           <span className="text-studio-cyan font-bold truncate max-w-[240px]" title={license?.device_id}>
             {license?.device_id || "Đang nhận diện..."}
           </span>
@@ -79,7 +79,7 @@ export const ActivationLockModal: React.FC<Props> = ({
           <div className="flex flex-col gap-1.5">
             <label className="text-xs font-semibold text-slate-200 flex items-center gap-1.5">
               <Key className="w-3.5 h-3.5 text-studio-cyan" />
-              <span>Mật khẩu kích hoạt bản quyền:</span>
+              <span>Mã mở khóa cục bộ:</span>
             </label>
 
             <div className="relative">
@@ -121,14 +121,14 @@ export const ActivationLockModal: React.FC<Props> = ({
             ) : (
               <>
                 <Unlock className="w-4 h-4" />
-                <span>Mở Khóa & Kích Hoạt Vĩnh Viễn</span>
+                <span>Mở khóa ứng dụng</span>
               </>
             )}
           </button>
         </form>
 
         <div className="text-[11px] text-slate-500 text-center font-mono">
-          Bản quyền được gắn cố định với phần cứng thiết bị • Chống gian lận thời gian hệ thống
+          Bản demo local • Không dùng để xác minh hoặc cấp license thương mại
         </div>
       </div>
     </div>
