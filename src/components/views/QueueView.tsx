@@ -57,8 +57,8 @@ export const QueueView: React.FC<Props> = ({
   // Stage steps
   const stages = [
     { id: "audio_tts", label: "1. Tổng hợp Giọng đọc" },
-    { id: "motion_base", label: "2. Echo Flash · chuyển động" },
-    { id: "musetalk", label: "3. Đồng bộ khẩu hình Lip-Sync" },
+    { id: "motion_base", label: "2. Chuyển động nhân vật" },
+    { id: "musetalk", label: "3. Đồng bộ khẩu hình" },
     { id: "verifying", label: "4. Kiểm định Chất lượng" },
   ];
 

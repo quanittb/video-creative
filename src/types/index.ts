@@ -72,6 +72,8 @@ export interface JobParams {
   source?: string;
   script?: string;
   voice?: string;
+  /** User-selected script/delivery guidance; current TTS providers do not expose direct emotion control. */
+  voice_expression?: string;
   driving?: string;
   duration?: number;
   multiplier?: number;

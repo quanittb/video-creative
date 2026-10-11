@@ -91,6 +91,45 @@ class PipelineModelManagerTests(unittest.TestCase):
         self.assertEqual(status["components"]["echo"]["assets_total"], len(echo.ASSETS))
         self.assertEqual(status["hash_verification"], "size_only")
 
+    def test_status_can_scan_one_user_facing_component_group(self):
+        complete_status = {
+            "schema_version": 1,
+            "components": {"echo": {"assets": []}, "musetalk": {"assets": []}},
+            "hash_verification": "sha256",
+        }
+        output = io.StringIO()
+        with mock.patch.object(manager, "build_status", return_value=complete_status) as build_status, contextlib.redirect_stdout(output):
+            result = manager.main(["status", "--json", "--component", "echo", "--verify-sha"])
+        self.assertEqual(result, 0)
+        build_status.assert_called_once_with(
+            None, None, verify_sha=True, component="echo"
+        )
+        printed = json.loads(output.getvalue())
+        self.assertEqual(set(printed["components"]), {"echo"})
+
+    def test_component_status_only_inspects_assets_in_selected_group(self):
+        echo_asset = tiny_asset(component="echo", relative_path="models/test/echo.bin")
+        muse_asset = tiny_asset(component="musetalk")
+        inspected = []
+
+        def asset_status(asset, _root, verify_sha=False):
+            inspected.append(asset.component)
+            return {"status": "missing", "component": asset.component}
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with mock.patch.object(manager, "echo_assets", return_value=(echo_asset,)), \
+                    mock.patch.object(manager, "MUSE_TALK_ASSETS", (muse_asset,)), \
+                    mock.patch.object(manager, "discover_musetalk_paths") as discover, \
+                    mock.patch.object(manager, "_runtime_candidates", return_value=()), \
+                    mock.patch.object(manager, "_source_status", return_value={"status": "missing"}), \
+                    mock.patch.object(manager, "_asset_status", side_effect=asset_status):
+                status = manager.build_status(root / "echo", root / "musetalk", verify_sha=True, component="echo")
+
+        self.assertEqual(set(status["components"]), {"echo"})
+        self.assertEqual(inspected, ["echo"])
+        discover.assert_not_called()
+
     def test_musetalk_source_accepts_module_and_package_face_parser_layouts(self):
         layouts = (
             Path("musetalk/utils/face_parsing.py"),

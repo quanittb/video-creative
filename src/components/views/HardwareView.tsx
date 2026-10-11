@@ -13,28 +13,19 @@ const StatusMark: React.FC<{ ready: boolean }> = ({ ready }) => ready
   : <XCircle className="w-3.5 h-3.5 text-rose-400" />;
 
 const ModelSummary: React.FC<{ title: string; component?: Partial<ManagedModelComponent> }> = ({ title, component }) => {
-  if (!component) {
-    return <div className="p-3 rounded-lg bg-studio-elevated text-xs text-slate-400">{title}: chưa có trạng thái model.</div>;
-  }
-  const assetsReady = component.assets_total !== undefined && component.assets_total > 0 && component.assets_ready === component.assets_total;
-  const sourceStatus = component.source?.status || "chưa kiểm tra";
-  const runtimeStatus = component.runtime?.status || "chưa kiểm tra";
+  const assetsReady = component?.assets_total !== undefined && component.assets_total > 0 && component.assets_ready === component.assets_total;
+  const sourceStatus = component?.source?.status;
+  const runtimeStatus = component?.runtime?.status;
   const sourceReady = sourceStatus === "ready" || sourceStatus === "match";
-  const runtimeReady = runtimeStatus === "ready";
-  const assetsReadyCount = component.assets_ready ?? 0;
-  const assetsTotal = component.assets_total ?? component.assets?.length ?? 0;
+  const ready = !!component && assetsReady && sourceReady && runtimeStatus === "ready";
   return (
-    <div className="p-3 rounded-lg bg-studio-elevated space-y-2">
+    <div className="p-3 rounded-lg bg-studio-elevated">
       <div className="flex items-center justify-between gap-3">
         <span className="text-xs font-semibold text-slate-200">{title}</span>
-        <span className={`text-[10px] font-semibold ${assetsReady ? "text-emerald-400" : "text-amber-300"}`}>
-          Model {assetsReadyCount}/{assetsTotal}{assetsTotal === 0 ? " · chưa kiểm tra" : ""}
+        <span className={`flex items-center gap-1.5 text-[10px] font-semibold ${ready ? "text-emerald-400" : "text-amber-300"}`}>
+          <StatusMark ready={ready} />
+          {ready ? "Sẵn sàng" : "Cần kiểm tra"}
         </span>
-      </div>
-      {component.directory && <p className="text-[10px] text-slate-500 break-all">{component.directory}</p>}
-      <div className="grid grid-cols-2 gap-2 text-[10px] text-slate-400">
-        <span className="flex items-center gap-1.5"><StatusMark ready={sourceReady} /> Source: {sourceStatus}</span>
-        <span className="flex items-center gap-1.5"><StatusMark ready={runtimeReady} /> Python runtime: {runtimeStatus}</span>
       </div>
     </div>
   );
@@ -110,8 +101,8 @@ export const HardwareView: React.FC<Props> = ({ hardware, onRefresh, isRefreshin
 
         <section className="bg-studio-card border border-studio-border rounded-xl p-5 space-y-3">
           <h3 className="text-xs font-bold text-slate-300 uppercase tracking-wide">Core render</h3>
-          <ModelSummary title="Echo Flash · tạo chuyển động" component={engines?.echo} />
-          <ModelSummary title="MuseTalk · đồng bộ khẩu hình" component={engines?.musetalk} />
+          <ModelSummary title="Hệ thống chuyển động" component={engines?.echo} />
+          <ModelSummary title="Đồng bộ khẩu hình" component={engines?.musetalk} />
         </section>
       </div>
     </div>

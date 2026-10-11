@@ -56,6 +56,7 @@ class StudioBridgeTests(unittest.TestCase):
 
     def test_dry_run_calls_pipeline_preflight_and_never_reports_fake_video(self):
         events = []
+        logs = []
         with tempfile.TemporaryDirectory() as temp_dir:
             fake_root = Path(temp_dir)
             scripts = fake_root / "scripts"
@@ -67,11 +68,12 @@ class StudioBridgeTests(unittest.TestCase):
                 patch.object(studio_bridge, "_preflight_audio", return_value=(fake_root / "silent.wav", False)),
                 patch.object(studio_bridge.subprocess, "Popen", side_effect=_CompletedProcess) as popen,
                 patch.object(studio_bridge, "emit_event", side_effect=lambda name, data: events.append((name, data))),
-                patch.object(studio_bridge, "emit_log"),
+                patch.object(studio_bridge, "emit_log", side_effect=logs.append),
                 patch.object(studio_bridge, "emit_progress"),
             ):
                 result = studio_bridge.run_pipeline_job({
                     "id": "dry_run_test", "dry_run": True, "output": "output/campaign-final.mp4",
+                    "voice_expression": "warm_friendly",
                 })
 
         self.assertEqual(result, 0)
@@ -80,6 +82,8 @@ class StudioBridgeTests(unittest.TestCase):
         self.assertIn("scripts/test_vertical_ads.py", command[2])
         self.assertNotIn("test_option_b_avatar.py", command)
         self.assertEqual(command[command.index("--output-name") + 1], "campaign-final.mp4")
+        self.assertTrue(any("Ấm áp, thân thiện" in line and "không nhận điều khiển cảm xúc trực tiếp" in line for line in logs))
+        self.assertTrue(any(data.get("spec", {}).get("voice_expression") == "warm_friendly" for name, data in events if name == "job_started"))
         validated = [data for name, data in events if name == "job_validated"]
         completed = [data for name, data in events if name == "job_completed"]
         self.assertEqual(validated, [{"job_id": "dry_run_test", "status": "validated", "output": None}])

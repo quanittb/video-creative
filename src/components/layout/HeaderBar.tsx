@@ -101,7 +101,7 @@ export const HeaderBar: React.FC<Props> = ({
           title={
             isTestMode
               ? "Chế độ preflight chỉ kiểm tra đầu vào và model, không tạo video."
-              : "Job sẽ chạy pipeline render Echo Flash và MuseTalk trên máy này."
+              : "Job sẽ chạy các bước tạo chuyển động nhân vật và đồng bộ khẩu hình trên máy này."
           }
           className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all border ${
             isTestMode

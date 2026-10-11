@@ -305,21 +305,27 @@ def build_status(
     echo_dir: str | Path | None = None,
     musetalk_dir: str | Path | None = None,
     verify_sha: bool = False,
+    component: str | None = None,
 ) -> dict[str, Any]:
-    discovered_musetalk_root, discovered_musetalk_python = discover_musetalk_paths()
+    if component not in (None, "echo", "musetalk"):
+        raise ValueError(f"Component không hợp lệ: {component}")
+    discovered_musetalk_root, discovered_musetalk_python = (
+        discover_musetalk_paths() if component != "echo" else (None, None)
+    )
     roots = _resolve_roots(echo_dir, musetalk_dir, discovered_musetalk_root)
     components = {}
-    for component in ("echo", "musetalk"):
-        root = roots[component]
-        assets = echo_assets() if component == "echo" else MUSE_TALK_ASSETS
-        discovered_runtime = discovered_musetalk_python if component == "musetalk" else None
+    selected_components = (component,) if component else ("echo", "musetalk")
+    for selected_component in selected_components:
+        root = roots[selected_component]
+        assets = echo_assets() if selected_component == "echo" else MUSE_TALK_ASSETS
+        discovered_runtime = discovered_musetalk_python if selected_component == "musetalk" else None
         runtime = discovered_runtime if discovered_runtime and discovered_runtime.is_file() else next(
-            (path for path in _runtime_candidates(component, root) if path.is_file()), None
+            (path for path in _runtime_candidates(selected_component, root) if path.is_file()), None
         )
         asset_statuses = [_asset_status(asset, root, verify_sha=verify_sha) for asset in assets]
-        components[component] = {
+        components[selected_component] = {
             "directory": str(root),
-            "source": _source_status(component, root),
+            "source": _source_status(selected_component, root),
             "runtime": {
                 "status": "ready" if runtime else "missing",
                 "path": str(runtime.resolve()) if runtime else None,
@@ -518,6 +524,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     status_parser = subparsers.add_parser("status", help="Đọc trạng thái source, runtime và từng model asset")
+    status_parser.add_argument("--component", choices=("echo", "musetalk"), help="Chỉ quét một nhóm model được UI hiển thị")
     status_parser.add_argument("--echo-dir", help="Thư mục EchoMimicV3, mặc định ~/Downloads/EchoMimicV3")
     status_parser.add_argument("--musetalk-dir", help="Thư mục MuseTalk; mặc định dò theo runner/components")
     status_parser.add_argument("--json", action="store_true", help="Chỉ xuất một JSON document machine-readable")
@@ -542,7 +549,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "status":
-            _emit_status(build_status(args.echo_dir, args.musetalk_dir, verify_sha=args.verify_sha), args.json)
+            status = build_status(
+                args.echo_dir,
+                args.musetalk_dir,
+                verify_sha=args.verify_sha,
+                component=args.component,
+            )
+            if args.component:
+                status["components"] = {args.component: status["components"][args.component]}
+            _emit_status(status, args.json)
             return 0
         if args.command == "delete":
             return delete_models(args.component, asset_id=args.asset_id, events=EventWriter(args.jsonl))

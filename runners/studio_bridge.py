@@ -37,6 +37,16 @@ LOCALAPPDATA = Path(os.environ.get("LOCALAPPDATA", r"C:\Users\quant\AppData\Loca
 CACHE_DIR = ROOT_DIR / "data" / "tts_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+VOICE_EXPRESSION_LABELS = {
+    "natural_clear": "Tự nhiên, rõ ràng",
+    "warm_friendly": "Ấm áp, thân thiện",
+    "confident_trustworthy": "Tự tin, đáng tin cậy",
+    "energetic_upbeat": "Năng lượng, tươi vui",
+    "calm_reassuring": "Điềm tĩnh, trấn an",
+    "empathetic": "Đồng cảm, chân thành",
+    "playful_light": "Hóm hỉnh, nhẹ nhàng",
+    "authoritative": "Chuyên nghiệp, điềm đạm",
+}
 
 
 
@@ -617,6 +627,12 @@ def run_pipeline_job(job_spec: Dict[str, Any]) -> int:
     """Run a real vertical Echo Flash + MuseTalk render or a preflight-only dry run."""
     job_id = str(job_spec.get("id") or "job_direct")
     emit_event("job_started", {"job_id": job_id, "spec": job_spec})
+    voice_expression = VOICE_EXPRESSION_LABELS.get(str(job_spec.get("voice_expression") or ""))
+    if voice_expression:
+        emit_log(
+            f"[Voice guidance] {voice_expression}. Đây là metadata/chỉ dẫn cho kịch bản; "
+            "provider TTS hiện tại không nhận điều khiển cảm xúc trực tiếp."
+        )
     emit_progress("preflight", 2.0, "Kiểm tra ảnh, audio và model trước khi chạy core...")
 
     pipeline_script = ROOT_DIR / "scripts" / "test_vertical_ads.py"

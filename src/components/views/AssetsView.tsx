@@ -103,14 +103,14 @@ export const AssetsView: React.FC<Props> = ({ onOpenFolder }) => {
                   </div>
                   <div className="flex items-start gap-2">
                     <span className="text-slate-500 text-[11px] w-24 shrink-0 uppercase tracking-wide">Chuyển động:</span>
-                    <span className="text-slate-300 font-medium">Echo Flash tự tạo chuyển động theo lời thoại.</span>
+                    <span className="text-slate-300 font-medium">Chỉ là mô tả tham khảo; ứng dụng không tự nạp nội dung này vào kịch bản của job.</span>
                   </div>
                 </div>
 
                 {/* Sample Script Snippet */}
                 <div className="bg-studio-elevated/70 rounded-lg p-3 text-xs text-slate-300 italic relative group">
                   <span className="text-[10px] text-slate-500 font-mono not-italic block mb-1 uppercase font-semibold">
-                    Kịch bản mẫu chuẩn phong cách:
+                    Kịch bản mẫu tham khảo (không tự áp dụng):
                   </span>
                   "{st.sampleScript}"
 

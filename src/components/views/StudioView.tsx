@@ -29,6 +29,7 @@ import {
 } from "lucide-react";
 import { HardwareStatus, PresentationStyle } from "../../types";
 import { PRESENTATION_STYLES } from "../../data/presentationStyles";
+import { AD_COPY_STYLES, AD_MARKETS, AD_OBJECTIVES, AdCopyBrief, VOICE_EXPRESSIONS } from "../../data/adCopyOptions";
 import { TTS_VOICES, TtsVoice, getVoiceLanguage, formatLanguageDisplay, getSampleTextForVoice } from "../../data/ttsVoices";
 import { CHARACTER_LIBRARY, CharacterOption } from "../../data/characterLibrary";
 import {
@@ -68,9 +69,18 @@ export const StudioView: React.FC<Props> = ({
   // =========================================================================
   // 2. FORM STATE (TITLE, SCRIPT, RATIO, MOTION)
   // =========================================================================
-  const [title, setTitle] = useState("Bản tin AI Video Studio");
-  const [script, setScript] = useState(currentStyle.sampleScript);
+  const [title, setTitle] = useState("Video quảng cáo mới");
+  const [script, setScript] = useState("");
   const [originalDraftScript, setOriginalDraftScript] = useState("");
+  const [adCopyStyleId, setAdCopyStyleId] = useState("ugc_creator");
+  const [targetMarketId, setTargetMarketId] = useState("VN");
+  const [customMarket, setCustomMarket] = useState("");
+  const [targetAudience, setTargetAudience] = useState("");
+  const [adObjective, setAdObjective] = useState("awareness");
+  const [targetDurationSeconds, setTargetDurationSeconds] = useState(30);
+  const [productFacts, setProductFacts] = useState("");
+  const [callToAction, setCallToAction] = useState("");
+  const [voiceExpressionId, setVoiceExpressionId] = useState("natural_clear");
 
   // =========================================================================
   // 3. GEMINI AI OPTIMIZATION STATE
@@ -187,7 +197,6 @@ export const StudioView: React.FC<Props> = ({
   // =========================================================================
   const handleSelectStyle = (style: PresentationStyle) => {
     setSelectedStyleId(style.id);
-    setTitle(`${style.number}. ${style.name} — ${style.vietnameseTitle}`);
 
     // If style recommends a voice from our catalog, sync it
     if (TTS_VOICES.some((v) => v.id === style.recommendedVoice)) {
@@ -195,18 +204,6 @@ export const StudioView: React.FC<Props> = ({
     }
 
     setSuccessBanner(`Đã áp dụng phong cách: ${style.name} (${style.vietnameseTitle})`);
-    setTimeout(() => setSuccessBanner(null), 2500);
-  };
-
-  const handleApplySampleScript = () => {
-    const langInfo = getVoiceLanguage(selectedVoice);
-    if (langInfo.isEnglish && currentStyle.sampleScriptEn) {
-      setScript(currentStyle.sampleScriptEn);
-      setSuccessBanner(`Đã nạp kịch bản mẫu Tiếng Anh (${selectedVoice.name}) cho phong cách #${currentStyle.number}!`);
-    } else {
-      setScript(currentStyle.sampleScript);
-      setSuccessBanner(`Đã nạp kịch bản mẫu Tiếng Việt (${selectedVoice.name}) cho phong cách #${currentStyle.number}!`);
-    }
     setTimeout(() => setSuccessBanner(null), 2500);
   };
 
@@ -222,12 +219,33 @@ export const StudioView: React.FC<Props> = ({
     setIsOptimizing(true);
     setOriginalDraftScript(script);
     try {
-      const result = await optimizeScriptWithGemini(script, currentStyle.id, selectedVoice, geminiApiKey);
+      const selectedMarket = AD_MARKETS.find((market) => market.id === targetMarketId);
+      const adBrief: AdCopyBrief = {
+        styleId: adCopyStyleId,
+        marketId: targetMarketId,
+        marketName: selectedMarket?.label || targetMarketId,
+        customMarket,
+        audience: targetAudience,
+        objective: adObjective,
+        durationSeconds: targetDurationSeconds,
+        productFacts,
+        callToAction,
+      };
+      const result = await optimizeScriptWithGemini(
+        script,
+        adCopyStyleId,
+        selectedVoice,
+        geminiApiKey,
+        adBrief,
+        voiceExpressionId,
+      );
       setOptimizationResult(result);
       setSuccessBanner(
         result.source === "gemini_api"
-          ? `✨ Gemini AI đã tối ưu kịch bản sang ${langInfo.name} cho giọng "${selectedVoice.name}" thành công!`
-          : `Đã tối ưu kịch bản theo khuôn mẫu ${langInfo.name} (Chế độ Offline).`
+          ? `✨ Gemini đã biên tập lời quảng cáo sang ${langInfo.name} theo brief và giọng đã chọn.`
+          : result.fallbackReason
+            ? "Gemini chưa khả dụng: nội dung được giữ nguyên và chỉ làm sạch khoảng trắng; chưa được AI biên tập hoặc bản địa hóa."
+            : "Chưa cấu hình Gemini: nội dung được giữ nguyên và chỉ làm sạch khoảng trắng; chưa được AI biên tập hoặc bản địa hóa."
       );
       setTimeout(() => setSuccessBanner(null), 4000);
     } catch (err: any) {
@@ -244,6 +262,13 @@ export const StudioView: React.FC<Props> = ({
       setOptimizationResult(null);
       setTimeout(() => setSuccessBanner(null), 2500);
     }
+  };
+
+  const handleApplyRecommendedExpression = () => {
+    if (!optimizationResult) return;
+    setVoiceExpressionId(optimizationResult.recommendedExpressionId);
+    setSuccessBanner(`Đã chọn hướng đọc: ${optimizationResult.recommendedExpressionName}. Hãy chạy Tối ưu quảng cáo lại để viết script theo hướng mới. TTS chưa điều khiển trực tiếp cảm xúc âm thanh.`);
+    setTimeout(() => setSuccessBanner(null), 3500);
   };
 
   const handleRevertToOriginalScript = () => {
@@ -490,6 +515,7 @@ export const StudioView: React.FC<Props> = ({
         voice: selectedVoiceId,
         gender: selectedVoice?.gender,
         voice_provider: selectedVoice?.provider,
+        voice_expression: voiceExpressionId,
         dry_run: isTestMode,
       });
 
@@ -540,7 +566,7 @@ export const StudioView: React.FC<Props> = ({
         <div className="flex items-center justify-between mb-2">
           <div className="flex items-center gap-2 text-xs font-bold text-slate-300 uppercase tracking-wider">
             <Sparkles className="w-4 h-4 text-studio-cyan" />
-            <span>10 Phong cách Thuyết trình & Bối cảnh Studio Tương ứng</span>
+            <span>Phong cách hình ảnh & bối cảnh studio</span>
           </div>
           <div className="flex items-center gap-3">
             <button
@@ -620,28 +646,19 @@ export const StudioView: React.FC<Props> = ({
               </div>
             </div>
 
-            {/* Quick Actions */}
+            {/* Visual style changes the scene, not the script. */}
             <div className="flex flex-col gap-2 shrink-0 border-l border-white/10 pl-4">
               <button
-                onClick={handleApplySampleScript}
-                className="px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 border border-white/10 text-white text-xs font-medium whitespace-nowrap flex items-center gap-1.5 transition-colors"
-                title="Điền kịch bản mẫu phù hợp với phong cách này"
-              >
-                <FileText className="w-3.5 h-3.5 text-studio-cyan" />
-                <span>Nạp kịch bản mẫu</span>
-              </button>
-
-              <button
                 onClick={handleOptimizeWithGemini}
-                disabled={isOptimizing}
+                disabled={isOptimizing || !script.trim()}
                 className="px-3 py-1.5 rounded-lg bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white text-xs font-semibold whitespace-nowrap flex items-center gap-1.5 shadow-md shadow-purple-600/20 transition-all disabled:opacity-50"
-                title={`Tối ưu hóa kịch bản theo ngôn ngữ ${getVoiceLanguage(selectedVoice).name}`}
+                title={`Biên tập lời quảng cáo theo brief bằng ngôn ngữ ${getVoiceLanguage(selectedVoice).name}`}
               >
                 <Sparkles className="w-3.5 h-3.5 text-amber-300 animate-pulse" />
                 <span>
                   {isOptimizing
                     ? "Gemini đang tối ưu..."
-                    : `Tối ưu Gemini (${getVoiceLanguage(selectedVoice).code.toUpperCase()})`}
+                    : geminiApiKey ? `Tối ưu quảng cáo (${getVoiceLanguage(selectedVoice).code.toUpperCase()})` : "Chưa cấu hình Gemini · chỉ chuẩn hóa cục bộ"}
                 </span>
               </button>
             </div>
@@ -662,7 +679,7 @@ export const StudioView: React.FC<Props> = ({
                 Tiêu đề Video & Kịch bản Lời thoại
               </label>
               <span className="text-[11px] text-studio-cyan font-mono bg-studio-card px-2.5 py-0.5 rounded border border-studio-border">
-                Phong cách: #{currentStyle.number} {currentStyle.vietnameseTitle}
+                Hình ảnh: {currentStyle.vietnameseTitle}
               </span>
             </div>
             <input
@@ -673,6 +690,69 @@ export const StudioView: React.FC<Props> = ({
               className="w-full bg-studio-card border border-studio-border focus:border-studio-accent rounded-lg px-3.5 py-2 text-sm text-slate-100 placeholder-slate-500 outline-none transition-colors"
             />
           </div>
+
+          {/* Ad-copy brief is separate from the visual studio-scene preset above. */}
+          <section className="rounded-xl border border-studio-border bg-studio-card p-4 flex flex-col gap-3">
+            <div>
+              <h3 className="text-xs font-bold uppercase tracking-wide text-slate-200">Brief tối ưu kịch bản quảng cáo</h3>
+              <p className="text-[10px] text-slate-500 mt-1">Chọn phong cách viết và thị trường. Những lựa chọn này không tự điền hay thay đổi kịch bản của bạn.</p>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <label className="text-[11px] text-slate-400 flex flex-col gap-1">
+                Phong cách nội dung quảng cáo
+                <select value={adCopyStyleId} onChange={(e) => setAdCopyStyleId(e.target.value)} className="bg-studio-elevated border border-studio-border rounded-lg px-2.5 py-2 text-xs text-slate-100 outline-none">
+                  {AD_COPY_STYLES.map((style) => <option key={style.id} value={style.id}>{style.label}</option>)}
+                </select>
+              </label>
+              <label className="text-[11px] text-slate-400 flex flex-col gap-1">
+                Thị trường / quốc gia
+                <select value={targetMarketId} onChange={(e) => setTargetMarketId(e.target.value)} className="bg-studio-elevated border border-studio-border rounded-lg px-2.5 py-2 text-xs text-slate-100 outline-none">
+                  {AD_MARKETS.map((market) => <option key={market.id} value={market.id}>{market.label}</option>)}
+                </select>
+              </label>
+              {targetMarketId === "other" && (
+                <label className="text-[11px] text-slate-400 flex flex-col gap-1 md:col-span-2">
+                  Ghi rõ quốc gia / khu vực và lưu ý văn hóa (nếu có)
+                  <input value={customMarket} onChange={(e) => setCustomMarket(e.target.value)} placeholder="Ví dụ: Đức, nhóm khách hàng nói tiếng Đức tại Berlin" className="bg-studio-elevated border border-studio-border rounded-lg px-2.5 py-2 text-xs text-slate-100 placeholder-slate-500 outline-none" />
+                </label>
+              )}
+              <label className="text-[11px] text-slate-400 flex flex-col gap-1">
+                Đối tượng khách hàng
+                <input value={targetAudience} onChange={(e) => setTargetAudience(e.target.value)} placeholder="Ví dụ: người mới đi làm, chủ shop nhỏ…" className="bg-studio-elevated border border-studio-border rounded-lg px-2.5 py-2 text-xs text-slate-100 placeholder-slate-500 outline-none" />
+              </label>
+              <label className="text-[11px] text-slate-400 flex flex-col gap-1">
+                Mục tiêu quảng cáo
+                <select value={adObjective} onChange={(e) => setAdObjective(e.target.value)} className="bg-studio-elevated border border-studio-border rounded-lg px-2.5 py-2 text-xs text-slate-100 outline-none">
+                  {AD_OBJECTIVES.map((objective) => <option key={objective.id} value={objective.id}>{objective.label}</option>)}
+                </select>
+              </label>
+              <label className="text-[11px] text-slate-400 flex flex-col gap-1">
+                Thời lượng lời thoại mục tiêu
+                <select value={targetDurationSeconds} onChange={(e) => setTargetDurationSeconds(Number(e.target.value))} className="bg-studio-elevated border border-studio-border rounded-lg px-2.5 py-2 text-xs text-slate-100 outline-none">
+                  {[15, 30, 45, 60].map((seconds) => <option key={seconds} value={seconds}>{seconds} giây (ước tính)</option>)}
+                </select>
+              </label>
+              <label className="text-[11px] text-slate-400 flex flex-col gap-1">
+                CTA mong muốn
+                <input value={callToAction} onChange={(e) => setCallToAction(e.target.value)} placeholder="Ví dụ: Tìm hiểu thêm tại… (để trống nếu chưa có)" className="bg-studio-elevated border border-studio-border rounded-lg px-2.5 py-2 text-xs text-slate-100 placeholder-slate-500 outline-none" />
+              </label>
+              <label className="text-[11px] text-slate-400 flex flex-col gap-1 md:col-span-2">
+                Thông tin sản phẩm / tuyên bố đã xác thực
+                <textarea value={productFacts} onChange={(e) => setProductFacts(e.target.value)} rows={2} placeholder="Ghi chính xác tên, tính năng, giá, điều kiện, bằng chứng được phép dùng. AI sẽ không tự bịa thông tin còn thiếu." className="bg-studio-elevated border border-studio-border rounded-lg px-2.5 py-2 text-xs text-slate-100 placeholder-slate-500 outline-none resize-y" />
+              </label>
+            </div>
+            <div className="border-t border-studio-border/70 pt-3 flex flex-col gap-2">
+              <label className="text-[11px] text-slate-400 flex flex-col gap-1 max-w-md">
+                Biểu cảm / hướng đọc mong muốn
+                <select value={voiceExpressionId} onChange={(e) => setVoiceExpressionId(e.target.value)} className="bg-studio-elevated border border-studio-border rounded-lg px-2.5 py-2 text-xs text-slate-100 outline-none">
+                  {VOICE_EXPRESSIONS.map((expression) => <option key={expression.id} value={expression.id}>{expression.label}</option>)}
+                </select>
+              </label>
+              <p className="text-[10px] text-slate-500 leading-relaxed">
+                Hướng đọc này giúp AI chọn từ ngữ, dấu câu và nhịp câu cho script; lựa chọn được lưu cùng job. TTS hiện chỉ chọn giọng đọc, chưa điều khiển trực tiếp cảm xúc âm thanh nên không đảm bảo giọng phát ra đổi biểu cảm.
+              </p>
+            </div>
+          </section>
 
           {/* Script Textarea & Editor */}
           <div className="flex-1 flex flex-col min-h-[220px]">
@@ -699,15 +779,15 @@ export const StudioView: React.FC<Props> = ({
 
                 <button
                   onClick={handleOptimizeWithGemini}
-                  disabled={isOptimizing}
+                  disabled={isOptimizing || !script.trim()}
                   className="px-2.5 py-1 rounded-md bg-studio-accent/20 hover:bg-studio-accent/30 text-studio-cyan border border-studio-accent/40 text-xs font-medium flex items-center gap-1.5 transition-all disabled:opacity-50"
-                  title={`Tối ưu kịch bản theo ngôn ngữ ${getVoiceLanguage(selectedVoice).name}`}
+                  title={`Biên tập lời quảng cáo theo brief bằng ngôn ngữ ${getVoiceLanguage(selectedVoice).name}`}
                 >
                   <Sparkles className="w-3.5 h-3.5 text-amber-300" />
                   <span>
                     {isOptimizing
                       ? "Đang gửi Gemini..."
-                      : `✨ Tối ưu kịch bản (${getVoiceLanguage(selectedVoice).code.toUpperCase()})`}
+                      : geminiApiKey ? `✨ Tối ưu quảng cáo (${getVoiceLanguage(selectedVoice).code.toUpperCase()})` : "Chưa cấu hình Gemini · chỉ chuẩn hóa cục bộ"}
                   </span>
                 </button>
               </div>
@@ -716,7 +796,7 @@ export const StudioView: React.FC<Props> = ({
             <textarea
               value={script}
               onChange={(e) => setScript(e.target.value)}
-              placeholder="Nhập kịch bản thô của bạn tại đây, sau đó bấm 'Tối ưu kịch bản với Gemini' để AI viết lại chuẩn phong cách đã chọn..."
+              placeholder="Nhập nội dung, ý chính hoặc bản nháp quảng cáo tại đây. Chọn brief rồi yêu cầu Gemini biên tập; để trống thì nút tối ưu sẽ không chạy."
               className="flex-1 w-full bg-studio-card border border-studio-border focus:border-studio-accent rounded-lg p-3.5 text-sm text-slate-100 placeholder-slate-500 resize-none outline-none leading-relaxed transition-colors font-sans"
             />
 
@@ -759,7 +839,7 @@ export const StudioView: React.FC<Props> = ({
                     🌐 {optimizationResult.targetLanguageName} • {optimizationResult.voiceName}
                   </span>
                   <span className="px-1.5 py-0.5 rounded text-[10px] bg-purple-500/20 text-purple-300 font-mono">
-                    {optimizationResult.source === "gemini_api" ? (optimizationResult.modelUsed || "Gemini AI") : "Template Engine"}
+                    {optimizationResult.source === "gemini_api" ? (optimizationResult.modelUsed || "Gemini AI") : "Chỉ chuẩn hóa cục bộ · chưa gọi AI"}
                   </span>
                 </div>
                 <div className="flex items-center gap-2 text-xs">
@@ -772,6 +852,19 @@ export const StudioView: React.FC<Props> = ({
               <p className="text-xs text-slate-200 bg-black/40 border border-white/10 rounded-lg p-3 leading-relaxed whitespace-pre-wrap max-h-36 overflow-y-auto">
                 {optimizationResult.optimizedScript}
               </p>
+
+              <div className="rounded-lg border border-amber-500/20 bg-amber-950/20 p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div>
+                  <p className="text-[11px] font-semibold text-amber-200">{optimizationResult.source === "gemini_api" ? "AI gợi ý" : "Gợi ý cục bộ"} hướng đọc: {optimizationResult.recommendedExpressionName}</p>
+                  <p className="text-[10px] text-slate-400 mt-0.5">{optimizationResult.recommendationRationale}</p>
+                  <p className="text-[10px] text-slate-500 mt-1">Chọn hướng đọc chỉ đổi lựa chọn; chạy Tối ưu quảng cáo lại để viết script theo hướng mới.</p>
+                </div>
+                {optimizationResult.recommendedExpressionId !== voiceExpressionId && (
+                  <button onClick={handleApplyRecommendedExpression} className="shrink-0 px-2.5 py-1.5 rounded-md bg-amber-500/15 border border-amber-500/30 text-amber-200 hover:text-white text-[10px] font-semibold">
+                    Chọn hướng đọc này
+                  </button>
+                )}
+              </div>
 
               <div className="flex items-center justify-end gap-2 pt-1">
                 <button

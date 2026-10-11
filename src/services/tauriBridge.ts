@@ -89,6 +89,7 @@ export async function invokeCommand<T>(cmd: string, args?: Record<string, any>):
         char: args?.char || "office",
         script: args?.script,
         voice: args?.voice,
+        voice_expression: args?.voice_expression,
         output: args?.output,
         driving: args?.driving,
         multiplier: args?.multiplier,

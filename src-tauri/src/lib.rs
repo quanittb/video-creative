@@ -120,6 +120,7 @@ async fn create_job(
     gender: Option<String>,
     voice_provider: Option<String>,
     output: Option<String>,
+    voice_expression: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let mut jobs = read_jobs_json();
     let id = format!("vcs_{}", &uuid::Uuid::new_v4().to_string()[..8]);
@@ -146,6 +147,7 @@ async fn create_job(
             "voice": voice,
             "gender": gender,
             "voice_provider": voice_provider,
+            "voice_expression": voice_expression,
             "driving": driving,
             "multiplier": multiplier.unwrap_or(0.55),
             "output": output,
@@ -276,7 +278,7 @@ fn model_manager_script(app_dir: &Path) -> std::path::PathBuf {
 }
 
 #[tauri::command]
-async fn get_pipeline_model_status(verify_sha: Option<bool>) -> Result<serde_json::Value, String> {
+async fn get_pipeline_model_status(verify_sha: Option<bool>, component: Option<String>) -> Result<serde_json::Value, String> {
     tokio::task::spawn_blocking(move || {
         let app_dir = get_app_dir();
         let python = get_python_exe(&app_dir);
@@ -286,6 +288,12 @@ async fn get_pipeline_model_status(verify_sha: Option<bool>) -> Result<serde_jso
         }
         let mut command = silent_command(&python);
         command.current_dir(&app_dir).arg(script).args(["status", "--json"]);
+        if let Some(component) = component.as_deref() {
+            if !["echo", "musetalk"].contains(&component) {
+                return Err("Nhóm model không hợp lệ.".to_string());
+            }
+            command.args(["--component", component]);
+        }
         if verify_sha.unwrap_or(false) {
             command.arg("--verify-sha");
         }
