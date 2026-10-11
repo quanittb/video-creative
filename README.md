@@ -1,90 +1,30 @@
-# 🎬 Video Creative Studio
+# Video Creative Studio
 
-Desktop application for creating vertical avatar videos with the **Echo Flash → MuseTalk** pipeline. The Tauri app submits jobs to a local Python bridge; browser preview does not run inference or inspect the host GPU.
+Video Creative Studio là ứng dụng desktop tạo video nhân vật dọc. Luồng render hiện tại của Studio dùng **Echo Flash → MuseTalk**: Echo tạo motion base từ ảnh nhân vật và audio, MuseTalk đồng bộ khẩu hình, sau đó core xác minh và xuất MP4 dọc 1080×1920.
 
-## Customer trial requirements
+## Điều kiện trước khi dùng thử
 
-- Use the desktop app on a machine where the Echo Flash and MuseTalk source checkouts, compatible Python environments/dependencies, FFmpeg, and required model files have already been installed and configured.
-- **Settings → Model render Echo Flash + MuseTalk** checks and manages catalogued model-weight files only. It does not install the core source checkouts, Python environments, or their packages.
-- The current Tauri bundle does not include those runtimes and assets. Building an installer does not by itself produce a self-contained customer-ready installation; prepare the machine/runtime separately before the trial.
-- In Studio, select a front-facing sample character or upload a custom image, enter a script and voice, then render. A successful job writes a verified 1080×1920 MP4 under the configured output directory.
+Bản desktop hiện **chưa phải installer tự chứa**. Máy chạy thử phải được chuẩn bị trước các thành phần bên ngoài ứng dụng:
 
-The legacy RunPod and batch workflow below is historical material; it is not used by the desktop Studio render button.
+- Mã nguồn Echo Flash, môi trường Python tương thích và các model cần thiết. Làm theo [hướng dẫn Echo Flash trên Windows](docs/ECHOMIMIC_V3_FLASH_WINDOWS.md).
+- Mã nguồn MuseTalk, môi trường Python/dependency tương thích và model MuseTalk. Các đường dẫn phải được core tìm thấy hoặc cấu hình theo hướng dẫn vận hành.
+- FFmpeg và `ffprobe` sẵn có trong `PATH`.
 
----
+**Settings → Model render Echo Flash + MuseTalk** kiểm tra và quản lý các model weight thuộc catalog của ứng dụng. Phần này không cài mã nguồn Echo/MuseTalk, Python, package, FFmpeg hay driver GPU. Việc build/copy ứng dụng sang máy mới không tự cài những thành phần đó.
 
-## ⚡ Current Render Flow
+## Luồng dùng thử trong ứng dụng
 
-```
-[Script]
-       │
-       ├──► TTS audio (when script is provided)
-       │
-       ▼
-[Echo Flash] ──► Motion base from the chosen character image and speech audio
-       │
-       ▼
-[MuseTalk] ──► Lip synchronization ──► Verified 1080×1920 MP4
-```
+1. Mở bản desktop đã được chuẩn bị trên máy chạy thử. `start_studio.bat` chỉ khởi chạy file `.exe` đã build; nó không cài core hoặc model.
+2. Mở **Cài đặt** và kiểm tra trạng thái các model Echo Flash và MuseTalk. Tải lại hoặc xác minh weight còn thiếu/hỏng nếu cần.
+3. Trong **Studio**, chọn một ảnh mẫu chính diện hoặc tải ảnh nhân vật, nhập kịch bản và chọn giọng.
+4. Chọn render ngay hoặc thêm job vào **Queue**. Với Queue, bấm **Kích hoạt Queue** để chạy tuần tự.
+5. Khi job hoàn tất, mở video từ hàng đợi hoặc thư mục output đã cấu hình; kiểm tra hình, âm thanh và khẩu hình trước khi bàn giao.
 
----
+## Hướng dẫn Windows và kiểm thử core
 
-## 📁 Project Directory Structure
+- [Chuẩn bị máy dùng thử RTX 3060](HUONG_DAN_CHUYEN_MAY_RTX3060.md)
+- [Cài và kiểm tra Echo Flash trên Windows](docs/ECHOMIMIC_V3_FLASH_WINDOWS.md)
+- [Kiểm thử pipeline video dọc Echo Flash + MuseTalk](docs/ECHO_VERTICAL_ADS_WINDOWS.md)
+- [Tái sử dụng motion base và cache cho audio dài](docs/ECHO_FLASH_LOOP_CACHE_WINDOWS.md)
 
-> **Historical reference:** this directory map describes the earlier cloud pipeline, not the current desktop implementation.
-
-```
-video-creative-studio/
-├── config/
-│   └── settings.json               # Video presets, voice mappings, lipsync config
-├── core/
-│   ├── script_director.py          # AI scene splitter & multi-cam director
-│   ├── tts_engine.py               # Multilingual TTS & word timestamp engine
-│   ├── matting_engine.py           # BiRefNet / Rembg alpha background removal
-│   ├── lipsync_engine.py           # MuseTalk & ProStudio-AI adapter
-│   └── video_composer.py           # FFmpeg multi-layer compositor & audio ducking
-├── assets/
-│   ├── characters/                 # Two canonical front-facing samples; custom images are runtime assets
-│   ├── backgrounds/                # Video background loops (studio, office, tech room)
-│   ├── brolls/                     # B-roll footage for cutaways
-│   └── audio/                      # Background music (BGM) & Sound Effects (SFX)
-├── test_samples/
-│   ├── script_spanish_sample.txt   # Sample Spanish TikTok/Reels script
-│   └── script_english_sample.txt   # Sample English script
-├── runpod_setup.sh                 # 1-Click bootstrap script for RunPod cloud deployment
-└── run_pipeline.py                 # Master pipeline execution CLI
-```
-
----
-
-## 🚀 How to Run on Cloud (RunPod RTX A4500 / RTX 4000 Ada)
-
-> **Historical workflow:** this RunPod batch workflow predates the current desktop Echo Flash → MuseTalk flow and does not describe the Studio render button.
-
-### 1. Upload & Setup (1-Click)
-1. Deploy your Pod on RunPod (**RTX A4500 $0.26/h** or **RTX 4000 Ada $0.28/h**).
-2. Ensure **Container Disk is set to 50 GB**.
-3. Open Web Terminal and run:
-   ```bash
-   cd /workspace
-   # Upload or clone video-creative-studio
-   cd video-creative-studio
-   bash runpod_setup.sh
-   ```
-
-### 2. Run the Full Batch Production Suite (~30-45 mins on Pod)
-To automatically process all 6 diverse evaluation projects across 3 character styles and 3 languages:
-```bash
-python batch_run_pod.py
-```
-
-### 3. Evaluation Projects Included in the Batch
-1. **01_nam_spanish_business.mp4**: Nam Doanh Nhân (nhanvatnam) - Tiếng Tây Ban Nha (Alvaro) - Topic: Kinh doanh & FinTech
-2. **02_nam_english_tech.mp4**: Nam Chuyên Gia (nhanvatnam) - Tiếng Anh (Guy) - Topic: AI Tech & Automation
-3. **03_nu_english_productivity.mp4**: Nữ Chuyên Gia (nhanvatnu) - Tiếng Anh (Jenny) - Topic: Productivity & Lifestyle
-4. **04_nu_vietnamese_startup.mp4**: Nữ Khởi Nghiệp (nhanvatnu) - Tiếng Việt (HoaiMy) - Topic: Khởi nghiệp & Video ngắn
-5. **05_hoathinh_english_story.mp4**: Hoạt hình 3D Pixar (hoathinhnu) - Tiếng Anh (Ana) - Topic: Kể chuyện thiếu nhi
-6. **06_hoathinh_spanish_story.mp4**: Hoạt hình 3D Pixar (hoathinhnu) - Tiếng Tây Ban Nha (Dalia) - Topic: Cuentos Infantiles
-
-### 4. Review Results
-* Mở file `output/batch_results/index.html` trên trình duyệt để xem toàn bộ 6 video cạnh nhau, so sánh chất lượng hình ảnh, độ khớp khẩu hình và giọng đọc!
+Các hướng dẫn CLI là công cụ kiểm tra core, không thay cho luồng Studio và không biến ứng dụng thành bộ cài runtime. Thời gian render và chất lượng phụ thuộc GPU, ảnh đầu vào, audio, model và môi trường đã cài.

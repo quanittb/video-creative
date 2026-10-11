@@ -24,7 +24,7 @@ Release chỉ được tuyên bố cho những tổ hợp nhân vật × ngôn n
 
 ## Cập nhật core trên Windows
 
-Đóng pipeline đang chạy rồi cập nhật source dự án có phiên bản mới của `scripts\test_vertical_ads.py`. Không cần cài lại venv, tải model hay xóa cache MuseTalk/Echo. Các thay đổi chỉ nằm trong controller/exporter của dự án; không sửa repo MuseTalk/WanGP hoặc checkpoint.
+Đóng pipeline đang chạy rồi cập nhật source dự án có phiên bản mới của `scripts\test_vertical_ads.py`. Không cần cài lại venv, tải model hay xóa cache MuseTalk/Echo. Các thay đổi chỉ nằm trong controller/exporter của dự án; không sửa source checkout MuseTalk hoặc checkpoint.
 
 ```bat
 cd /d "C:\Users\Admin\Downloads\video-creative-studio\video-creative-studio"

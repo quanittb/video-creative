@@ -1,3 +1,5 @@
+> ⚠️ **TÀI LIỆU LỊCH SỬ — KHÔNG DÙNG ĐỂ VẬN HÀNH HOẶC RENDER HIỆN TẠI.** Tài liệu ghi lại kế hoạch và trạng thái tích hợp tại thời điểm soạn. Những nhận định bên dưới rằng FE chưa nối Echo Flash, runner còn dùng LivePortrait/torso, hoặc WanGP là giao diện độc lập đã lỗi thời và không mô tả sản phẩm hiện nay. Luồng hiện tại là Studio → Echo Flash → MuseTalk qua bridge; xem [README hiện tại](../README.md) và hướng dẫn dùng thử để biết quy trình đang áp dụng.
+
 # Báo cáo triển khai core tạo video vào ứng dụng
 
 **Ngày chốt baseline:** 10/10/2026

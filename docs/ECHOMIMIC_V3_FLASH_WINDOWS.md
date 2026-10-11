@@ -6,7 +6,7 @@ Nhánh này tạo chuyển động mới từ ảnh và audio/prompt bằng Echo
 
 Nếu bạn nhận bộ test dạng ZIP, hãy giải nén các file bên trong vào đúng thư mục gốc dự án `C:\Users\Admin\Downloads\video-creative-studio\video-creative-studio`, giữ nguyên cấu trúc `scripts`, `tests`, `docs` và file `.bat`. ZIP không chứa checkpoint/model weights; lệnh tải model ở bước 2 mới lấy các file đó.
 
-Quy trình dành cho Windows 10 64-bit, Python 3.11 x64, Git, driver NVIDIA hiện có và RTX 3060 12GB. WanGP/MuseTalk đang dùng venv riêng; các lệnh dưới đây không cài package vào hai môi trường đó. Cần FFmpeg và `ffprobe` trong `PATH`; tải một bản Windows từ [trang FFmpeg](https://ffmpeg.org/download.html), giải nén và thêm thư mục `bin` có hai file `.exe` vào `PATH`, rồi mở CMD mới.
+Quy trình dành cho Windows 10 64-bit, Python 3.11 x64, Git, driver NVIDIA hiện có và RTX 3060 12GB. MuseTalk cần source và môi trường riêng; các lệnh Echo bên dưới không cài package vào môi trường MuseTalk. Cần FFmpeg và `ffprobe` trong `PATH`; tải một bản Windows từ [trang FFmpeg](https://ffmpeg.org/download.html), giải nén và thêm thư mục `bin` có hai file `.exe` vào `PATH`, rồi mở CMD mới.
 
 Đảm bảo ổ đĩa còn ít nhất 50GB trống. Bộ weight được cố định theo revision và gồm khoảng **20,77GB** (khoảng 19,34GiB); venv, cache và file staging cần thêm chỗ. Máy có 32GB RAM nên việc nạp weight vẫn khá sát giới hạn khi Windows và ứng dụng khác đang chạy. Trước render, đóng ứng dụng đang chiếm RAM/VRAM. Không cài CUDA Toolkit hoặc driver Linux; PyTorch Windows wheel bên dưới mang runtime CUDA 12.4, dùng driver NVIDIA của Windows.
 
@@ -23,7 +23,7 @@ set "ECHO_PY=C:\Users\Admin\Downloads\EchoMimicV3\venv\Scripts\python.exe"
 "%ECHO_PY%" -m pip install -r "C:\Users\Admin\Downloads\video-creative-studio\video-creative-studio\scripts\echo_flash_requirements.txt"
 ```
 
-Các bản Torch/torchvision/torchaudio phải cùng bộ CUDA 12.4. Bộ requirements riêng chỉ cài dependency mà adapter dùng; không cài toàn bộ `requirements.txt` upstream (có các package nặng không cần cho đường inference này). Không cài FlashAttention hoặc xformers; adapter dùng attention SDPA của PyTorch. Giữ nguyên venv này tách biệt với WanGP/MuseTalk.
+Các bản Torch/torchvision/torchaudio phải cùng bộ CUDA 12.4. Bộ requirements riêng chỉ cài dependency mà adapter dùng; không cài toàn bộ `requirements.txt` upstream (có các package nặng không cần cho đường inference này). Không cài FlashAttention hoặc xformers; adapter dùng attention SDPA của PyTorch. Giữ nguyên venv Echo tách biệt với môi trường MuseTalk.
 
 Nếu thư mục `EchoMimicV3` đã tồn tại, không chạy lại `git clone`; kiểm tra commit bằng:
 
