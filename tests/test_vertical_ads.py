@@ -91,6 +91,123 @@ class VerticalAdsTests(unittest.TestCase):
             "mouth_aperture_ratio": open_gap,
         }))
 
+    def test_face_alignment_disables_compile_and_retries_cuda_backend_failure_on_cpu(self):
+        class BackendCompilerFailed(RuntimeError):
+            pass
+
+        class FakeTorch:
+            class cuda:
+                @staticmethod
+                def is_available():
+                    return True
+
+                @staticmethod
+                def empty_cache():
+                    return None
+
+        class FakeFaceAlignment:
+            class LandmarksType:
+                TWO_D = "2d"
+
+            constructor_calls = []
+
+            class Detector:
+                def __init__(self, device):
+                    self.device = device
+
+                def get_landmarks(self, _image):
+                    if self.device == "cuda":
+                        raise BackendCompilerFailed("Triton backend unavailable")
+                    return ["cpu-landmarks"]
+
+            @classmethod
+            def FaceAlignment(cls, landmark_type, *, device, flip_input, compile=True):
+                cls.constructor_calls.append({
+                    "landmark_type": landmark_type, "device": device,
+                    "flip_input": flip_input, "compile": compile,
+                })
+                return cls.Detector(device)
+
+        detector, error = mouth_masks._face_alignment_detector(FakeTorch, FakeFaceAlignment)
+        self.assertIsNone(error)
+        self.assertTrue(detector.ready)
+        self.assertEqual(detector.get_landmarks(object()), ["cpu-landmarks"])
+        diagnostics = detector.diagnostics()
+        self.assertEqual([call["compile"] for call in FakeFaceAlignment.constructor_calls], [False, False])
+        self.assertEqual(diagnostics["primary_device"], "cuda")
+        self.assertEqual(diagnostics["selected_device"], "cpu")
+        self.assertEqual(diagnostics["fallback_device"], "cpu")
+        self.assertEqual(diagnostics["fallback_attempt_count"], 1)
+        self.assertEqual(diagnostics["fallback_success_count"], 1)
+        self.assertEqual(diagnostics["primary_inference_error"]["type"], "BackendCompilerFailed")
+        self.assertIn("Triton backend unavailable", diagnostics["primary_inference_error"]["message"])
+
+    def test_face_alignment_both_routes_fail_and_error_counts_remain_visible(self):
+        class FakeTorch:
+            class cuda:
+                @staticmethod
+                def is_available():
+                    return True
+
+                @staticmethod
+                def empty_cache():
+                    return None
+
+        class FakeFaceAlignment:
+            class LandmarksType:
+                TWO_D = "2d"
+
+            class Detector:
+                def __init__(self, device):
+                    self.device = device
+
+                def get_landmarks(self, _image):
+                    raise RuntimeError(self.device + " inference unavailable")
+
+            @classmethod
+            def FaceAlignment(cls, landmark_type, *, device, flip_input, compile=True):
+                return cls.Detector(device)
+
+        detector, error = mouth_masks._face_alignment_detector(FakeTorch, FakeFaceAlignment)
+        self.assertIsNone(error)
+        with self.assertRaisesRegex(RuntimeError, "CUDA and CPU routes"):
+            detector.get_landmarks(object())
+        with self.assertRaisesRegex(RuntimeError, "CUDA and CPU routes"):
+            detector.get_landmarks(object())
+        diagnostics = detector.diagnostics()
+        self.assertEqual(diagnostics["selected_device"], "cpu")
+        self.assertEqual(diagnostics["fallback_attempt_count"], 1)
+        self.assertEqual(diagnostics["fallback_success_count"], 0)
+        self.assertEqual(diagnostics["fallback_inference_error"]["message"], "cpu inference unavailable")
+        # Match donor_validation entries built by validate_closed_donor(), where the
+        # detector failure is nested in the measured landmark metric.
+        counters = mouth_masks._landmark_detector_error_counters({
+            17: {
+                "status": "skipped",
+                "closed_mouth_metric": {
+                    "landmark_mouth_aperture": {
+                        "status": "landmark_detector_error:RuntimeError",
+                        "passed": False,
+                    },
+                },
+            },
+            18: {
+                "status": "skipped",
+                "closed_mouth_metric": {
+                    "landmark_mouth_aperture": {"status": "measured", "passed": False},
+                },
+            },
+            19: {
+                "status": "skipped",
+                "reason": "donor_mouth_labels_not_detected",
+                "closed_mouth_metric": None,
+            },
+        })
+        self.assertEqual(counters["candidate_error_count"], 1)
+        self.assertEqual(counters["candidate_errors_by_reason"], {
+            "landmark_detector_error:RuntimeError": 1,
+        })
+
     @unittest.skipUnless(FFMPEG and mouth_masks.cv2 is not None and mouth_masks.np is not None,
                          "OpenCV and FFmpeg are required for final-frame mouth QC")
     def test_final_output_mouth_qc_fails_when_any_pause_frame_is_open_or_uncertain(self):

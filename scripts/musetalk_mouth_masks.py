@@ -10,6 +10,7 @@ helpers remain testable offline without loading Torch or a GPU model.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import math
 import sys
@@ -248,21 +249,207 @@ def detect_mouth_aperture(detector: Any, image_bgr: np.ndarray) -> Tuple[Optiona
     return aperture, reason, mouth_width
 
 
-def _face_alignment_detector(torch: Any) -> Tuple[Optional[Any], Optional[str]]:
-    """Load the already-declared face-alignment dependency only in the MuseTalk process."""
-    try:
-        import face_alignment
+def _exception_details(error: BaseException) -> Dict[str, str]:
+    message = str(error).strip().replace("\r", " ").replace("\n", " ")
+    return {"type": type(error).__name__, "message": message[:800]}
 
-        landmark_types = face_alignment.LandmarksType
+
+class _FaceAlignmentDetectorRouter:
+    """Prefer CUDA eager inference, retry a failed CUDA backend on CPU, and fail closed."""
+
+    def __init__(self, torch: Any, face_alignment: Any, landmark_type: Any) -> None:
+        self.torch = torch
+        self.face_alignment = face_alignment
+        self.landmark_type = landmark_type
+        self.primary_device = "cpu"
+        self.fallback_device: Optional[str] = None
+        self.selected_device: Optional[str] = None
+        self.detector: Optional[Any] = None
+        self.compile_control = "unavailable_assumed_eager"
+        self.initialization_attempts: List[Dict[str, Any]] = []
+        self.primary_inference_error: Optional[Dict[str, str]] = None
+        self.fallback_inference_error: Optional[Dict[str, str]] = None
+        self.fallback_reason: Optional[Dict[str, Any]] = None
+        self.fallback_attempt_count = 0
+        self.fallback_success_count = 0
+        self.terminal_error: Optional[str] = None
+
+        try:
+            if bool(torch.cuda.is_available()):
+                self.primary_device = "cuda"
+                self.fallback_device = "cpu"
+        except Exception as error:
+            self.initialization_attempts.append({
+                "device": "cuda",
+                "status": "unavailable",
+                "error": _exception_details(error),
+            })
+
+        self._initialize(self.primary_device)
+        if self.detector is None and self.primary_device != "cpu":
+            first_error = self.initialization_attempts[-1].get("error")
+            self.fallback_reason = {
+                "stage": "initialization",
+                "from_device": self.primary_device,
+                "to_device": "cpu",
+                "error": first_error,
+            }
+            self.fallback_attempt_count += 1
+            self._initialize("cpu")
+            if self.detector is not None:
+                self.fallback_success_count += 1
+
+    @property
+    def ready(self) -> bool:
+        return self.detector is not None and self.terminal_error is None
+
+    def _initialize(self, device: str) -> None:
+        self.detector = None
+        self.selected_device = None
+        attempt: Dict[str, Any] = {"device": device, "execution_mode": "eager"}
+        try:
+            kwargs: Dict[str, Any] = {"flip_input": False, "device": device}
+            try:
+                parameters = inspect.signature(self.face_alignment.FaceAlignment).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            if "compile" in parameters:
+                # Recent face-alignment defaults to torch.compile=True. Its wrapper can
+                # retain a failed compiled module after logging and claiming eager mode.
+                kwargs["compile"] = False
+                self.compile_control = "disabled"
+                attempt["compile"] = False
+            detector = self.face_alignment.FaceAlignment(self.landmark_type, **kwargs)
+            self.detector = detector
+            self.selected_device = device
+            attempt["status"] = "ready"
+        except Exception as error:
+            attempt["status"] = "failed"
+            attempt["error"] = _exception_details(error)
+        self.initialization_attempts.append(attempt)
+
+    def _empty_cuda_cache(self) -> None:
+        try:
+            if hasattr(self.torch, "cuda") and hasattr(self.torch.cuda, "empty_cache"):
+                self.torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def get_landmarks(self, image: Any) -> Any:
+        if self.terminal_error is not None:
+            raise RuntimeError(self.terminal_error)
+        if self.detector is None:
+            raise RuntimeError(self._diagnostic_error())
+        try:
+            return self.detector.get_landmarks(image)
+        except Exception as primary_error:
+            if self.selected_device != "cuda" or self.fallback_device != "cpu":
+                self.terminal_error = "Landmark detector failed on {} route: {}: {}".format(
+                    self.selected_device or "unknown", type(primary_error).__name__,
+                    _exception_details(primary_error)["message"],
+                )
+                raise RuntimeError(self.terminal_error) from primary_error
+
+            self.primary_inference_error = _exception_details(primary_error)
+            self.fallback_reason = {
+                "stage": "inference",
+                "from_device": "cuda",
+                "to_device": "cpu",
+                "error": self.primary_inference_error,
+            }
+            self.fallback_attempt_count += 1
+            self._empty_cuda_cache()
+            self._initialize("cpu")
+            if self.detector is None:
+                self.terminal_error = self._format_route_failure(
+                    primary_error, self.initialization_attempts[-1].get("error"),
+                )
+                raise RuntimeError(self.terminal_error) from primary_error
+
+            # Do not return to CUDA after a backend failure; all later closure checks
+            # use the working eager CPU route and preserve the same strict thresholds.
+            try:
+                result = self.detector.get_landmarks(image)
+            except Exception as fallback_error:
+                self.fallback_inference_error = _exception_details(fallback_error)
+                self.terminal_error = self._format_route_failure(primary_error, fallback_error)
+                raise RuntimeError(self.terminal_error) from fallback_error
+            self.fallback_success_count += 1
+            return result
+
+    def _format_route_failure(self, primary_error: BaseException, fallback_error: Any) -> str:
+        primary = _exception_details(primary_error)
+        if isinstance(fallback_error, BaseException):
+            fallback = _exception_details(fallback_error)
+        elif isinstance(fallback_error, Mapping):
+            fallback = dict(fallback_error)
+        else:
+            fallback = None
+        return "Landmark detector failed on CUDA and CPU routes (CUDA: {}: {}; CPU: {}).".format(
+            primary["type"], primary["message"],
+            "{}: {}".format(fallback.get("type"), fallback.get("message")) if fallback else "unavailable",
+        )
+
+    def _diagnostic_error(self) -> str:
+        failures = [attempt for attempt in self.initialization_attempts if attempt.get("status") == "failed"]
+        summary = "; ".join(
+            "{}: {}: {}".format(
+                item.get("device"), item.get("error", {}).get("type"),
+                item.get("error", {}).get("message"),
+            ) for item in failures
+        )
+        return "No face-alignment route is available{}".format(": " + summary if summary else ".")
+
+    def diagnostics(self) -> Dict[str, Any]:
+        return {
+            "primary_device": self.primary_device,
+            "selected_device": self.selected_device,
+            "fallback_device": self.fallback_device,
+            "fallback_used": self.fallback_attempt_count > 0,
+            "fallback_attempt_count": self.fallback_attempt_count,
+            "fallback_success_count": self.fallback_success_count,
+            "execution_mode": "eager",
+            "compile_control": self.compile_control,
+            "fallback_reason": self.fallback_reason,
+            "primary_inference_error": self.primary_inference_error,
+            "fallback_inference_error": self.fallback_inference_error,
+            "initialization_attempts": list(self.initialization_attempts),
+            "terminal_error": self.terminal_error,
+        }
+
+
+def _face_alignment_detector(torch: Any, face_alignment_module: Any = None) -> Tuple[Optional[Any], Optional[str]]:
+    """Load face-alignment in eager mode and route CUDA backend failures to CPU."""
+    try:
+        if face_alignment_module is None:
+            import face_alignment as face_alignment_module
+
+        landmark_types = face_alignment_module.LandmarksType
         landmark_type = getattr(landmark_types, "TWO_D", None)
         if landmark_type is None:
             landmark_type = getattr(landmark_types, "_2D", None)
         if landmark_type is None:
             return None, "face_alignment_2d_landmark_type_unavailable"
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        return face_alignment.FaceAlignment(landmark_type, flip_input=False, device=device), None
+        detector = _FaceAlignmentDetectorRouter(torch, face_alignment_module, landmark_type)
+        if not detector.ready:
+            return detector, detector._diagnostic_error()
+        return detector, None
     except Exception as error:
         return None, "face_alignment_init_error:" + type(error).__name__
+
+
+def _landmark_detector_error_counters(donor_validation: Mapping[int, Mapping[str, Any]]) -> Dict[str, Any]:
+    failures: Counter[str] = Counter()
+    for validation in donor_validation.values():
+        metric = validation.get("closed_mouth_metric") or {}
+        landmark_metric = metric.get("landmark_mouth_aperture") or {}
+        status = landmark_metric.get("status")
+        if isinstance(status, str) and status.startswith("landmark_detector_error:"):
+            failures[status] += 1
+    return {
+        "candidate_error_count": sum(failures.values()),
+        "candidate_errors_by_reason": dict(sorted(failures.items())),
+    }
 
 
 def _exact_mapped_donor(
@@ -769,6 +956,11 @@ def run_extraction(
         donor_count = len(donor_cache)
         coverage_status = ("none" if not corrected_frames else
                            "full" if corrected_frames == len(requests) else "partial")
+        detector_diagnostics = (
+            landmark_detector.diagnostics()
+            if landmark_detector is not None and callable(getattr(landmark_detector, "diagnostics", None))
+            else None
+        )
         report = {
             "status": ("applied" if coverage_status == "full" else
                        "partially_applied" if coverage_status == "partial" else
@@ -778,7 +970,11 @@ def run_extraction(
             "parser": "MuseTalk FaceParsing.net raw argmax; labels 11, 12, 13",
             "landmark_aperture_gate": {
                 "detector": "face-alignment 68-point landmarks",
-                "detector_status": landmark_detector_error or ("ready" if landmark_detector is not None else "unavailable"),
+                "detector_status": landmark_detector_error or (
+                    "ready" if landmark_detector is not None and getattr(landmark_detector, "ready", True)
+                    else "unavailable"
+                ),
+                "device_diagnostics": detector_diagnostics,
                 "measurement": "maximum central inner-lip vertical gap projected perpendicular to mouth axis, divided by mouth-corner width",
                 "maximum_closed_threshold": MAX_MOUTH_APERTURE_RATIO,
                 "minimum_mouth_width_pixels": MIN_MOUTH_WIDTH_PIXELS,
@@ -848,6 +1044,7 @@ def run_extraction(
             "mean_mask_pixels": round(float(np.mean(mask_areas)), 2) if mask_areas else 0.0,
             "mean_mask_fraction_of_frame": round(float(np.mean(mask_areas)) / float(width * height), 8) if mask_areas else 0.0,
             "skipped_frame_reasons": dict(sorted(reasons.items())),
+            "landmark_detector_error_counters": _landmark_detector_error_counters(donor_validation),
             "inference_wall_seconds": round(time.perf_counter() - started, 3),
             "experimental_pose_proxy": True,
             "speech_and_nonmask_pixels_policy": (
@@ -1139,6 +1336,10 @@ def validate_output_pause_frames(
             "status": "not_applicable", "method": "face-alignment 68-point inner-lip aperture",
             "requested_frame_count": 0, "passed_frame_count": 0, "failed_frame_indices": [],
             "frame_measurements": [],
+            "landmark_detector_diagnostics": (
+                landmark_detector.diagnostics()
+                if callable(getattr(landmark_detector, "diagnostics", None)) else None
+            ),
         }
     if landmark_detector is None:
         return {
@@ -1146,6 +1347,7 @@ def validate_output_pause_frames(
             "method": "face-alignment 68-point inner-lip aperture",
             "requested_frame_count": len(indices), "passed_frame_count": 0,
             "failed_frame_indices": indices, "frame_measurements": [],
+            "landmark_detector_diagnostics": None,
         }
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
@@ -1182,6 +1384,10 @@ def validate_output_pause_frames(
         "passed_frame_count": len(indices) - len(failed),
         "failed_frame_indices": failed,
         "frame_measurements": measurements,
+        "landmark_detector_diagnostics": (
+            landmark_detector.diagnostics()
+            if callable(getattr(landmark_detector, "diagnostics", None)) else None
+        ),
         "quality_scope": "A pass means each measured pause frame is under the aperture threshold; it is a geometric QC gate, not a guarantee of subjective naturalness across every character, pose, codec, or language.",
     }
 
@@ -1208,10 +1414,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         import torch
         landmark_detector, detector_error = _face_alignment_detector(torch)
         if args.check_landmark_detector:
+            detector_ready = landmark_detector is not None and getattr(landmark_detector, "ready", True)
             report = {
-                "status": "ready" if landmark_detector is not None and detector_error is None else "failed",
+                "status": "ready" if detector_ready and detector_error is None else "failed",
                 "detector": "face-alignment 68-point landmarks",
                 "initialization_error": detector_error,
+                "device_diagnostics": (
+                    landmark_detector.diagnostics()
+                    if landmark_detector is not None and callable(getattr(landmark_detector, "diagnostics", None))
+                    else None
+                ),
                 "quality_scope": "Dependency/model initialization only; no image or video quality is certified.",
             }
             print(json.dumps(report, ensure_ascii=False))
