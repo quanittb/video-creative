@@ -40,8 +40,11 @@ MIN_COLOR_MATCH_LIP_PIXELS = 8
 MIN_COLOR_MATCH_PIXELS_PER_LIP_CLASS = 4
 MAX_LIP_LUMINANCE_SHIFT = 12.0
 MAX_LIP_CHROMA_SHIFT = 18.0
-MAX_SPEECH_POSE_PARSE_CANDIDATES_PER_SOURCE_POSE = 8
-MAX_SPEECH_POSE_LANDMARK_CHECKS_PER_SOURCE_POSE = 2
+# A 5.16s motion loop can produce roughly twelve exact-pose occurrences in a
+# 55s preview. Keep both stages bounded above that observed bank so a pose is
+# not declared donor-free merely because its later candidates were skipped.
+MAX_SPEECH_POSE_PARSE_CANDIDATES_PER_SOURCE_POSE = 16
+MAX_SPEECH_POSE_LANDMARK_CHECKS_PER_SOURCE_POSE = 16
 
 
 def _require_image_dependencies() -> None:
@@ -502,6 +505,76 @@ def _bounded_evenly_spaced_indices(indices: Sequence[int], maximum: int) -> List
     return sorted(set(selected))
 
 
+def _speech_pose_validation_summary(
+    candidates_by_source: Mapping[int, Sequence[int]],
+    donor_validation: Mapping[int, Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Summarize checked and inconclusive exact-pose candidates for diagnostics."""
+    unvalidated: Dict[int, List[int]] = {}
+    parser_checked: Dict[int, List[int]] = {}
+    landmark_checked: Dict[int, List[int]] = {}
+    for source_index, candidate_indices in candidates_by_source.items():
+        unvalidated[source_index] = [
+            index for index in candidate_indices
+            if not donor_validation.get(index, {}).get("validation_complete", False)
+        ]
+        parser_checked[source_index] = [
+            index for index in candidate_indices
+            if donor_validation.get(index, {}).get("parser_checked") is True
+        ]
+        landmark_checked[source_index] = [
+            index for index in candidate_indices
+            if donor_validation.get(index, {}).get("landmark_checked") is True
+        ]
+    unvalidated_count = sum(map(len, unvalidated.values()))
+    return {
+        "unvalidated_candidate_indices_by_source": unvalidated,
+        "parser_checked_candidate_indices_by_source": parser_checked,
+        "landmark_checked_candidate_indices_by_source": landmark_checked,
+        "unvalidated_candidate_count": unvalidated_count,
+        "candidate_validation_exhaustive": unvalidated_count == 0,
+    }
+
+
+def _speech_pose_diagnostic_scope(
+    available_donor_count: int,
+    has_candidate_frames: bool,
+    unvalidated_candidate_count: int,
+) -> str:
+    """Describe whether the speech-pose donor search was complete and useful."""
+    if unvalidated_candidate_count:
+        if available_donor_count:
+            return (
+                "At least one donor passed the strict closure gate and is available, "
+                "but validation is not exhaustive: {} exact-pose candidate frame(s) "
+                "were skipped or could not be conclusively validated."
+            ).format(unvalidated_candidate_count)
+        return (
+            "No checked candidate passed the strict closure gate, but validation is "
+            "not exhaustive: {} exact-pose candidate frame(s) were skipped or could "
+            "not be conclusively validated; requested output frames were not parsed "
+            "because no patch could be prepared."
+        ).format(unvalidated_candidate_count)
+    if not has_candidate_frames:
+        return (
+            "No eligible non-pause donor frame was found for the requested exact "
+            "ping-pong pose(s); requested output frames were not parsed because no "
+            "patch could be prepared."
+        )
+    if not available_donor_count:
+        return (
+            "All eligible donors were validated and none passed the closed-mouth "
+            "gates; requested output frames were not parsed because no patch could "
+            "be prepared."
+        )
+    return (
+        "Per-frame records describe parser and measured-landmark donor eligibility/"
+        "patch preparation; final composited frames require a separate post-FFmpeg "
+        "aperture validation and passing thresholds do not guarantee universal "
+        "subjective quality."
+    )
+
+
 def _derive_speech_pose_candidates(
     requests: Mapping[int, Mapping[str, Any]],
     pause_intervals: Sequence[Mapping[str, Any]],
@@ -783,6 +856,9 @@ def run_extraction(
     donor_frame_count = int(request.get("donor_video_frame_count", output_frame_count))
     pause_intervals = request.get("pause_intervals") or []
     speech_pose_candidates: Dict[int, List[int]] = {}
+    speech_pose_candidates_before_parse_cap: Dict[int, List[int]] = {}
+    speech_pose_parse_cap_skipped: Dict[int, List[int]] = {}
+    speech_pose_landmark_cap_skipped: Dict[int, List[int]] = {}
     if donor_mode == "quiet-source":
         source_candidates = [int(index) for index in request.get("quiet_source_frame_indices", [])]
     elif donor_mode == "silence-conditioned-exact-source":
@@ -799,11 +875,24 @@ def run_extraction(
             raise ValueError(
                 "Speech-pose candidate indices do not match pause exclusions and exact ping-pong source mapping."
             )
+        speech_pose_candidates_before_parse_cap = {
+            source_index: list(candidates)
+            for source_index, candidates in speech_pose_candidates.items()
+        }
         speech_pose_candidates = {
             source_index: _bounded_evenly_spaced_indices(
                 candidates, MAX_SPEECH_POSE_PARSE_CANDIDATES_PER_SOURCE_POSE,
             )
             for source_index, candidates in speech_pose_candidates.items()
+        }
+        speech_pose_parse_cap_skipped = {}
+        for source_index, candidates in speech_pose_candidates_before_parse_cap.items():
+            selected_indices = set(speech_pose_candidates[source_index])
+            speech_pose_parse_cap_skipped[source_index] = [
+                index for index in candidates if index not in selected_indices
+            ]
+        speech_pose_landmark_cap_skipped = {
+            source_index: [] for source_index in speech_pose_candidates_before_parse_cap
         }
         source_candidates = sorted({index for indices in speech_pose_candidates.values() for index in indices})
     if fps < 1 or width < 1 or height < 1 or output_frame_count < 1:
@@ -859,6 +948,18 @@ def run_extraction(
     donor_cache: Dict[int, Tuple[np.ndarray, Dict[str, Any], Dict[str, Any]]] = {}
     donor_validation: Dict[int, Dict[str, Any]] = {}
     reasons: Counter[str] = Counter()
+    if donor_mode == "speech-pose-bank":
+        for source_index, skipped_indices in speech_pose_parse_cap_skipped.items():
+            for donor_index in skipped_indices:
+                donor_validation[donor_index] = {
+                    "status": "skipped",
+                    "reason": "speech_pose_parse_candidate_budget_exceeded",
+                    "source_frame_index": source_index,
+                    "parser_checked": False,
+                    "landmark_checked": False,
+                    "validation_complete": False,
+                }
+                reasons["speech_pose_parse_candidate_budget_exceeded"] += 1
     missing_terminal_reason = (
         _exact_source_donor_missing_reason(
             donor_source_frame_count - 1, donor_source_frame_count, donor_frame_count,
@@ -941,6 +1042,11 @@ def run_extraction(
                 "status": "skipped", "reason": "donor_mouth_not_confidently_closed",
                 "source_frame_index": speech_pose_by_candidate.get(donor_index),
                 "landmark_checked": donor_mode == "speech-pose-bank",
+                "parser_checked": donor_mode == "speech-pose-bank",
+                "validation_complete": (
+                    descriptor.get("mouth_aperture_status") == "measured"
+                    if donor_mode == "speech-pose-bank" else None
+                ),
                 "closed_mouth_metric": closed_metric,
             }
             return
@@ -949,6 +1055,8 @@ def run_extraction(
             "status": "available", "reason": None,
             "source_frame_index": speech_pose_by_candidate.get(donor_index),
             "landmark_checked": donor_mode == "speech-pose-bank",
+            "parser_checked": donor_mode == "speech-pose-bank",
+            "validation_complete": True if donor_mode == "speech-pose-bank" else None,
             "closed_mouth_metric": closed_metric,
         }
 
@@ -961,6 +1069,36 @@ def run_extraction(
             if landmark_detector is not None and callable(getattr(landmark_detector, "diagnostics", None))
             else None
         )
+        speech_pose_validation = {
+            "unvalidated_candidate_indices_by_source": {},
+            "parser_checked_candidate_indices_by_source": {},
+            "landmark_checked_candidate_indices_by_source": {},
+            "unvalidated_candidate_count": 0,
+            "candidate_validation_exhaustive": None,
+        }
+        speech_pose_candidate_validation_exhaustive: Optional[bool] = None
+        if donor_mode == "speech-pose-bank":
+            speech_pose_validation = _speech_pose_validation_summary(
+                speech_pose_candidates_before_parse_cap, donor_validation,
+            )
+            speech_pose_candidate_validation_exhaustive = speech_pose_validation[
+                "candidate_validation_exhaustive"
+            ]
+        unvalidated_speech_pose_count = speech_pose_validation["unvalidated_candidate_count"]
+        if donor_mode == "speech-pose-bank":
+            diagnostic_scope = _speech_pose_diagnostic_scope(
+                donor_count,
+                any(speech_pose_candidates_before_parse_cap.values()),
+                unvalidated_speech_pose_count,
+            )
+        elif not donor_cache:
+            diagnostic_scope = (
+                "All eligible donors were validated and none passed the closed-mouth gates; requested output frames were not parsed because no patch could be prepared."
+            )
+        else:
+            diagnostic_scope = (
+                "Per-frame records describe parser and measured-landmark donor eligibility/patch preparation; final composited frames require a separate post-FFmpeg aperture validation and passing thresholds do not guarantee universal subjective quality."
+            )
         report = {
             "status": ("applied" if coverage_status == "full" else
                        "partially_applied" if coverage_status == "partial" else
@@ -987,7 +1125,7 @@ def run_extraction(
             "donor_validation": (
                 "only the exact ping-pong-mapped frame from the silence-conditioned MuseTalk pass is eligible; parser inner-mouth fraction must be <= {:.2f} and landmark aperture must be <= {:.3f}; no fallback donor is permitted".format(MAX_INNER_MOUTH_FRACTION, MAX_MOUTH_APERTURE_RATIO)
                 if donor_mode == "silence-conditioned-exact-source" else
-                "donors must be non-pause frames from this full-audio MuseTalk output with the same exact ping-pong source pose; at most {} parser-preselected candidates per source pose receive landmark closure checks; no cross-pose fallback; parser inner-mouth fraction must be <= {:.2f} and landmark aperture must be <= {:.3f}".format(MAX_SPEECH_POSE_LANDMARK_CHECKS_PER_SOURCE_POSE, MAX_INNER_MOUTH_FRACTION, MAX_MOUTH_APERTURE_RATIO)
+                "donors must be non-pause frames from this full-audio MuseTalk output with the same exact ping-pong source pose; at most {} candidates per pose are parsed and at most {} parser-passing candidates per pose receive landmark checks; skipped indices are reported and no cross-pose fallback is allowed; parser inner-mouth fraction must be <= {:.2f} and landmark aperture must be <= {:.3f}".format(MAX_SPEECH_POSE_PARSE_CANDIDATES_PER_SOURCE_POSE, MAX_SPEECH_POSE_LANDMARK_CHECKS_PER_SOURCE_POSE, MAX_INNER_MOUTH_FRACTION, MAX_MOUTH_APERTURE_RATIO)
                 if donor_mode == "speech-pose-bank" else
                 "source frame lies fully within verified quiet-source interval; parser inner-mouth fraction must be <= {:.2f} and landmark aperture must be <= {:.3f}".format(MAX_INNER_MOUTH_FRACTION, MAX_MOUTH_APERTURE_RATIO)
             ),
@@ -1006,11 +1144,7 @@ def run_extraction(
                 "transform_anchor": "mouth_bbox_center_with_face_bbox_scale",
             },
             "lip_color_policy": "Bounded per-class median Lab L/a/b match from overlapping parsed upper/lower lip pixels; inner-mouth label 11 is untouched; skip if fewer than {} total or {} per-class matching samples.".format(MIN_COLOR_MATCH_LIP_PIXELS, MIN_COLOR_MATCH_PIXELS_PER_LIP_CLASS),
-            "diagnostic_scope": (
-                "All eligible donors were validated and none passed the closed-mouth gates; requested output frames were not parsed because no patch could be prepared."
-                if not donor_cache else
-                "Per-frame records describe parser and measured-landmark donor eligibility/patch preparation; final composited frames require a separate post-FFmpeg aperture validation and passing thresholds do not guarantee universal subjective quality."
-            ),
+            "diagnostic_scope": diagnostic_scope,
             "frame_time_basis": "timestamp_seconds is the output video frame start: output_frame_index / FPS; frame_interval_seconds gives its full 1/FPS interval.",
             "donor_video_frame_count": donor_frame_count,
             "donor_source_frame_count": donor_source_frame_count,
@@ -1033,9 +1167,15 @@ def run_extraction(
             "exact_neutral_donor_candidate_frames": len(source_candidates) if donor_mode == "silence-conditioned-exact-source" else 0,
             "speech_pose_candidate_frames_tested": len(source_candidates) if donor_mode == "speech-pose-bank" else 0,
             "speech_pose_candidate_indices_by_source": ({str(index): values for index, values in sorted(speech_pose_candidates.items())} if donor_mode == "speech-pose-bank" else None),
-            "speech_pose_candidate_indices_before_bounding": ({str(index): values for index, values in sorted((request.get("speech_pose_candidate_frame_indices_by_source") or {}).items(), key=lambda item: int(item[0]))} if donor_mode == "speech-pose-bank" else None),
+            "speech_pose_candidate_indices_before_bounding": ({str(index): values for index, values in sorted(speech_pose_candidates_before_parse_cap.items())} if donor_mode == "speech-pose-bank" else None),
             "speech_pose_parse_candidate_limit_per_source_pose": MAX_SPEECH_POSE_PARSE_CANDIDATES_PER_SOURCE_POSE if donor_mode == "speech-pose-bank" else None,
             "speech_pose_landmark_check_limit_per_source_pose": MAX_SPEECH_POSE_LANDMARK_CHECKS_PER_SOURCE_POSE if donor_mode == "speech-pose-bank" else None,
+            "speech_pose_candidate_indices_skipped_by_parse_cap_by_source": ({str(index): values for index, values in sorted(speech_pose_parse_cap_skipped.items())} if donor_mode == "speech-pose-bank" else None),
+            "speech_pose_parser_checked_candidate_indices_by_source": ({str(index): values for index, values in sorted(speech_pose_validation["parser_checked_candidate_indices_by_source"].items())} if donor_mode == "speech-pose-bank" else None),
+            "speech_pose_landmark_checked_candidate_indices_by_source": ({str(index): values for index, values in sorted(speech_pose_validation["landmark_checked_candidate_indices_by_source"].items())} if donor_mode == "speech-pose-bank" else None),
+            "speech_pose_candidate_indices_skipped_by_landmark_cap_by_source": ({str(index): values for index, values in sorted(speech_pose_landmark_cap_skipped.items())} if donor_mode == "speech-pose-bank" else None),
+            "speech_pose_unvalidated_candidate_indices_by_source": ({str(index): values for index, values in sorted(speech_pose_validation["unvalidated_candidate_indices_by_source"].items())} if donor_mode == "speech-pose-bank" else None),
+            "speech_pose_candidate_validation_exhaustive": speech_pose_candidate_validation_exhaustive,
             "donor_frame_validation": {str(index): value for index, value in sorted(donor_validation.items())},
             "valid_closed_donor_frames": donor_count,
             "selected_donor_frame_count": sum(selected_donors.values()),
@@ -1067,6 +1207,15 @@ def run_extraction(
             donor_frame = _read_frame(reference_capture, donor_index)
             if donor_frame is None or donor_frame.shape[:2] != (height, width):
                 reasons["quiet_donor_frame_unreadable_or_wrong_size"] += 1
+                if donor_mode == "speech-pose-bank":
+                    donor_validation[donor_index] = {
+                        "status": "skipped",
+                        "reason": "speech_pose_donor_frame_unreadable_or_wrong_size",
+                        "source_frame_index": speech_pose_by_candidate.get(donor_index),
+                        "parser_checked": False,
+                        "landmark_checked": False,
+                        "validation_complete": False,
+                    }
                 continue
             try:
                 labels = _raw_label_map(parser, donor_frame, torch)
@@ -1075,6 +1224,10 @@ def run_extraction(
                 reasons["donor_parser_error:" + type(error).__name__] += 1
                 donor_validation[donor_index] = {
                     "status": "skipped", "reason": "donor_parser_error:" + type(error).__name__,
+                    "source_frame_index": speech_pose_by_candidate.get(donor_index),
+                    "parser_checked": True,
+                    "landmark_checked": False,
+                    "validation_complete": False,
                     "closed_mouth_metric": None,
                 }
                 continue
@@ -1083,6 +1236,9 @@ def run_extraction(
                 donor_validation[donor_index] = {
                     "status": "skipped", "reason": "donor_" + reason,
                     "source_frame_index": speech_pose_by_candidate.get(donor_index),
+                    "parser_checked": True,
+                    "landmark_checked": False,
+                    "validation_complete": True,
                     "closed_mouth_metric": None,
                 }
                 continue
@@ -1095,6 +1251,8 @@ def run_extraction(
                     "source_frame_index": source_index,
                     "inner_mouth_fraction": round(parser_fraction, 6),
                     "maximum_inner_mouth_fraction": MAX_INNER_MOUTH_FRACTION,
+                    "parser_checked": True,
+                    "validation_complete": parser_fraction > MAX_INNER_MOUTH_FRACTION,
                     "landmark_checked": False,
                 }
                 if parser_fraction > MAX_INNER_MOUTH_FRACTION:
@@ -1113,12 +1271,16 @@ def run_extraction(
                     key=lambda item: (float(item[2].get("inner_mouth_fraction", 1.0)), item[0]),
                 )
                 shortlist = parser_candidates[:MAX_SPEECH_POSE_LANDMARK_CHECKS_PER_SOURCE_POSE]
+                skipped_by_landmark_cap = [item[0] for item in parser_candidates[len(shortlist):]]
+                speech_pose_landmark_cap_skipped[source_index] = skipped_by_landmark_cap
                 for donor_index, _, descriptor, _ in parser_candidates[len(shortlist):]:
                     donor_validation[donor_index] = {
                         "status": "skipped",
                         "reason": "speech_pose_landmark_validation_budget_exceeded",
                         "source_frame_index": source_index,
                         "inner_mouth_fraction": round(float(descriptor.get("inner_mouth_fraction", 1.0)), 6),
+                        "parser_checked": True,
+                        "validation_complete": False,
                         "landmark_checked": False,
                     }
                     reasons["speech_pose_landmark_validation_budget_exceeded"] += 1

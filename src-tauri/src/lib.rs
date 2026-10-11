@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -24,7 +24,7 @@ fn silent_command<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
 pub struct AppState {
     pub worker_running: Arc<Mutex<bool>>,
     pub worker_child_id: Arc<Mutex<Option<u32>>>,
-    pub cached_hardware: Arc<Mutex<Option<serde_json::Value>>>,
+    pub model_manager_running: Arc<Mutex<bool>>,
 }
 
 fn get_app_dir() -> std::path::PathBuf {
@@ -120,8 +120,6 @@ async fn create_job(
     let id = format!("vcs_{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let now = chrono::Local::now().to_rfc3339();
 
-    let out_name = format!("output/{}.mp4", &name.replace(['\\', '/', ':', '*', '?', '"', '<', '>', '|'], "_"));
-
     let new_job = serde_json::json!({
         "id": id,
         "name": name,
@@ -145,7 +143,7 @@ async fn create_job(
             "voice_provider": voice_provider,
             "driving": driving,
             "multiplier": multiplier.unwrap_or(0.55),
-            "output": out_name,
+            "output": null,
             "dry_run": dry_run.unwrap_or(false)
         }
     });
@@ -210,26 +208,27 @@ async fn clear_completed_jobs() -> Result<String, String> {
 /// Fast fallback hardware JSON
 fn default_hardware_json(python: &str) -> serde_json::Value {
     serde_json::json!({
+        "available": false,
+        "message": "Không đọc được trạng thái thực từ local bridge.",
         "system": {
-            "platform": "win32",
+            "platform": std::env::consts::OS,
             "python": python,
-            "ffmpeg": true,
-            "ffprobe": true,
+            "ffmpeg": false,
+            "ffprobe": false,
             "gpu": {
-                "available": true,
-                "name": "NVIDIA GeForce GTX 1650 (Máy Dev)",
-                "total_vram_mb": 4096,
-                "free_vram_mb": 3200
+                "available": false,
+                "name": "Chưa phát hiện",
+                "total_vram_mb": 0,
+                "free_vram_mb": 0
             }
         },
         "engines": {
-            "liveportrait": { "installed": true, "path": "LivePortrait" },
-            "musetalk": { "installed": true, "venv_ready": true, "python": null }
+            "musetalk": { "source": { "status": "unknown" }, "runtime": { "status": "unknown" }, "assets_ready": 0, "assets_total": 0 }
         },
         "assets": {
-            "character_count": 38,
+            "character_count": 0,
             "characters": [],
-            "driving_count": 2,
+            "driving_count": 0,
             "driving_templates": []
         }
     })
@@ -237,14 +236,7 @@ fn default_hardware_json(python: &str) -> serde_json::Value {
 
 /// Hardware status with in-memory caching and non-blocking background detection
 #[tauri::command]
-async fn get_hardware_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    // Check cached value first for instant 0ms return
-    if let Ok(lock) = state.cached_hardware.lock() {
-        if let Some(cached) = &*lock {
-            return Ok(cached.clone());
-        }
-    }
-
+async fn get_hardware_status() -> Result<serde_json::Value, String> {
     let app_dir = get_app_dir();
     let python = get_python_exe(&app_dir);
     let python_clone = python.clone();
@@ -260,22 +252,155 @@ async fn get_hardware_status(state: State<'_, AppState>) -> Result<serde_json::V
             .output();
 
         match status_res {
-            Ok(out) => {
+            Ok(out) if out.status.success() => {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 serde_json::from_str::<serde_json::Value>(&stdout)
                     .unwrap_or_else(|_| default_hardware_json(&python_clone))
             }
-            Err(_) => default_hardware_json(&python_clone),
+            Ok(_) | Err(_) => default_hardware_json(&python_clone),
         }
     })
     .await
     .unwrap_or_else(|_| default_hardware_json(&python));
 
-    if let Ok(mut lock) = state.cached_hardware.lock() {
-        *lock = Some(val.clone());
+    Ok(val)
+}
+
+fn model_manager_script(app_dir: &Path) -> std::path::PathBuf {
+    app_dir.join("scripts").join("pipeline_model_manager.py")
+}
+
+#[tauri::command]
+async fn get_pipeline_model_status(verify_sha: Option<bool>) -> Result<serde_json::Value, String> {
+    tokio::task::spawn_blocking(move || {
+        let app_dir = get_app_dir();
+        let python = get_python_exe(&app_dir);
+        let script = model_manager_script(&app_dir);
+        if !script.is_file() {
+            return Err(format!("Không tìm thấy model manager: {}", script.display()));
+        }
+        let mut command = silent_command(&python);
+        command.current_dir(&app_dir).arg(script).args(["status", "--json"]);
+        if verify_sha.unwrap_or(false) {
+            command.arg("--verify-sha");
+        }
+        let output = command.output().map_err(|error| format!("Không chạy được model manager: {error}"))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+        let mut status = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .map_err(|error| format!("Model manager trả JSON không hợp lệ: {error}"))?;
+        status["available"] = serde_json::Value::Bool(true);
+        Ok(status)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn manage_pipeline_models(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    action: String,
+    component: String,
+    asset_id: Option<String>,
+    force: Option<bool>,
+) -> Result<String, String> {
+    if !["download", "delete"].contains(&action.as_str()) {
+        return Err("Thao tác model không hợp lệ.".to_string());
+    }
+    if !["echo", "musetalk", "all"].contains(&component.as_str()) {
+        return Err("Core model không hợp lệ.".to_string());
+    }
+    if let Some(asset) = asset_id.as_deref() {
+        if asset.is_empty() || !asset.chars().all(|character| character.is_ascii_alphanumeric() || character == '_') {
+            return Err("Asset ID không hợp lệ.".to_string());
+        }
     }
 
-    Ok(val)
+    // Lock ordering is shared with start_render_worker so downloads/deletes
+    // cannot overlap a live GPU job or race its startup.
+    {
+        let worker_lock = state.worker_running.lock().map_err(|error| error.to_string())?;
+        if *worker_lock {
+            return Err("Không thể tải hoặc xóa model khi GPU worker đang chạy.".to_string());
+        }
+        let mut manager_lock = state.model_manager_running.lock().map_err(|error| error.to_string())?;
+        if *manager_lock {
+            return Err("Một thao tác model khác đang chạy.".to_string());
+        }
+        *manager_lock = true;
+    }
+
+    let app_for_task = app.clone();
+    let manager_running = state.model_manager_running.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let result = (|| -> Result<String, String> {
+        use std::io::{BufRead, BufReader, Read};
+        use std::process::Stdio;
+        let app_dir = get_app_dir();
+        let python = get_python_exe(&app_dir);
+        let script = model_manager_script(&app_dir);
+        if !script.is_file() {
+            return Err(format!("Không tìm thấy model manager: {}", script.display()));
+        }
+        let mut command = silent_command(&python);
+        command.current_dir(&app_dir).arg(script).arg(&action)
+            .arg("--component").arg(&component).arg("--jsonl")
+            .stdout(Stdio::piped()).stderr(Stdio::piped());
+        if let Some(asset) = asset_id.as_deref() {
+            command.arg("--asset").arg(asset);
+        }
+        if action == "download" {
+            command.arg("--repair");
+            if force.unwrap_or(false) {
+                command.arg("--force");
+            }
+        }
+        let mut child = command.spawn().map_err(|error| format!("Không chạy được model manager: {error}"))?;
+        let stdout = child.stdout.take().ok_or_else(|| "Không đọc được tiến trình model manager.".to_string())?;
+        let stderr = child.stderr.take().ok_or_else(|| "Không đọc được lỗi của model manager.".to_string())?;
+        let stderr_reader = std::thread::spawn(move || {
+            let mut output = String::new();
+            let _ = BufReader::new(stderr).read_to_string(&mut output);
+            output
+        });
+        let mut failure = None;
+        for line in BufReader::new(stdout).lines() {
+            let line = line.map_err(|error| format!("Lỗi đọc tiến trình model manager: {error}"))?;
+            if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
+                if let Some(error) = event.pointer("/failed/0/error").and_then(|value| value.as_str()) {
+                    failure = Some(error.to_string());
+                } else if matches!(event.get("event").and_then(|value| value.as_str()), Some("asset_failed" | "asset_delete_failed")) {
+                    failure = event.get("error").and_then(|value| value.as_str()).map(str::to_owned);
+                }
+                let _ = app_for_task.emit("vcs-model-manager-progress", event);
+            } else if !line.trim().is_empty() {
+                let _ = app_for_task.emit("vcs-model-manager-progress", serde_json::json!({ "event": "log", "message": line }));
+            }
+        }
+        let status = child.wait().map_err(|error| error.to_string())?;
+        let stderr_output = stderr_reader.join().unwrap_or_default();
+        if status.success() {
+            Ok("Thao tác model hoàn tất.".to_string())
+        } else {
+            Err(failure.unwrap_or_else(|| {
+                let detail = stderr_output.trim();
+                if detail.is_empty() {
+                    format!("Model manager kết thúc với mã lỗi {:?}.", status.code())
+                } else {
+                    detail.to_string()
+                }
+            }))
+        }
+        })();
+        if let Ok(mut manager) = manager_running.lock() {
+            *manager = false;
+        }
+        result
+    }).await;
+
+    task.map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -283,6 +408,9 @@ fn start_render_worker(app: AppHandle, state: State<'_, AppState>) -> Result<Str
     let mut is_running = state.worker_running.lock().unwrap();
     if *is_running {
         return Ok("Worker already running".to_string());
+    }
+    if *state.model_manager_running.lock().unwrap() {
+        return Err("Không thể khởi chạy GPU worker trong lúc đang tải hoặc xóa model.".to_string());
     }
 
     *is_running = true;
@@ -916,6 +1044,7 @@ async fn save_custom_character(
 
     let rel_path = format!("assets/characters/custom/{}", unique_filename);
     let web_path = format!("/characters/custom/{}", unique_filename);
+    let preview_path = target_path.to_string_lossy().to_string();
     let display_name = if name.trim().is_empty() {
         clean_stem
     } else {
@@ -928,6 +1057,7 @@ async fn save_custom_character(
         "filename": unique_filename,
         "relPath": rel_path,
         "webPath": web_path,
+        "previewPath": preview_path,
         "category": "custom",
         "desc": "Nhân vật tùy chọn đã lưu vào thư viện cục bộ",
         "gender": "male"
@@ -954,12 +1084,14 @@ async fn list_custom_characters() -> Result<Vec<serde_json::Value>, String> {
                         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(&fname).to_string();
                         let rel_path = format!("assets/characters/custom/{}", fname);
                         let web_path = format!("/characters/custom/{}", fname);
+                        let preview_path = path.to_string_lossy().to_string();
                         result.push(serde_json::json!({
                             "id": format!("custom_{}", fname),
                             "name": stem,
                             "filename": fname,
                             "relPath": rel_path,
                             "webPath": web_path,
+                            "previewPath": preview_path,
                             "category": "custom",
                             "desc": "Nhân vật tùy chọn trong thư viện",
                             "gender": "male"
@@ -987,10 +1119,17 @@ async fn delete_custom_character(filename: String) -> Result<bool, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            let custom_dir = get_app_dir().join("assets").join("characters").join("custom");
+            app.asset_protocol_scope().allow_directory(custom_dir, true)?;
+            Ok(())
+        })
         .plugin(tauri_plugin_shell::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             get_hardware_status,
+            get_pipeline_model_status,
+            manage_pipeline_models,
             list_jobs,
             create_job,
             start_render_worker,

@@ -1,5 +1,7 @@
 # Kế hoạch kiểm thử ảnh thành video trên RTX 3060 12 GB
 
+> **Tài liệu lưu trữ (legacy), không dùng để chạy core hiện tại.** Nội dung bên dưới mô tả pipeline LivePortrait, driving clip và mask office cũ; ảnh `asian_male_office_1080p.png` cùng các ảnh góc đã bị loại khỏi thư viện mẫu. Launcher `test_rtx3060.bat` cũng thuộc luồng thử cũ. Để dùng sản phẩm hiện tại, mở ứng dụng Tauri, kiểm tra model tại **Settings → Model render Echo Flash + MuseTalk**, rồi tạo job trong **Studio**. Các CLI cũ được giữ lại cho mục đích đối chiếu lịch sử; không phải đường dẫn render của app.
+
 Tài liệu này hướng dẫn so sánh pipeline LivePortrait → MuseTalk bằng cùng một ảnh, driving clip và audio. Output B cho thấy chuyển động đầu đã ổn, nhưng vai còn ít chuyển động: optical flow theo dõi feature mặt dịch chuyển khoảng 20 px trên ảnh chiếu, trong khi vùng áo được đo chỉ dịch 1–2 px. Các con số này là chuyển động 2D trên ảnh, không phải quãng đường vật lý của đầu/vai. B1/B2 thử tăng phản ứng vai và cho phép mask tác động nhẹ qua đường viền thân. Chất lượng thực tế còn phụ thuộc ảnh nguồn, driving clip, mô hình và môi trường GPU; các thiết lập dưới đây là điểm bắt đầu để đo trên máy RTX 3060 12 GB, không phải cam kết kết quả.
 
 ## Dữ liệu và giới hạn của lượt thử

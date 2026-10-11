@@ -769,6 +769,167 @@ class VerticalAdsTests(unittest.TestCase):
                     root / "report.json", request_path, parser=object(), torch=object(),
                 )
 
+    def test_speech_pose_validation_summary_marks_capped_candidates_incomplete(self):
+        self.assertEqual(mouth_masks.MAX_SPEECH_POSE_PARSE_CANDIDATES_PER_SOURCE_POSE, 16)
+        self.assertEqual(mouth_masks.MAX_SPEECH_POSE_LANDMARK_CHECKS_PER_SOURCE_POSE, 16)
+        self.assertEqual(
+            mouth_masks._bounded_evenly_spaced_indices(list(range(16)), 16), list(range(16)),
+        )
+
+        candidates = list(range(17))
+        parsed = mouth_masks._bounded_evenly_spaced_indices(
+            candidates, mouth_masks.MAX_SPEECH_POSE_PARSE_CANDIDATES_PER_SOURCE_POSE,
+        )
+        skipped_by_parse_cap = [index for index in candidates if index not in set(parsed)]
+        self.assertEqual(len(parsed), 16)
+        self.assertEqual(len(skipped_by_parse_cap), 1)
+
+        validation = {
+            index: {
+                "parser_checked": True,
+                "landmark_checked": True,
+                "validation_complete": True,
+            }
+            for index in parsed
+        }
+        validation[skipped_by_parse_cap[0]] = {
+            "parser_checked": False,
+            "landmark_checked": False,
+            "validation_complete": False,
+        }
+        summary = mouth_masks._speech_pose_validation_summary({0: candidates}, validation)
+        self.assertEqual(summary["parser_checked_candidate_indices_by_source"][0], parsed)
+        self.assertEqual(summary["landmark_checked_candidate_indices_by_source"][0], parsed)
+        self.assertEqual(summary["unvalidated_candidate_indices_by_source"][0], skipped_by_parse_cap)
+        self.assertEqual(summary["unvalidated_candidate_count"], 1)
+        self.assertFalse(summary["candidate_validation_exhaustive"])
+
+        validation[skipped_by_parse_cap[0]] = {
+            "parser_checked": True,
+            "landmark_checked": True,
+            "validation_complete": True,
+        }
+        complete_summary = mouth_masks._speech_pose_validation_summary({0: candidates}, validation)
+        self.assertTrue(complete_summary["candidate_validation_exhaustive"])
+        self.assertEqual(complete_summary["unvalidated_candidate_count"], 0)
+
+    def test_speech_pose_diagnostic_distinguishes_available_donor_from_no_pass(self):
+        incomplete_with_donor = mouth_masks._speech_pose_diagnostic_scope(
+            available_donor_count=1,
+            has_candidate_frames=True,
+            unvalidated_candidate_count=2,
+        )
+        self.assertIn("At least one donor passed", incomplete_with_donor)
+        self.assertIn("validation is not exhaustive", incomplete_with_donor)
+        self.assertNotIn("No checked candidate passed", incomplete_with_donor)
+
+        incomplete_without_donor = mouth_masks._speech_pose_diagnostic_scope(
+            available_donor_count=0,
+            has_candidate_frames=True,
+            unvalidated_candidate_count=2,
+        )
+        self.assertIn("No checked candidate passed", incomplete_without_donor)
+        self.assertIn("validation is not exhaustive", incomplete_without_donor)
+
+        exhaustive_without_donor = mouth_masks._speech_pose_diagnostic_scope(
+            available_donor_count=0,
+            has_candidate_frames=True,
+            unvalidated_candidate_count=0,
+        )
+        self.assertIn("All eligible donors were validated", exhaustive_without_donor)
+
+    def test_speech_pose_bank_checks_bounded_candidates_and_reports_any_cap_skips(self):
+        if mouth_masks.cv2 is None or mouth_masks.np is None:
+            self.skipTest("OpenCV/NumPy from the MuseTalk runtime are required for donor validation checks")
+        cv2, np = mouth_masks.cv2, mouth_masks.np
+
+        labels = np.zeros((200, 200), dtype=np.uint8)
+        cv2.ellipse(labels, (100, 90), (45, 60), 0, 0, 360, 1, -1)
+        labels[121:125, 87:100] = 12
+        labels[121:125, 100:113] = 13
+
+        def run_case(root: Path, output_frame_count: int):
+            reference_video = root / "reference.avi"
+            rendered_video = root / "rendered.avi"
+            fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+            for path in (reference_video, rendered_video):
+                writer = cv2.VideoWriter(str(path), fourcc, 25.0, (200, 200))
+                self.assertTrue(writer.isOpened(), "OpenCV must open the test AVI writer")
+                try:
+                    for _ in range(output_frame_count):
+                        writer.write(np.full((200, 200, 3), (40, 80, 120), dtype=np.uint8))
+                finally:
+                    writer.release()
+
+            request_path = root / "request.json"
+            request_path.write_text(json.dumps({
+                "fps": 25,
+                "width": 200,
+                "height": 200,
+                "output_frame_count": output_frame_count,
+                "donor_mode": "speech-pose-bank",
+                "donor_video_frame_count": output_frame_count,
+                "donor_source_frame_count": 2,
+                "motion_base_frame_count": 2,
+                "pause_intervals": [{"start_seconds": 0.0, "end_seconds": 0.04}],
+                "speech_pose_candidate_frame_indices_by_source": mouth_masks._derive_speech_pose_candidates(
+                    {0: {"exact_source_frame_index": 0}},
+                    [{"start_seconds": 0.0, "end_seconds": 0.04}],
+                    output_frame_count, 2, 25,
+                ),
+                "output_pause_frames": [{
+                    "output_frame_index": 0,
+                    "exact_source_frame_index": 0,
+                }],
+            }), encoding="utf-8")
+
+            with mock.patch.object(mouth_masks, "_raw_label_map", return_value=labels) as parse:
+                report = mouth_masks.run_extraction(
+                    rendered_video, reference_video,
+                    root / "masks", root / "patches", root / "report.json", request_path,
+                    parser=object(), torch=object(),
+                    landmark_detector=self._static_landmark_detector(aperture_pixels=4.0),
+                )
+            return report, parse.call_count
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # For a two-frame motion base, 25 output frames provide twelve exact-pose
+            # donors for source pose 0 after excluding the paused frame 0.
+            (root / "ten").mkdir()
+            complete, parse_count = run_case(root / "ten", 25)
+            self.assertEqual(parse_count, 12)
+            self.assertEqual(complete["speech_pose_parse_candidate_limit_per_source_pose"], 16)
+            self.assertEqual(complete["speech_pose_landmark_check_limit_per_source_pose"], 16)
+            self.assertEqual(complete["speech_pose_parser_checked_candidate_indices_by_source"]["0"],
+                             complete["speech_pose_candidate_indices_before_bounding"]["0"])
+            self.assertEqual(complete["speech_pose_landmark_checked_candidate_indices_by_source"]["0"],
+                             complete["speech_pose_candidate_indices_before_bounding"]["0"])
+            self.assertEqual(complete["speech_pose_candidate_indices_skipped_by_parse_cap_by_source"]["0"], [])
+            self.assertEqual(complete["speech_pose_candidate_indices_skipped_by_landmark_cap_by_source"]["0"], [])
+            self.assertTrue(complete["speech_pose_candidate_validation_exhaustive"])
+            self.assertIn("All eligible donors were validated", complete["diagnostic_scope"])
+
+            # More than sixteen exact-pose candidates are safely bounded by the hard
+            # per-pose cap and must be named as unvalidated in the report.
+            (root / "eleven").mkdir()
+            capped, parse_count = run_case(root / "eleven", 36)
+            self.assertEqual(parse_count, 16)
+            self.assertEqual(len(capped["speech_pose_candidate_indices_before_bounding"]["0"]), 17)
+            self.assertEqual(len(capped["speech_pose_parser_checked_candidate_indices_by_source"]["0"]), 16)
+            self.assertEqual(len(capped["speech_pose_landmark_checked_candidate_indices_by_source"]["0"]), 16)
+            skipped_parse = capped["speech_pose_candidate_indices_skipped_by_parse_cap_by_source"]["0"]
+            self.assertEqual(len(skipped_parse), 1)
+            self.assertEqual(capped["speech_pose_candidate_indices_skipped_by_landmark_cap_by_source"]["0"], [])
+            self.assertEqual(capped["speech_pose_unvalidated_candidate_indices_by_source"]["0"], skipped_parse)
+            self.assertFalse(capped["speech_pose_candidate_validation_exhaustive"])
+            self.assertIn("validation is not exhaustive", capped["diagnostic_scope"])
+            self.assertNotIn("All eligible donors were validated", capped["diagnostic_scope"])
+            skipped_validation = capped["donor_frame_validation"][str(skipped_parse[0])]
+            self.assertEqual(skipped_validation["reason"], "speech_pose_parse_candidate_budget_exceeded")
+            self.assertFalse(skipped_validation["parser_checked"])
+            self.assertFalse(skipped_validation["landmark_checked"])
+
     def test_mouth_only_color_match_reduces_lip_seam_without_touching_inner_mouth(self):
         if mouth_masks.cv2 is None or mouth_masks.np is None:
             self.skipTest("OpenCV/NumPy from the MuseTalk runtime are required for lip-color checks")

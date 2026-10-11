@@ -27,7 +27,6 @@ interface BatchDraftItem {
   char: string;
   script: string;
   voice: string;
-  multiplier: number;
   output: string;
 }
 
@@ -36,11 +35,10 @@ export const BatchView: React.FC<Props> = ({ onBatchQueued, invokeCommand, isTes
     {
       id: "draft_1",
       name: "Tập 1 - Tin tức Trí tuệ nhân tạo",
-      char: "office",
+      char: "male",
       script:
         "Xin chào quý vị, đây là bản tin tập 1 cập nhật các phát triển vượt bậc của mô hình thị giác máy tính và tổng hợp giọng nói đa vùng miền.",
       voice: "vi-VN-NamMinhNeural",
-      multiplier: 0.55,
       output: "tap_1_tin_tuc_ai.mp4",
     },
     {
@@ -48,25 +46,14 @@ export const BatchView: React.FC<Props> = ({ onBatchQueued, invokeCommand, isTes
       name: "Tập 2 - Giới thiệu Mô hình 3D",
       char: "female",
       script:
-        "Chào mừng các bạn đến với tập 2. Hôm nay chúng ta sẽ tìm hiểu về cách kết hợp chuyển động chân dung và đồng bộ khẩu hình trên GPU RTX 3060.",
+        "Chào mừng các bạn đến với tập 2. Hôm nay chúng ta sẽ tìm hiểu về cách kết hợp chuyển động chân dung và đồng bộ khẩu hình bằng AI.",
       voice: "vi-VN-HoaiMyNeural",
-      multiplier: 0.50,
       output: "tap_2_mo_hinh_3d.mp4",
-    },
-    {
-      id: "draft_3",
-      name: "Tập 3 - Đào tạo Tự động hóa",
-      char: "pixar",
-      script:
-        "Tập 3 sẽ hướng dẫn quy trình tự động hóa hàng loạt video bài giảng chất lượng 1080p bằng manifest CSV mà không cần can thiệp thủ công.",
-      voice: "vi-VN-NamMinhNeural",
-      multiplier: 0.60,
-      output: "tap_3_dao_tao_batch.mp4",
     },
   ]);
 
   const [selectedIds, setSelectedIds] = useState<Set<string>>(
-    new Set(["draft_1", "draft_2", "draft_3"])
+    new Set(["draft_1", "draft_2"])
   );
   const [manifestPath, setManifestPath] = useState("");
   const [isImporting, setIsImporting] = useState(false);
@@ -94,10 +81,9 @@ export const BatchView: React.FC<Props> = ({ onBatchQueued, invokeCommand, isTes
     const newItem: BatchDraftItem = {
       id: `draft_${Date.now()}`,
       name: `Mục batch ${idx}`,
-      char: "office",
+      char: "male",
       script: "Nhập nội dung kịch bản cho mục này...",
       voice: "vi-VN-NamMinhNeural",
-      multiplier: 0.55,
       output: `video_batch_${idx}.mp4`,
     };
     setItems([...items, newItem]);
@@ -130,7 +116,6 @@ export const BatchView: React.FC<Props> = ({ onBatchQueued, invokeCommand, isTes
           voice: item.voice,
           gender: vObj?.gender,
           voice_provider: vObj?.provider,
-          multiplier: item.multiplier,
           dry_run: isTestMode,
         });
       }
@@ -169,10 +154,9 @@ export const BatchView: React.FC<Props> = ({ onBatchQueued, invokeCommand, isTes
   // Sample CSV / JSON downloads
   const downloadSampleCsv = () => {
     const csvContent =
-      "name,character,voice,multiplier,script,output_name\n" +
-      '"Tin 1","office","vi-VN-NamMinhNeural",0.55,"Xin chào các bạn, đây là video batch thứ nhất.","tin_1.mp4"\n' +
-      '"Tin 2","female","vi-VN-HoaiMyNeural",0.50,"Bản tin công nghệ thế giới hôm nay có nhiều điểm mới.","tin_2.mp4"\n' +
-      '"Tin 3","pixar","vi-VN-NamMinhNeural",0.60,"Bài giảng 3D chuyển động tự nhiên với AI.","tin_3.mp4"\n';
+      "name,character,voice,script,output_name\n" +
+      '"Tin 1","male","vi-VN-NamMinhNeural","Xin chào các bạn, đây là video batch thứ nhất.","tin_1.mp4"\n' +
+      '"Tin 2","female","vi-VN-HoaiMyNeural","Bản tin công nghệ thế giới hôm nay có nhiều điểm mới.","tin_2.mp4"\n';
 
     const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
@@ -276,7 +260,6 @@ export const BatchView: React.FC<Props> = ({ onBatchQueued, invokeCommand, isTes
                 <th className="p-3.5 w-48">Tên video</th>
                 <th className="p-3.5 w-32">Nhân vật</th>
                 <th className="p-3.5 w-36">Giọng đọc</th>
-                <th className="p-3.5 w-24">Biên độ</th>
                 <th className="p-3.5">Kịch bản lời thoại</th>
                 <th className="p-3.5 w-40">File đầu ra</th>
               </tr>
@@ -284,7 +267,7 @@ export const BatchView: React.FC<Props> = ({ onBatchQueued, invokeCommand, isTes
             <tbody className="divide-y divide-studio-border/60">
               {items.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="p-12 text-center text-slate-500">
+                  <td colSpan={6} className="p-12 text-center text-slate-500">
                     Chưa có mục batch nào. Hãy thêm hàng mới hoặc nạp file CSV/JSON manifest.
                   </td>
                 </tr>
@@ -326,9 +309,8 @@ export const BatchView: React.FC<Props> = ({ onBatchQueued, invokeCommand, isTes
                           }}
                           className="w-full bg-studio-elevated border border-studio-border rounded px-2 py-1 text-slate-300 outline-none"
                         >
-                          <option value="office">Asian Male (Office)</option>
-                          <option value="female">Vietnamese Female</option>
-                          <option value="pixar">3D Pixar Stylized</option>
+                          <option value="male">Nhân vật nam</option>
+                          <option value="female">Nhân vật nữ</option>
                         </select>
                       </td>
                       <td className="p-3.5">
@@ -345,20 +327,6 @@ export const BatchView: React.FC<Props> = ({ onBatchQueued, invokeCommand, isTes
                           <option value="en-US-GuyNeural">Guy (US)</option>
                           <option value="en-US-JennyNeural">Jenny (US)</option>
                         </select>
-                      </td>
-                      <td className="p-3.5 font-mono text-studio-cyan">
-                        <input
-                          type="number"
-                          step="0.05"
-                          min="0.30"
-                          max="0.85"
-                          value={item.multiplier}
-                          onChange={(e) => {
-                            const val = parseFloat(e.target.value);
-                            setItems(items.map((x) => (x.id === item.id ? { ...x, multiplier: val } : x)));
-                          }}
-                          className="w-16 bg-studio-elevated border border-studio-border rounded px-1.5 py-1 text-slate-300 outline-none font-mono"
-                        />
                       </td>
                       <td className="p-3.5">
                         <input
@@ -402,7 +370,7 @@ export const BatchView: React.FC<Props> = ({ onBatchQueued, invokeCommand, isTes
           </div>
           <div className="flex items-center gap-2 text-slate-500">
             <Clock className="w-3.5 h-3.5" />
-            <span>Chế độ GPU: Tuần tự 1-Job (Chống tràn 12GB VRAM)</span>
+            <span>Render tuần tự để giới hạn mức sử dụng GPU.</span>
           </div>
         </div>
       </div>

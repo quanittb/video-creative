@@ -46,6 +46,7 @@ runners/bundled-models/
 
 # Local runtime data & caches
 data/tts_cache/
+data/outputs/preview-*.wav
 output/
 temp/
 

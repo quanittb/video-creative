@@ -2,11 +2,9 @@
   {
     "name": "Bản tin AI Tự Động #01",
     "params": {
-      "char": "office",
+      "char": "male",
       "voice": "vi-VN-NamMinhNeural",
-      "multiplier": 0.55,
-      "script": "Video Creative Studio xin kính chào quý vị và các bạn. Hệ thống đang vận hành xử lý hàng loạt theo chuẩn batch automation.",
-      "output": "D:\\rustProject\\video-creative-studio\\output\\batch_demo_01.mp4"
+      "script": "Video Creative Studio xin kính chào quý vị và các bạn. Hệ thống đang vận hành xử lý hàng loạt theo chuẩn batch automation."
     }
   },
   {
@@ -14,9 +12,7 @@
     "params": {
       "char": "female",
       "voice": "vi-VN-HoaiMyNeural",
-      "multiplier": 0.50,
-      "script": "Cảm ơn quý vị đã đồng hành cùng chúng tôi trong bản tin tự động hóa quy trình render video cục bộ.",
-      "output": "D:\\rustProject\\video-creative-studio\\output\\batch_demo_02.mp4"
+      "script": "Cảm ơn quý vị đã đồng hành cùng chúng tôi trong bản tin tự động hóa quy trình render video cục bộ."
     }
   }
 ]

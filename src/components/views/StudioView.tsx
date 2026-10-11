@@ -2,7 +2,6 @@ import React, { useState, useMemo, useRef } from "react";
 import {
   Sparkles,
   Volume2,
-  Sliders,
   Layers,
   Play,
   CheckCircle,
@@ -23,7 +22,6 @@ import {
   Settings,
   RefreshCw,
   Eye,
-  SlidersHorizontal,
   Star,
   Globe,
   Loader2,
@@ -40,6 +38,7 @@ import {
   setStoredGeminiKey,
 } from "../../services/geminiOptimizer";
 import { VoiceLibraryModal } from "../modals/VoiceLibraryModal";
+import { getLocalFilePreviewSrc, isTauriEnv } from "../../services/tauriBridge";
 
 interface Props {
   hardware: HardwareStatus | null;
@@ -72,16 +71,6 @@ export const StudioView: React.FC<Props> = ({
   const [title, setTitle] = useState("Bản tin AI Video Studio");
   const [script, setScript] = useState(currentStyle.sampleScript);
   const [originalDraftScript, setOriginalDraftScript] = useState("");
-  const [aspectRatio, setAspectRatio] = useState<"16:9" | "9:16" | "1:1">(currentStyle.defaultAspectRatio);
-  const [multiplier, setMultiplier] = useState(currentStyle.recommendedMultiplier);
-  const [selectedDriving, setSelectedDriving] = useState("reference_head_driving.mp4");
-  const [drivingPolicy, setDrivingPolicy] = useState<"hold" | "loop">(currentStyle.drivingPolicy);
-  const [torsoMotion, setTorsoMotion] = useState(currentStyle.torsoMotion);
-  const [dryRun, setDryRun] = useState(isTestMode);
-
-  React.useEffect(() => {
-    setDryRun(isTestMode);
-  }, [isTestMode]);
 
   // =========================================================================
   // 3. GEMINI AI OPTIMIZATION STATE
@@ -113,7 +102,12 @@ export const StudioView: React.FC<Props> = ({
       try {
         const saved = await invokeCommand<CharacterOption[]>("list_custom_characters");
         if (isMounted && Array.isArray(saved) && saved.length > 0) {
-          setCustomCharacters(saved);
+          setCustomCharacters(saved.map((character) => ({
+            ...character,
+            webPath: isTauriEnv() && character.previewPath
+              ? getLocalFilePreviewSrc(character.previewPath)
+              : character.webPath,
+          })));
         }
       } catch (e) {
         console.warn("Could not load custom characters:", e);
@@ -181,8 +175,8 @@ export const StudioView: React.FC<Props> = ({
     });
   }, []);
 
-  // Active right column tab: 'character' | 'voice' | 'motion'
-  const [rightTab, setRightTab] = useState<"character" | "voice" | "motion">("character");
+  // Active right column tab: 'character' | 'voice'
+  const [rightTab, setRightTab] = useState<"character" | "voice">("character");
 
   // Notifications
   const [successBanner, setSuccessBanner] = useState<string | null>(null);
@@ -193,10 +187,6 @@ export const StudioView: React.FC<Props> = ({
   // =========================================================================
   const handleSelectStyle = (style: PresentationStyle) => {
     setSelectedStyleId(style.id);
-    setMultiplier(style.recommendedMultiplier);
-    setAspectRatio(style.defaultAspectRatio);
-    setDrivingPolicy(style.drivingPolicy);
-    setTorsoMotion(style.torsoMotion);
     setTitle(`${style.number}. ${style.name} — ${style.vietnameseTitle}`);
 
     // If style recommends a voice from our catalog, sync it
@@ -293,8 +283,11 @@ export const StudioView: React.FC<Props> = ({
 
       const newCharOption: CharacterOption = {
         ...savedChar,
-        webPath: previewUrl, // immediate browser display
+        webPath: isTauriEnv() && savedChar.previewPath
+          ? getLocalFilePreviewSrc(savedChar.previewPath)
+          : previewUrl,
       };
+      if (isTauriEnv() && savedChar.previewPath) URL.revokeObjectURL(previewUrl);
 
       setCustomCharacters((prev) => [
         newCharOption,
@@ -363,7 +356,7 @@ export const StudioView: React.FC<Props> = ({
           ? "Ảnh tự tải (Đã lưu)"
           : selectedCharOption.gender === "male"
           ? "MC Nam"
-          : "MC Nữ / 3D",
+          : "MC Nữ",
     };
   }, [selectedCharOption]);
 
@@ -497,9 +490,7 @@ export const StudioView: React.FC<Props> = ({
         voice: selectedVoiceId,
         gender: selectedVoice?.gender,
         voice_provider: selectedVoice?.provider,
-        driving: selectedDriving,
-        multiplier: multiplier,
-        dry_run: dryRun || isTestMode,
+        dry_run: isTestMode,
       });
 
       onJobCreated();
@@ -578,7 +569,7 @@ export const StudioView: React.FC<Props> = ({
               >
                 <span className="font-mono text-[10px] opacity-70">#{style.number}</span>
                 <span>{style.vietnameseTitle}</span>
-                <span className="text-[10px] opacity-60 font-mono">({style.defaultAspectRatio})</span>
+                <span className="text-[10px] opacity-60 font-mono">(9:16)</span>
               </button>
             );
           })}
@@ -594,7 +585,7 @@ export const StudioView: React.FC<Props> = ({
               <div className="w-24 h-16 rounded-lg bg-black/40 border border-white/10 flex flex-col items-center justify-center p-2 text-center shrink-0 relative overflow-hidden shadow-inner">
                 <Film className="w-4 h-4 text-studio-cyan mb-1" />
                 <span className="text-[10px] font-mono text-slate-300 font-semibold truncate w-full text-center">
-                  {currentStyle.defaultAspectRatio}
+                  9:16
                 </span>
                 <span className="text-[8px] text-slate-400 uppercase tracking-wider">Studio</span>
               </div>
@@ -620,9 +611,7 @@ export const StudioView: React.FC<Props> = ({
                   {currentStyle.backgroundDescription}
                 </p>
                 <div className="flex items-center gap-4 mt-0.5 text-[11px] text-slate-400">
-                  <span>
-                    Chuyển động đầu: <strong className="text-studio-cyan font-mono">{currentStyle.recommendedMultiplier.toFixed(2)}x</strong>
-                  </span>
+                  <span>Chuyển động được tạo tự động theo kịch bản và giọng đọc.</span>
                   <span>•</span>
                   <span>
                     Khuyên dùng: <span className="text-amber-300">{currentStyle.voiceGuideline}</span>
@@ -882,7 +871,7 @@ export const StudioView: React.FC<Props> = ({
               }`}
             >
               <User className="w-3.5 h-3.5" />
-              <span>Ảnh Nhân vật ({CHARACTER_LIBRARY.length}+)</span>
+              <span>Nhân vật mẫu ({CHARACTER_LIBRARY.length})</span>
             </button>
 
             <button
@@ -897,17 +886,6 @@ export const StudioView: React.FC<Props> = ({
               <span>Giọng đọc TTS ProStudio ({TTS_VOICES.length})</span>
             </button>
 
-            <button
-              onClick={() => setRightTab("motion")}
-              className={`flex-1 py-2 px-3 rounded-lg text-xs font-semibold flex items-center justify-center gap-2 transition-all ${
-                rightTab === "motion"
-                  ? "bg-studio-accent text-white shadow-md shadow-indigo-600/30"
-                  : "text-slate-400 hover:text-slate-200"
-              }`}
-            >
-              <SlidersHorizontal className="w-3.5 h-3.5" />
-              <span>Cử động & Render</span>
-            </button>
           </div>
 
           {/* TAB 1: CHARACTER PORTRAIT SELECTION */}
@@ -982,14 +960,6 @@ export const StudioView: React.FC<Props> = ({
                       {
                         id: "female",
                         label: `MC Nữ (${allCharacters.filter((c) => c.category === "female").length})`,
-                      },
-                      {
-                        id: "anime",
-                        label: `3D Pixar (${allCharacters.filter((c) => c.category === "anime").length})`,
-                      },
-                      {
-                        id: "angle",
-                        label: `Góc quay (${allCharacters.filter((c) => c.category === "angle").length})`,
                       },
                     ].map((tab) => (
                       <button
@@ -1303,114 +1273,6 @@ export const StudioView: React.FC<Props> = ({
                     </div>
                   );
                 })}
-              </div>
-            </div>
-          )}
-
-          {/* TAB 3: MOTION & RENDERING CONTROLS */}
-          {rightTab === "motion" && (
-            <div className="bg-studio-card border border-studio-border rounded-xl p-4 flex flex-col gap-4">
-              <label className="text-xs font-semibold text-slate-300 uppercase tracking-wide flex items-center gap-2">
-                <Sliders className="w-4 h-4 text-studio-accent" />
-                <span>Tham số chuyển động ({currentStyle.name} Tuned)</span>
-              </label>
-
-              {/* Driving Template */}
-              <div className="flex flex-col gap-1.5">
-                <span className="text-xs text-slate-400">Mẫu chuyển động đầu (Driving Template):</span>
-                <select
-                  value={selectedDriving}
-                  onChange={(e) => setSelectedDriving(e.target.value)}
-                  className="w-full bg-studio-elevated border border-studio-border rounded-lg px-3 py-2 text-xs text-slate-100 outline-none focus:border-studio-accent"
-                >
-                  <option value="reference_head_driving.mp4">
-                    reference_head_driving.mp4 (Gật gù đĩnh đạc, ổn định vai - Khuyến nghị)
-                  </option>
-                  <option value="natural_driving_template.mp4">
-                    natural_driving_template.mp4 (Phong cách tự nhiên, chớp mắt sinh học)
-                  </option>
-                </select>
-              </div>
-
-              {/* Multiplier Slider */}
-              <div className="flex flex-col gap-2">
-                <div className="flex items-center justify-between text-xs">
-                  <span className="text-slate-400">Hệ số biên độ lắc đầu (Multiplier):</span>
-                  <span className="font-mono font-bold text-studio-cyan">{multiplier.toFixed(2)}x</span>
-                </div>
-                <input
-                  type="range"
-                  min="0.30"
-                  max="0.85"
-                  step="0.01"
-                  value={multiplier}
-                  onChange={(e) => setMultiplier(parseFloat(e.target.value))}
-                  className="w-full accent-indigo-500 cursor-pointer"
-                />
-                <div className="flex justify-between text-[10px] text-slate-500 font-mono">
-                  <span>0.30x (Calm & Mindful)</span>
-                  <span>0.40x (News/Doc)</span>
-                  <span>0.55x (Chuẩn MC)</span>
-                  <span>0.68x (Social/TikTok)</span>
-                </div>
-              </div>
-
-              {/* Framing & Driving Policy */}
-              <div className="grid grid-cols-2 gap-3 pt-1">
-                <div>
-                  <span className="text-xs text-slate-400 block mb-1">Chính sách Driving:</span>
-                  <select
-                    value={drivingPolicy}
-                    onChange={(e) => setDrivingPolicy(e.target.value as "hold" | "loop")}
-                    className="w-full bg-studio-elevated border border-studio-border rounded-lg px-3 py-2 text-xs text-slate-100 outline-none focus:border-studio-accent"
-                  >
-                    <option value="hold">Hold (Giữ pose cuối tự nhiên)</option>
-                    <option value="loop">Loop (Lặp lại mượt)</option>
-                  </select>
-                </div>
-
-                <div>
-                  <span className="text-xs text-slate-400 block mb-1">Tỷ lệ khung hình:</span>
-                  <div className="grid grid-cols-3 gap-1">
-                    {(["16:9", "9:16", "1:1"] as const).map((ratio) => (
-                      <button
-                        key={ratio}
-                        type="button"
-                        onClick={() => setAspectRatio(ratio)}
-                        className={`py-1.5 rounded text-xs font-mono font-medium border ${
-                          aspectRatio === ratio
-                            ? "bg-studio-accent text-white border-studio-accent"
-                            : "bg-studio-elevated border-studio-border text-slate-300 hover:bg-studio-hover"
-                        }`}
-                      >
-                        {ratio}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </div>
-
-              {/* Checkboxes */}
-              <div className="flex items-center gap-6 pt-2 border-t border-studio-border/60">
-                <label className="flex items-center gap-2 cursor-pointer text-xs text-slate-300 select-none">
-                  <input
-                    type="checkbox"
-                    checked={torsoMotion}
-                    onChange={(e) => setTorsoMotion(e.target.checked)}
-                    className="rounded bg-studio-elevated border-studio-border text-indigo-500 focus:ring-0"
-                  />
-                  <span>Đồng bộ nhịp thở thân trên (Torso Kinematics)</span>
-                </label>
-
-                <label className="flex items-center gap-2 cursor-pointer text-xs text-slate-300 select-none">
-                  <input
-                    type="checkbox"
-                    checked={dryRun}
-                    onChange={(e) => setDryRun(e.target.checked)}
-                    className="rounded bg-studio-elevated border-studio-border text-indigo-500 focus:ring-0"
-                  />
-                  <span className="text-studio-amber">Dry-Run (Kiểm tra an toàn máy hiện tại)</span>
-                </label>
               </div>
             </div>
           )}

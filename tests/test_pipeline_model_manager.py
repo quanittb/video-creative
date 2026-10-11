@@ -91,6 +91,28 @@ class PipelineModelManagerTests(unittest.TestCase):
         self.assertEqual(status["components"]["echo"]["assets_total"], len(echo.ASSETS))
         self.assertEqual(status["hash_verification"], "size_only")
 
+    def test_musetalk_source_accepts_module_and_package_face_parser_layouts(self):
+        layouts = (
+            Path("musetalk/utils/face_parsing.py"),
+            Path("musetalk/utils/face_parsing/__init__.py"),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            for index, parser_path in enumerate(layouts):
+                with self.subTest(layout=str(parser_path)):
+                    root = base / str(index)
+                    (root / "scripts").mkdir(parents=True)
+                    (root / "scripts" / "realtime_inference.py").write_text("# test runner\n")
+                    parser = root / parser_path
+                    parser.parent.mkdir(parents=True)
+                    parser.write_text("# test face parser\n")
+
+                    status = manager._source_status("musetalk", root)
+
+                    self.assertEqual(status["status"], "ready")
+                    self.assertEqual(status["missing_files"], [])
+                    self.assertTrue(any("one of:" in path for path in status["required_files"]))
+
     def test_fast_status_does_not_hash_and_verify_sha_hashes_present_assets(self):
         asset = tiny_asset()
         with tempfile.TemporaryDirectory() as temp:
@@ -256,6 +278,82 @@ class PipelineModelManagerTests(unittest.TestCase):
             self.assertEqual(result, 1)
             self.assertEqual(target.read_bytes(), original)
             self.assertEqual([json.loads(line)["event"] for line in output.getvalue().splitlines()][-1], "download_completed")
+
+    def test_force_download_reloads_a_verified_asset(self):
+        payload = b"known good model"
+        asset = tiny_asset(payload=payload)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / Path(asset.relative_path)
+            target.parent.mkdir(parents=True)
+            target.write_bytes(payload)
+            calls = []
+
+            def downloader(_asset, path, **kwargs):
+                calls.append(kwargs)
+                path.write_bytes(payload)
+                return "downloaded"
+
+            with mock.patch.object(manager, "MUSE_TALK_ASSETS", (asset,)), \
+                    mock.patch.object(manager, "discover_musetalk_paths", return_value=(None, None)):
+                result = manager.download_models(
+                    "musetalk", musetalk_dir=root, asset_id=asset.asset_id,
+                    force=True, downloader=downloader, events=manager.EventWriter(jsonl=True),
+                )
+            self.assertEqual(result, 0)
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(calls[0]["overwrite"])
+            self.assertTrue(calls[0]["force_download"])
+            self.assertEqual(target.read_bytes(), payload)
+
+    def test_delete_removes_only_selected_catalog_asset_and_partial(self):
+        asset = tiny_asset()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / Path(asset.relative_path)
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"model")
+            partial = target.with_name(target.name + ".part")
+            partial.write_bytes(b"partial")
+            output = io.StringIO()
+            status = {"components": {
+                "echo": {"directory": str(root / "echo")},
+                "musetalk": {"directory": str(root)},
+            }}
+            with mock.patch.object(manager, "_selected_assets", return_value=(asset,)), \
+                    mock.patch.object(manager, "build_status", return_value=status), \
+                    contextlib.redirect_stdout(output):
+                result = manager.delete_models("musetalk", asset_id=asset.asset_id, events=manager.EventWriter(jsonl=True))
+            self.assertEqual(result, 0)
+            self.assertFalse(target.exists())
+            self.assertFalse(partial.exists())
+            self.assertEqual(json.loads(output.getvalue().splitlines()[-1])["event"], "delete_completed")
+
+    def test_delete_rejects_asset_symlink_that_resolves_outside_managed_root(self):
+        asset = tiny_asset()
+        with tempfile.TemporaryDirectory() as temp:
+            temp_root = Path(temp)
+            root = temp_root / "managed"
+            root.mkdir()
+            outside = temp_root / "outside.bin"
+            outside.write_bytes(b"keep")
+            target = root / Path(asset.relative_path)
+            target.parent.mkdir(parents=True)
+            target.symlink_to(outside)
+            status = {"components": {
+                "echo": {"directory": str(temp_root / "echo")},
+                "musetalk": {"directory": str(root)},
+            }}
+            output = io.StringIO()
+            with mock.patch.object(manager, "_selected_assets", return_value=(asset,)), \
+                    mock.patch.object(manager, "build_status", return_value=status), \
+                    contextlib.redirect_stdout(output):
+                result = manager.delete_models("musetalk", asset_id=asset.asset_id, events=manager.EventWriter(jsonl=True))
+            self.assertEqual(result, 1)
+            self.assertTrue(target.is_symlink())
+            self.assertEqual(outside.read_bytes(), b"keep")
+            failure = json.loads(output.getvalue().splitlines()[-2])
+            self.assertEqual(failure["event"], "asset_delete_failed")
 
     def test_full_sized_verified_partial_is_atomically_promoted_without_network(self):
         payload = b"complete verified payload"

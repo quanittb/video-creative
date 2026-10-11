@@ -30,12 +30,12 @@ export const HeaderBar: React.FC<Props> = ({
   isRefreshing,
 }) => {
   const gpu = hardware?.system.gpu;
-  const isGpuLow = gpu ? gpu.total_vram_mb < 6000 : false;
-  const totalVramGb = gpu ? (gpu.total_vram_mb / 1024).toFixed(1) : "12.0";
-  const freeVramGb = gpu ? (gpu.free_vram_mb / 1024).toFixed(1) : "9.8";
-  const usedPercent = gpu && gpu.total_vram_mb > 0
+  const hasGpuMetrics = hardware?.available !== false && !!gpu?.available && gpu.total_vram_mb > 0;
+  const isGpuLow = hasGpuMetrics && gpu.total_vram_mb < 6000;
+  const freeVramGb = hasGpuMetrics ? (gpu.free_vram_mb / 1024).toFixed(1) : null;
+  const usedPercent = hasGpuMetrics
     ? Math.round(((gpu.total_vram_mb - gpu.free_vram_mb) / gpu.total_vram_mb) * 100)
-    : 18;
+    : null;
 
   return (
     <header className="h-14 bg-studio-panel border-b border-studio-border px-4 flex items-center justify-between select-none z-10 shrink-0">
@@ -100,8 +100,8 @@ export const HeaderBar: React.FC<Props> = ({
           onClick={onToggleTestMode}
           title={
             isTestMode
-              ? "Đang ở chế độ Thử nghiệm: Không dùng VRAM thật, mô phỏng các chặng an toàn để bạn kiểm tra giao diện và batch trên máy này."
-              : "Đang ở chế độ Render Thật: Kích hoạt GPU inference đầy đủ (dành cho máy trạm RTX 3060 12GB)."
+              ? "Chế độ preflight chỉ kiểm tra đầu vào và model, không tạo video."
+              : "Job sẽ chạy pipeline render Echo Flash và MuseTalk trên máy này."
           }
           className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all border ${
             isTestMode
@@ -112,12 +112,12 @@ export const HeaderBar: React.FC<Props> = ({
           {isTestMode ? (
             <>
               <FlaskConical className="w-3.5 h-3.5 text-amber-400" />
-              <span>Chế độ Test (Máy hiện tại)</span>
+              <span>Preflight · không render</span>
             </>
           ) : (
             <>
               <Zap className="w-3.5 h-3.5 text-emerald-400 fill-current" />
-              <span>Render Thật (RTX 3060)</span>
+              <span>Render thật</span>
             </>
           )}
         </button>
@@ -127,21 +127,10 @@ export const HeaderBar: React.FC<Props> = ({
           <Cpu className="w-4 h-4 text-studio-accent" />
           <div className="flex flex-col">
             <div className="flex items-center gap-1.5 text-[11px] font-mono">
-              <span className="text-slate-300 font-semibold">{gpu?.name || "NVIDIA GPU"}</span>
-              <span className="text-slate-500">|</span>
-              <span className={isGpuLow ? "text-studio-amber" : "text-studio-emerald"}>
-                {freeVramGb}GB Free {isGpuLow ? "(Máy Test)" : ""}
-              </span>
+              <span className="text-slate-300 font-semibold">{gpu?.available ? gpu.name : "GPU chưa phát hiện"}</span>
+              {freeVramGb !== null && <><span className="text-slate-500">|</span><span className={isGpuLow ? "text-studio-amber" : "text-studio-emerald"}>{freeVramGb} GB trống</span></>}
             </div>
-            {/* Mini VRAM Bar */}
-            <div className="w-28 h-1 bg-studio-elevated rounded-full overflow-hidden mt-0.5">
-              <div
-                className={`h-full transition-all duration-300 ${
-                  usedPercent > 85 ? "bg-studio-rose" : usedPercent > 65 ? "bg-studio-amber" : "bg-studio-accent"
-                }`}
-                style={{ width: `${usedPercent}%` }}
-              />
-            </div>
+            {usedPercent !== null && <div className="w-28 h-1 bg-studio-elevated rounded-full overflow-hidden mt-0.5"><div className={`h-full transition-all duration-300 ${usedPercent > 85 ? "bg-studio-rose" : usedPercent > 65 ? "bg-studio-amber" : "bg-studio-accent"}`} style={{ width: `${usedPercent}%` }} /></div>}
           </div>
         </div>
 

@@ -1,14 +1,18 @@
 import { HardwareStatus, RenderJob } from "../types";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 // Check if running inside Tauri environment
 export const isTauriEnv = (): boolean => {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 };
 
+export const getLocalFilePreviewSrc = (path: string): string =>
+  isTauriEnv() ? convertFileSrc(path) : path;
+
 // Safe invoke wrapper
 export async function invokeCommand<T>(cmd: string, args?: Record<string, any>): Promise<T> {
   if (isTauriEnv()) {
-    const { invoke } = await import("@tauri-apps/api/core");
     return invoke<T>(cmd, args);
   }
 
@@ -17,43 +21,47 @@ export async function invokeCommand<T>(cmd: string, args?: Record<string, any>):
 
   if (cmd === "get_hardware_status") {
     return {
+      available: false,
+      message: "Trình duyệt không thể đọc phần cứng hoặc model trên máy. Mở ứng dụng desktop để kiểm tra.",
       system: {
-        platform: "win32",
-        python: "Python 3.10.11 (RTX 3060 12GB Host)",
-        ffmpeg: true,
-        ffprobe: true,
+        platform: typeof navigator !== "undefined" ? navigator.platform : "browser",
+        python: "Chỉ phát hiện trong ứng dụng desktop",
+        ffmpeg: false,
+        ffprobe: false,
         gpu: {
-          available: true,
-          name: "NVIDIA GeForce RTX 3060 (12GB VRAM)",
-          total_vram_mb: 12288,
-          free_vram_mb: 9850,
+          available: false,
+          name: "Không khả dụng trong trình duyệt",
+          total_vram_mb: 0,
+          free_vram_mb: 0,
         },
       },
       engines: {
-        liveportrait: {
-          installed: true,
-          path: "D:\\rustProject\\video-creative-studio\\LivePortrait",
-        },
         musetalk: {
-          installed: true,
-          venv_ready: true,
-          python: "D:\\rustProject\\video-creative-studio\\musetalk-venv\\Scripts\\python.exe",
+          source: { status: "unknown" },
+          runtime: { status: "unknown" },
+          assets_ready: 0,
+          assets_total: 0,
         },
       },
       assets: {
-        character_count: 38,
-        characters: [
-          { name: "asian_male_office_1080p", path: "assets/characters/nhanvatnam/asian_male_office_1080p.png", group: "nhanvatnam" },
-          { name: "vietnamese_female_anchor", path: "assets/characters/nhanvatnu/ChatGPT Image Sep 14, 2026, 11_35_53 AM (1).png", group: "nhanvatnu" },
-          { name: "pixar_character_3d", path: "assets/characters/hoathinhnu/ChatGPT Image Sep 8, 2026, 09_49_11 AM (1).png", group: "hoathinhnu" },
-        ],
-        driving_count: 2,
-        driving_templates: [
-          { name: "reference_head_driving.mp4", path: "assets/driving_templates/reference_head_driving.mp4", size_mb: 3.05 },
-          { name: "natural_driving_template.mp4", path: "assets/driving_templates/natural_driving_template.mp4", size_mb: 2.01 },
-        ],
+        character_count: 0,
+        characters: [],
+        driving_count: 0,
+        driving_templates: [],
       },
     } as unknown as T;
+  }
+
+  if (cmd === "get_pipeline_model_status") {
+    return {
+      available: false,
+      message: "Trình duyệt không thể kiểm tra model trên máy. Mở ứng dụng desktop để xem trạng thái.",
+      components: {},
+    } as unknown as T;
+  }
+
+  if (cmd === "manage_pipeline_models") {
+    throw new Error("Tải, sửa hoặc xóa model chỉ khả dụng trong ứng dụng desktop.");
   }
 
   if (cmd === "list_jobs") {
@@ -65,31 +73,7 @@ export async function invokeCommand<T>(cmd: string, args?: Record<string, any>):
         // ignore
       }
     }
-    return [
-      {
-        id: "vcs_mock_01",
-        name: "Bản tin AI Công nghệ 1 Phút",
-        status: "completed",
-        progress: 100,
-        stage: "done",
-        message: "Video đã được tạo thành công!",
-        created_at: new Date(Date.now() - 3600000).toISOString(),
-        completed_at: new Date(Date.now() - 3500000).toISOString(),
-        output_file: "output/avatar_option_b_result.mp4",
-        params: {
-          char: "office",
-          voice: "vi-VN-NamMinhNeural",
-          script: "Xin chào quý vị và các bạn đến với bản tin công nghệ...",
-          multiplier: 0.55,
-        },
-        log_tail: [
-          "[Audio AI] Đã tạo âm thanh: vietnamese_speech.mp3 (55.58s)",
-          "[Motion 3D] Đã tạo cử động nhân vật 3D hoàn tất (multiplier=0.55)",
-          "[Lip-Sync] Đang xử lý đồng bộ khẩu hình AI...",
-          "✅ Video đầu ra: output/avatar_option_b_result.mp4",
-        ],
-      },
-    ] as unknown as T;
+    return [] as unknown as T;
   }
 
   if (cmd === "create_job") {
@@ -119,7 +103,7 @@ export async function invokeCommand<T>(cmd: string, args?: Record<string, any>):
   }
 
   if (cmd === "start_render_worker") {
-    return "Worker started (Browser Simulated)" as unknown as T;
+    throw new Error("Render video chỉ chạy trong ứng dụng desktop Tauri; trình duyệt không thực thi GPU core.");
   }
 
   if (cmd === "stop_render_worker") {
@@ -127,11 +111,7 @@ export async function invokeCommand<T>(cmd: string, args?: Record<string, any>):
   }
 
   if (cmd === "preview_tts_voice") {
-    return {
-      status: "success",
-      duration: 3.2,
-      audio_path: "temp/preview.mp3",
-    } as unknown as T;
+    throw new Error("Nghe thử TTS cần ứng dụng desktop chạy local bridge.");
   }
 
   if (cmd === "get_license_status") {
@@ -228,7 +208,6 @@ export async function listenToEvent<T>(
   callback: (payload: T) => void
 ): Promise<() => void> {
   if (isTauriEnv()) {
-    const { listen } = await import("@tauri-apps/api/event");
     const unlisten = await listen<T>(event, (e) => callback(e.payload));
     return unlisten;
   }

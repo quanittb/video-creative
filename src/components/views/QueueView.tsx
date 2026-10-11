@@ -44,7 +44,7 @@ export const QueueView: React.FC<Props> = ({
   const activeJob = jobs.find((j) => j.status === "running");
   const queuedJobs = jobs.filter((j) => j.status === "queued");
   const completedOrFailedJobs = jobs.filter(
-    (j) => j.status === "completed" || j.status === "failed" || j.status === "cancelled"
+    (j) => j.status === "completed" || j.status === "validated" || j.status === "failed" || j.status === "cancelled"
   );
 
   // Auto-scroll logs
@@ -57,14 +57,14 @@ export const QueueView: React.FC<Props> = ({
   // Stage steps
   const stages = [
     { id: "audio_tts", label: "1. Tổng hợp Giọng đọc" },
-    { id: "liveportrait", label: "2. Cử động nhân vật 3D" },
+    { id: "motion_base", label: "2. Echo Flash · chuyển động" },
     { id: "musetalk", label: "3. Đồng bộ khẩu hình Lip-Sync" },
     { id: "verifying", label: "4. Kiểm định Chất lượng" },
   ];
 
   const getStageStep = (stageName: string): number => {
     if (stageName.includes("audio")) return 1;
-    if (stageName.includes("liveportrait") || stageName.includes("torso")) return 2;
+    if (stageName.includes("motion") || stageName.includes("echo")) return 2;
     if (stageName.includes("musetalk") || stageName.includes("lip")) return 3;
     if (stageName.includes("verify") || stageName.includes("final")) return 4;
     return 0;
@@ -232,6 +232,7 @@ export const QueueView: React.FC<Props> = ({
                   jobs.map((job) => {
                     const isRunning = job.status === "running";
                     const isCompleted = job.status === "completed";
+                    const isValidated = job.status === "validated";
                     const isFailed = job.status === "failed";
                     const isQueued = job.status === "queued";
 
@@ -246,14 +247,16 @@ export const QueueView: React.FC<Props> = ({
                             className={`px-2 py-0.5 rounded text-[10px] font-semibold uppercase ${
                               isRunning
                                 ? "bg-cyan-950 text-studio-cyan border border-cyan-800"
-                                : isCompleted
+                              : isCompleted
                                 ? "bg-emerald-950 text-emerald-400 border border-emerald-800"
+                                : isValidated
+                                ? "bg-indigo-950 text-indigo-300 border border-indigo-800"
                                 : isFailed
                                 ? "bg-rose-950 text-rose-400 border border-rose-800"
                                 : "bg-amber-950 text-amber-400 border border-amber-800"
                             }`}
                           >
-                            {job.status}
+                            {isValidated ? "Preflight đạt · chưa render" : job.status}
                           </span>
                         </td>
                         <td className="p-3 font-mono text-slate-300">
@@ -341,7 +344,7 @@ export const QueueView: React.FC<Props> = ({
                       ? "text-rose-400 bg-rose-950/20 px-1 rounded"
                       : log.includes("✅") || log.includes("Hoàn tất")
                       ? "text-emerald-400"
-                      : log.includes("[LivePortrait]") || log.includes("[MuseTalk]")
+                      : log.toLowerCase().includes("echo") || log.includes("[MuseTalk]")
                       ? "text-studio-cyan"
                       : "text-slate-400"
                   }`}

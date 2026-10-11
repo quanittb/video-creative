@@ -200,6 +200,7 @@ def _runtime_candidates(component: str, root: Path) -> Iterable[Path]:
 
 
 def _source_status(component: str, root: Path) -> dict[str, Any]:
+    alternative_required: tuple[Path, ...] = ()
     if component == "echo":
         required = (
             root / "infer_flash.py",
@@ -209,9 +210,19 @@ def _source_status(component: str, root: Path) -> dict[str, Any]:
     else:
         required = (
             root / "scripts" / "realtime_inference.py",
+        )
+        # MuseTalk has shipped both as a single module and as a package.
+        # Accept either layout so source status matches the installed runtime.
+        alternative_required = (
             root / "musetalk" / "utils" / "face_parsing.py",
+            root / "musetalk" / "utils" / "face_parsing" / "__init__.py",
         )
     missing = [str(path) for path in required if not path.is_file()]
+    if alternative_required and not any(path.is_file() for path in alternative_required):
+        missing.append("one of: " + " or ".join(str(path) for path in alternative_required))
+    required_files = [str(path) for path in required]
+    if alternative_required:
+        required_files.append("one of: " + " or ".join(str(path) for path in alternative_required))
     revision: dict[str, Any] = {"status": "not_applicable", "actual": None, "expected": None}
     if not missing:
         try:
@@ -242,7 +253,7 @@ def _source_status(component: str, root: Path) -> dict[str, Any]:
     return {
         "status": status,
         "path": str(root),
-        "required_files": [str(path) for path in required],
+        "required_files": required_files,
         "missing_files": missing,
         "revision": revision,
     }
@@ -392,6 +403,7 @@ def download_models(
     musetalk_dir: str | Path | None = None,
     asset_id: str | None = None,
     repair: bool = False,
+    force: bool = False,
     events: EventWriter | None = None,
     downloader: Any = None,
 ) -> int:
@@ -407,20 +419,20 @@ def download_models(
             root = roots[asset.component]
             target = root / Path(asset.relative_path)
             state = _asset_status(asset, root)
-            action = "verify" if state["status"] == "ready" else "repair" if state["status"] in ("size_mismatch", "hash_mismatch") else "resume" if state["status"] == "partial" else "download"
+            action = "reload" if force and state["status"] == "ready" else "verify" if state["status"] == "ready" else "repair" if state["status"] in ("size_mismatch", "hash_mismatch") else "resume" if state["status"] == "partial" else "download"
             writer.emit(
                 "asset_started", component=asset.component, asset_id=asset.asset_id,
                 path=str(target), action=action, bytes_received=state["partial_bytes"],
                 bytes_total=asset.size, asset_index=asset_index,
                 asset_count=len(selected),
             )
-            if state["status"] == "ready":
+            if state["status"] == "ready" and not force:
                 state = _asset_status(asset, root, verify_sha=True)
                 if state["status"] == "ready":
                     succeeded += 1
                     writer.emit("asset_verified", component=asset.component, asset_id=asset.asset_id, path=str(target), result="reused", actual_bytes=state["actual_bytes"], sha256=state["actual_sha256"])
                     continue
-            if state["status"] in ("size_mismatch", "hash_mismatch") and not repair:
+            if state["status"] in ("size_mismatch", "hash_mismatch") and not (repair or force):
                 raise ValueError(
                     f"Asset hiện có bị {state['status']}; giữ nguyên file. Chỉ dùng --repair nếu muốn tải bản đã xác minh và thay thế nguyên tử: {target}"
                 )
@@ -434,8 +446,9 @@ def download_models(
 
             outcome = download(
                 asset.as_downloader_asset(), target,
-                overwrite=repair, progress=lambda _text: None,
+                overwrite=repair or force, progress=lambda _text: None,
                 progress_callback=on_progress,
+                force_download=force,
             )
             # The shared downloader only returns after it has verified byte
             # count and SHA-256, then atomically replaced the target.
@@ -458,6 +471,46 @@ def download_models(
     return 0 if not failed else 1
 
 
+def delete_models(
+    component: str,
+    asset_id: str | None = None,
+    events: EventWriter | None = None,
+) -> int:
+    """Delete catalog assets only; never remove a source checkout or runtime."""
+    writer = events or EventWriter(jsonl=False)
+    selected = _selected_assets(component, asset_id)
+    status = build_status()
+    roots = {
+        key: Path(value["directory"]).expanduser().resolve()
+        for key, value in status["components"].items()
+    }
+    failed: list[dict[str, str]] = []
+    deleted = 0
+    for asset in selected:
+        root = roots[asset.component]
+        target = root / Path(asset.relative_path)
+        partial = target.with_name(target.name + ".part")
+        try:
+            for candidate in (target, partial):
+                resolved = candidate.resolve()
+                if not resolved.is_relative_to(root):
+                    raise ValueError("Asset catalog path resolves outside its managed root.")
+            removed = False
+            for candidate in (target, partial):
+                if candidate.is_file() or candidate.is_symlink():
+                    candidate.unlink()
+                    removed = True
+            if not removed:
+                raise FileNotFoundError(f"Không có model để xóa: {target}")
+            deleted += 1
+            writer.emit("asset_deleted", component=asset.component, asset_id=asset.asset_id, path=str(target))
+        except Exception as exc:
+            failed.append({"asset_id": asset.asset_id, "error": str(exc)})
+            writer.emit("asset_delete_failed", component=asset.component, asset_id=asset.asset_id, error=str(exc))
+    writer.emit("delete_completed", status="ok" if not failed else "incomplete", deleted=deleted, failed=failed)
+    return 0 if not failed else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Kiểm tra/tải model EchoMimic V3 Flash và MuseTalk; không cài Python/dependency hoặc chạy GPU.",
@@ -475,7 +528,12 @@ def build_parser() -> argparse.ArgumentParser:
     download_parser.add_argument("--echo-dir", help="Override thư mục EchoMimicV3")
     download_parser.add_argument("--musetalk-dir", help="Override thư mục MuseTalk")
     download_parser.add_argument("--repair", action="store_true", help="Cho phép thay file đích sai size/hash sau khi tải và xác minh file staging")
+    download_parser.add_argument("--force", action="store_true", help="Tải lại kể cả khi asset hiện tại đã vượt qua kiểm tra SHA-256")
     download_parser.add_argument("--jsonl", action="store_true", help="Xuất event JSON Lines schema_version=1")
+    delete_parser = subparsers.add_parser("delete", help="Xóa asset trong catalog, không xóa source/runtime")
+    delete_parser.add_argument("--component", choices=("echo", "musetalk", "all"), required=True)
+    delete_parser.add_argument("--asset", dest="asset_id", help="Chỉ xóa asset ID ổn định từ status --json")
+    delete_parser.add_argument("--jsonl", action="store_true", help="Xuất event JSON Lines schema_version=1")
     return parser
 
 
@@ -486,12 +544,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "status":
             _emit_status(build_status(args.echo_dir, args.musetalk_dir, verify_sha=args.verify_sha), args.json)
             return 0
+        if args.command == "delete":
+            return delete_models(args.component, asset_id=args.asset_id, events=EventWriter(args.jsonl))
         return download_models(
-            args.component,
-            echo_dir=args.echo_dir,
-            musetalk_dir=args.musetalk_dir,
-            asset_id=args.asset_id,
-            repair=args.repair,
+            args.component, echo_dir=args.echo_dir, musetalk_dir=args.musetalk_dir,
+            asset_id=args.asset_id, repair=args.repair, force=args.force,
             events=EventWriter(args.jsonl),
         )
     except Exception as exc:

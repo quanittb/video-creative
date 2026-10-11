@@ -19,8 +19,8 @@ export const App: React.FC = () => {
   const [isWorkerRunning, setIsWorkerRunning] = useState<boolean>(false);
   const [workerLogs, setWorkerLogs] = useState<string[]>([]);
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
-  // Default to Test Mode on development machine to prevent GPU OOM
-  const [isTestMode, setIsTestMode] = useState<boolean>(true);
+  // Real render is the production default; preflight must be selected explicitly.
+  const [isTestMode, setIsTestMode] = useState<boolean>(false);
 
   // License & Remote Updater State
   const [license, setLicense] = useState<LicenseStatus | null>(null);

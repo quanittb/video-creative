@@ -1,4 +1,4 @@
-"""Regenerate the stock office torso matte from the portrait and calibrated mask."""
+"""Legacy helper calibrated to the removed office portrait; not used by Studio."""
 
 from pathlib import Path
 

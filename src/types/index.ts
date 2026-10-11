@@ -18,6 +18,8 @@ export interface DrivingAsset {
 }
 
 export interface HardwareStatus {
+  available?: boolean;
+  message?: string;
   system: {
     platform: string;
     python: string;
@@ -26,15 +28,8 @@ export interface HardwareStatus {
     gpu: GpuInfo;
   };
   engines: {
-    liveportrait: {
-      installed: boolean;
-      path: string;
-    };
-    musetalk: {
-      installed: boolean;
-      venv_ready: boolean;
-      python: string | null;
-    };
+    echo?: Partial<ManagedModelComponent>;
+    musetalk?: Partial<ManagedModelComponent>;
   };
   assets: {
     character_count: number;
@@ -42,6 +37,33 @@ export interface HardwareStatus {
     driving_count: number;
     driving_templates: DrivingAsset[];
   };
+}
+
+export interface ManagedModelAsset {
+  asset_id: string;
+  component: "echo" | "musetalk";
+  path: string;
+  expected_bytes: number;
+  actual_bytes: number | null;
+  status: string;
+  hash_status: string;
+}
+
+export interface ManagedModelComponent {
+  directory: string;
+  source: { status: string; revision?: { status: string; actual?: string | null; expected?: string | null } };
+  runtime: { status: string; path?: string | null; validation?: string };
+  assets: ManagedModelAsset[];
+  assets_ready: number;
+  assets_total: number;
+}
+
+export interface PipelineModelStatus {
+  schema_version?: number;
+  available: boolean;
+  message?: string;
+  components: Partial<Record<"echo" | "musetalk", ManagedModelComponent>>;
+  hash_verification?: string;
 }
 
 export interface JobParams {
@@ -65,7 +87,7 @@ export interface JobParams {
 export interface RenderJob {
   id: string;
   name: string;
-  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  status: "queued" | "running" | "validated" | "completed" | "failed" | "cancelled";
   progress: number;
   stage: string;
   message: string;

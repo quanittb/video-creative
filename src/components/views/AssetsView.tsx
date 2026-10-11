@@ -1,19 +1,19 @@
 import React, { useState } from "react";
-import { Folder, Film, User, Copy, Check, Sparkles, BookOpen, Clock, Sliders } from "lucide-react";
-import { HardwareStatus, CharacterAsset, DrivingAsset } from "../../types";
+import { Folder, User, Copy, Check, Sparkles } from "lucide-react";
+import { HardwareStatus } from "../../types";
 import { PRESENTATION_STYLES } from "../../data/presentationStyles";
+import { CHARACTER_LIBRARY } from "../../data/characterLibrary";
 
 interface Props {
   hardware: HardwareStatus | null;
   onOpenFolder: (path?: string) => void;
 }
 
-export const AssetsView: React.FC<Props> = ({ hardware, onOpenFolder }) => {
-  const [activeCategory, setActiveCategory] = useState<"characters" | "driving" | "styles">("styles");
+export const AssetsView: React.FC<Props> = ({ onOpenFolder }) => {
+  const [activeCategory, setActiveCategory] = useState<"characters" | "styles">("styles");
   const [copiedPath, setCopiedPath] = useState<string | null>(null);
 
-  const characters = hardware?.assets.characters || [];
-  const drivings = hardware?.assets.driving_templates || [];
+  const characters = CHARACTER_LIBRARY;
 
   const handleCopyText = (text: string, id: string) => {
     navigator.clipboard.writeText(text);
@@ -50,17 +50,6 @@ export const AssetsView: React.FC<Props> = ({ hardware, onOpenFolder }) => {
             <span>Thư viện Nhân vật ({characters.length})</span>
           </button>
 
-          <button
-            onClick={() => setActiveCategory("driving")}
-            className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-2 transition-colors ${
-              activeCategory === "driving"
-                ? "bg-studio-accent text-white"
-                : "bg-studio-elevated text-slate-400 hover:text-white"
-            }`}
-          >
-            <Film className="w-3.5 h-3.5" />
-            <span>Mẫu Driving Pose ({drivings.length})</span>
-          </button>
         </div>
 
         <button
@@ -97,7 +86,7 @@ export const AssetsView: React.FC<Props> = ({ hardware, onOpenFolder }) => {
                   </div>
 
                   <span className={`px-2 py-0.5 rounded text-[10px] font-mono font-semibold border ${st.badgeColor}`}>
-                    {st.recommendedAspectRatios.join(" • ")}
+                    9:16
                   </span>
                 </div>
 
@@ -113,10 +102,8 @@ export const AssetsView: React.FC<Props> = ({ hardware, onOpenFolder }) => {
                     <span className="text-slate-300 font-medium">{st.voiceGuideline}</span>
                   </div>
                   <div className="flex items-start gap-2">
-                    <span className="text-slate-500 text-[11px] w-24 shrink-0 uppercase tracking-wide">Kinematics:</span>
-                    <span className="text-studio-cyan font-mono font-semibold">
-                      Biên độ {st.recommendedMultiplier.toFixed(2)}x • {st.kinematicsGuideline}
-                    </span>
+                    <span className="text-slate-500 text-[11px] w-24 shrink-0 uppercase tracking-wide">Chuyển động:</span>
+                    <span className="text-slate-300 font-medium">Echo Flash tự tạo chuyển động theo lời thoại.</span>
                   </div>
                 </div>
 
@@ -163,9 +150,9 @@ export const AssetsView: React.FC<Props> = ({ hardware, onOpenFolder }) => {
                   className="bg-studio-card border border-studio-border hover:border-slate-600 rounded-xl p-3 flex flex-col gap-2 group transition-all"
                 >
                   <div className="w-full aspect-[4/3] rounded-lg bg-gradient-to-tr from-slate-900 to-slate-800 flex items-center justify-center text-slate-400 font-mono text-xs overflow-hidden relative">
-                    <span className="p-2 text-center break-all">{c.name}</span>
+                    <img src={c.webPath} alt={c.name} className="absolute inset-0 w-full h-full object-cover" loading="lazy" />
                     <span className="absolute top-2 right-2 text-[10px] font-mono px-1.5 py-0.5 rounded bg-black/60 text-studio-cyan">
-                      {c.group}
+                      {c.gender === "male" ? "Nam" : "Nữ"}
                     </span>
                   </div>
 
@@ -174,7 +161,7 @@ export const AssetsView: React.FC<Props> = ({ hardware, onOpenFolder }) => {
                       {c.name}
                     </span>
                     <button
-                      onClick={() => handleCopyText(c.path, `char_${idx}`)}
+                      onClick={() => handleCopyText(c.relPath, `char_${idx}`)}
                       title="Sao chép đường dẫn file"
                       className="p-1 rounded bg-studio-elevated hover:bg-studio-hover text-slate-400 hover:text-white"
                     >
@@ -191,47 +178,6 @@ export const AssetsView: React.FC<Props> = ({ hardware, onOpenFolder }) => {
           </div>
         )}
 
-        {/* TAB 3: DRIVING TEMPLATES */}
-        {activeCategory === "driving" && (
-          <div className="grid grid-cols-3 gap-4">
-            {drivings.length === 0 ? (
-              <div className="col-span-3 p-12 text-center text-slate-500 text-xs">
-                Không tìm thấy template driving trong assets/driving_templates/
-              </div>
-            ) : (
-              drivings.map((d, idx) => (
-                <div
-                  key={idx}
-                  className="bg-studio-card border border-studio-border hover:border-slate-600 rounded-xl p-4 flex flex-col gap-3 group transition-all"
-                >
-                  <div className="flex items-center justify-between">
-                    <Film className="w-5 h-5 text-studio-accent" />
-                    <span className="text-xs font-mono text-studio-cyan">{d.size_mb} MB</span>
-                  </div>
-
-                  <div>
-                    <h4 className="text-xs font-bold text-slate-200">{d.name}</h4>
-                    <p className="text-[11px] text-slate-400 mt-1">
-                      {d.name.includes("reference")
-                        ? "Chuẩn MC truyền hình: cử động đầu gật gù tự nhiên, ổn định vai."
-                        : "Phong cách sinh học: chớp mắt định kỳ và nhịp thở đĩnh đạc."}
-                    </p>
-                  </div>
-
-                  <div className="mt-auto pt-2 border-t border-studio-border/60 flex items-center justify-between text-xs">
-                    <span className="text-[10px] text-slate-500 font-mono">25 FPS</span>
-                    <button
-                      onClick={() => handleCopyText(d.path, `drive_${idx}`)}
-                      className="text-xs text-studio-cyan hover:underline flex items-center gap-1"
-                    >
-                      {copiedPath === `drive_${idx}` ? "Đã chép" : "Chép đường dẫn"}
-                    </button>
-                  </div>
-                </div>
-              ))
-            )}
-          </div>
-        )}
       </div>
     </div>
   );

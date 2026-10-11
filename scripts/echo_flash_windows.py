@@ -145,7 +145,7 @@ def default_echo_root() -> Path:
 
 
 def default_image() -> Path:
-    return project_root() / "assets" / "characters" / "nhanvatnam" / "asian_male_office_1080p.png"
+    return project_root() / "assets" / "characters" / "nhanvatnam" / "ChatGPT Image Sep 8, 2026, 08_46_26 AM (1).png"
 
 
 def default_audio() -> Path:
@@ -395,13 +395,15 @@ def download_asset(
     opener: Any = None,
     progress: Any = print,
     progress_callback: Any = None,
+    force_download: bool = False,
 ) -> str:
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
-        if destination.is_file() and destination.stat().st_size == asset.size and sha256_file(destination) == asset.sha256:
+        if (not force_download and destination.is_file()
+                and destination.stat().st_size == asset.size and sha256_file(destination) == asset.sha256):
             progress("Đã có file đúng SHA: {}".format(destination))
             return "reused"
-        if not overwrite:
+        if not overwrite and not force_download:
             raise ValueError("File đã tồn tại nhưng size/SHA không đúng; giữ nguyên file: {} (dùng --overwrite để tải bản xác minh mới).".format(destination))
     partial = destination.with_name(destination.name + ".part")
     current_size = partial.stat().st_size if partial.exists() else 0

@@ -159,7 +159,7 @@ class BatchImporter:
                 multiplier = float(row["multiplier"]) if row.get("multiplier") else 0.55
                 output_name = row.get("output_name") or f"{Path(name).stem}.mp4"
                 output_path = f"output/{output_name}" if not output_name.startswith("output/") else output_name
-                dry_run = str(row.get("dry_run", "true")).lower() in ("true", "1", "yes")
+                dry_run = str(row.get("dry_run", "false")).lower() in ("true", "1", "yes")
 
                 job = RenderJob(
                     name=name,
@@ -258,7 +258,9 @@ class SequentialWorker:
             )
 
             log_buffer: List[str] = []
-            output_file = params.get("output")
+            output_file = None
+            preflight_validated = False
+            job_error = None
 
             for raw_line in self.current_process.stdout:
                 line = raw_line.strip()
@@ -287,13 +289,29 @@ class SequentialWorker:
                             })
                         elif ev_type == "job_completed":
                             output_file = event.get("output") or output_file
+                        elif ev_type == "job_validated":
+                            preflight_validated = True
+                        elif ev_type == "job_failed":
+                            job_error = event.get("error") or job_error
                     except Exception:
                         pass
 
             self.current_process.wait()
             rc = self.current_process.returncode
 
-            if rc == 0:
+            if rc == 0 and params.get("dry_run") and preflight_validated:
+                print(f"[Worker] ✅ Job {job_id}: preflight đạt; chưa tạo video.", flush=True)
+                self.store.update_job(job_id, {
+                    "status": "validated",
+                    "stage": "validated",
+                    "progress": 100.0,
+                    "message": "Preflight đạt; chưa tạo video.",
+                    "completed_at": datetime.now().isoformat(),
+                    "output_file": None,
+                    "log_tail": log_buffer[-10:],
+                })
+                return True
+            if rc == 0 and output_file and Path(output_file).is_file() and Path(output_file).stat().st_size > 0:
                 print(f"[Worker] ✅ Job {job_id} hoàn tất thành công!", flush=True)
                 self.store.update_job(job_id, {
                     "status": "completed",
@@ -310,7 +328,7 @@ class SequentialWorker:
                 self.store.update_job(job_id, {
                     "status": "failed",
                     "stage": "error",
-                    "error": f"Lỗi thực thi (exit code {rc})",
+                    "error": job_error or ("Preflight kết thúc nhưng không phát trạng thái xác nhận." if rc == 0 else f"Lỗi thực thi (exit code {rc})"),
                     "completed_at": datetime.now().isoformat(),
                     "log_tail": log_buffer[-20:],
                 })

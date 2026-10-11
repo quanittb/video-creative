@@ -3,6 +3,8 @@
 **Ngày chốt baseline:** 10/10/2026
 **Phạm vi:** giữ nguyên thuật toán EchoMimic V3 Flash → MuseTalk hiện tại; báo cáo cách bọc core này bằng UI để có thể triển khai ứng dụng theo từng bước. Đây là báo cáo kỹ thuật, không thay đổi thuật toán hay cấu hình inference.
 
+> **Báo cáo kế hoạch trước triển khai.** Phần mô tả FE/bridge bên dưới là trạng thái tại thời điểm lập kế hoạch và đã lỗi thời. Core hiện được nối qua `runners/studio_bridge.py` và `scripts/test_vertical_ads.py`; dùng README hiện tại để biết flow trong app.
+
 ## Tóm tắt điều hành
 
 Core hiện có một pipeline Windows chạy được qua CLI/batch. FE ứng dụng đã có trên nhánh `develop/quanph/v1.0.0`; các script Echo Flash → MuseTalk dọc nay cũng được đưa vào nhánh này, nhưng job runner của FE vẫn gọi luồng LivePortrait/torso/MuseTalk cũ. Người dùng vẫn chạy pipeline Echo mới bằng CMD cho tới khi bridge/UI được nối. Phần giao diện WanGP là sản phẩm độc lập, không điều khiển pipeline này.

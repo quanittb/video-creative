@@ -1,8 +1,7 @@
 """Studio Bridge for Video Creative Studio.
 
-Provides a unified JSON-lines IPC interface between Tauri / Frontend
-and the underlying AI Video Pipeline (LivePortrait + MuseTalk + TTS).
-Streams structured events without modifying the core pipeline code.
+Provides a JSON-lines IPC interface between Tauri / Frontend and the
+Echo Flash + MuseTalk production pipeline, plus the existing TTS providers.
 """
 
 from __future__ import annotations
@@ -18,6 +17,7 @@ import signal
 import subprocess
 import sys
 import time
+import wave
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 import urllib.request
@@ -108,42 +108,31 @@ def get_gpu_info() -> Dict[str, Any]:
 
 
 def preflight_check() -> Dict[str, Any]:
-    """Check availability of all engines, dependencies, and assets."""
+    """Report detected host tools and managed model assets without assumptions."""
     gpu = get_gpu_info()
     ffmpeg_ok = bool(shutil.which("ffmpeg"))
     ffprobe_ok = bool(shutil.which("ffprobe"))
     python_exe = detect_python_executable()
-    
-    lp_dir = ROOT_DIR / "LivePortrait"
-    lp_ok = (lp_dir / "inference.py").is_file()
-    
-    musetalk_dir = ROOT_DIR / "musetalk"
-    musetalk_ok = musetalk_dir.is_dir()
-    
-    muse_py = ROOT_DIR / "musetalk-venv" / "Scripts" / "python.exe"
-    musetalk_venv_ok = muse_py.is_file()
-    
     char_dir = ROOT_DIR / "assets" / "characters"
+    try:
+        from scripts.pipeline_model_manager import build_status
+
+        model_status = build_status()
+        model_components = model_status.get("components", {})
+    except Exception:
+        model_components = {}
+
     characters = []
-    if char_dir.is_dir():
-        for f in char_dir.rglob("*.png"):
-            characters.append({
-                "name": f.stem,
-                "path": str(f.resolve()),
-                "group": f.parent.name,
-            })
-            
-    driving_dir = ROOT_DIR / "assets" / "driving_templates"
-    drivings = []
-    if driving_dir.is_dir():
-        for f in driving_dir.glob("*.mp4"):
-            drivings.append({
-                "name": f.name,
-                "path": str(f.resolve()),
-                "size_mb": round(f.stat().st_size / (1024 * 1024), 2),
-            })
+    for name, relative_path, group in (
+        ("MC Nam", "nhanvatnam/ChatGPT Image Sep 8, 2026, 08_46_26 AM (1).png", "nam"),
+        ("MC Nữ", "nhanvatnu/ChatGPT Image Sep 14, 2026, 11_35_53 AM (1).png", "nữ"),
+    ):
+        path = char_dir / relative_path
+        if path.is_file():
+            characters.append({"name": name, "path": str(path.resolve()), "group": group})
 
     status = {
+        "available": True,
         "system": {
             "platform": sys.platform,
             "python": python_exe,
@@ -152,21 +141,16 @@ def preflight_check() -> Dict[str, Any]:
             "gpu": gpu,
         },
         "engines": {
-            "liveportrait": {
-                "installed": lp_ok,
-                "path": str(lp_dir),
-            },
+            "echo": model_components.get("echo", {"source": {"status": "unknown"}, "assets_ready": 0, "assets_total": 0}),
             "musetalk": {
-                "installed": musetalk_ok,
-                "venv_ready": musetalk_venv_ok,
-                "python": str(muse_py) if musetalk_venv_ok else None,
+                **model_components.get("musetalk", {"source": {"status": "unknown"}, "runtime": {"status": "unknown"}, "assets_ready": 0, "assets_total": 0}),
             },
         },
         "assets": {
             "character_count": len(characters),
             "characters": characters,
-            "driving_count": len(drivings),
-            "driving_templates": drivings,
+            "driving_count": 0,
+            "driving_templates": [],
         },
     }
     return status
@@ -514,269 +498,226 @@ def synthesize_voice(
         return dur, fallback_voice
 
 
-def run_pipeline_job(job_spec: Dict[str, Any]) -> int:
-    """Execute a single render job by delegating to test_option_b_avatar.py."""
-    job_id = job_spec.get("id", "job_direct")
-    emit_event("job_started", {"job_id": job_id, "spec": job_spec})
-    emit_progress("initializing", 2.0, "Khởi tạo môi trường và thông số render...")
+def _resolve_character_image(job_spec: Dict[str, Any]) -> Path:
+    character_root = (ROOT_DIR / "assets" / "characters").resolve()
+    source = job_spec.get("source")
+    if source:
+        image = Path(str(source)).expanduser()
+        if not image.is_absolute():
+            image = ROOT_DIR / image
+        image = image.resolve()
+        if not image.is_relative_to(character_root):
+            raise ValueError("Ảnh nguồn phải nằm trong assets/characters/ của ứng dụng.")
+    else:
+        identity = " ".join(str(job_spec.get(key, "")) for key in ("char", "gender", "name")).casefold()
+        if any(token in identity for token in ("female", "woman", "nữ")):
+            relative = Path("nhanvatnu") / "ChatGPT Image Sep 14, 2026, 11_35_53 AM (1).png"
+        elif any(token in identity for token in ("male", "man", "nam", "office")):
+            relative = Path("nhanvatnam") / "ChatGPT Image Sep 8, 2026, 08_46_26 AM (1).png"
+        else:
+            raise ValueError("Job chưa chọn ảnh nhân vật nam/nữ hợp lệ.")
+        image = character_root / relative
 
-    script_path = ROOT_DIR / "test_option_b_avatar.py"
-    if not script_path.is_file():
-        emit_event("error", {"message": f"Không tìm thấy {script_path}"})
+    if image.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"} or not image.is_file():
+        raise FileNotFoundError(f"Không tìm thấy ảnh nhân vật hợp lệ: {image}")
+    return image
+
+
+def _resolve_job_audio(job_spec: Dict[str, Any], job_id: str) -> Path:
+    audio_value = job_spec.get("audio")
+    if audio_value:
+        audio_path = Path(str(audio_value)).expanduser()
+        if not audio_path.is_absolute():
+            audio_path = ROOT_DIR / audio_path
+        audio_path = audio_path.resolve()
+        if not audio_path.is_file():
+            raise FileNotFoundError(f"Không tìm thấy file audio: {audio_path}")
+        return audio_path
+
+    script_text = str(job_spec.get("script") or "").strip()
+    if not script_text:
+        raise ValueError("Job cần có kịch bản hoặc file audio.")
+    audio_path = ROOT_DIR / "temp" / f"{job_id}_pipeline_speech.mp3"
+    audio_path.parent.mkdir(parents=True, exist_ok=True)
+    voice = str(job_spec.get("voice") or "vi-VN-NamMinhNeural")
+    emit_progress("audio_tts", 5.0, f"Đang tạo giọng đọc ({voice})...")
+    try:
+        duration, voice_used = synthesize_voice(
+            script_text, voice, audio_path, gender_hint=job_spec.get("gender"),
+        )
+    except Exception as error:
+        audio_path.unlink(missing_ok=True)
+        raise RuntimeError(f"Không tạo được giọng đọc; job dừng trước khi render: {error}") from error
+    emit_log(f"[TTS] Đã tạo audio bằng {voice_used}: {audio_path.name} ({duration:.2f}s).")
+    return audio_path
+
+
+def _preflight_audio(job_spec: Dict[str, Any], job_id: str) -> Tuple[Path, bool]:
+    if job_spec.get("audio"):
+        return _resolve_job_audio(job_spec, job_id), False
+    # The pipeline's dry-run needs a media stream to inspect. A short silent WAV
+    # is only a preflight fixture; it is never used by a production render.
+    audio_path = ROOT_DIR / "temp" / f"{job_id}_preflight_silence.wav"
+    audio_path.parent.mkdir(parents=True, exist_ok=True)
+    sample_rate = 16000
+    duration_seconds = 3.2
+    with wave.open(str(audio_path), "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(sample_rate)
+        audio.writeframes(b"\0\0" * int(sample_rate * duration_seconds))
+    return audio_path, True
+
+
+def _verified_output_from_log(output_root: Path, log_lines: list[str]) -> Optional[Path]:
+    for line in reversed(log_lines):
+        match = re.search(r"Verified 1080x1920 output:\s*(.*?)\s*\|", line)
+        if match:
+            candidate = Path(match.group(1).strip()).expanduser().resolve()
+            if candidate.is_file() and candidate.stat().st_size > 0:
+                return candidate
+    reports = sorted(
+        output_root.glob("job_*/vertical_ad_report.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for report_path in reports:
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            if report.get("status") != "complete":
+                continue
+            for video in report.get("videos", []):
+                value = (video.get("output") or {}).get("path")
+                if value:
+                    candidate = Path(value).expanduser().resolve()
+                    if candidate.is_file() and candidate.stat().st_size > 0:
+                        return candidate
+        except (OSError, ValueError, TypeError):
+            continue
+    return None
+
+
+def run_pipeline_job(job_spec: Dict[str, Any]) -> int:
+    """Run a real vertical Echo Flash + MuseTalk render or a preflight-only dry run."""
+    job_id = str(job_spec.get("id") or "job_direct")
+    emit_event("job_started", {"job_id": job_id, "spec": job_spec})
+    emit_progress("preflight", 2.0, "Kiểm tra ảnh, audio và model trước khi chạy core...")
+
+    pipeline_script = ROOT_DIR / "scripts" / "test_vertical_ads.py"
+    if not pipeline_script.is_file():
+        message = f"Không tìm thấy pipeline Echo Flash + MuseTalk: {pipeline_script}"
+        emit_event("job_failed", {"job_id": job_id, "error": message})
+        emit_log(message)
         return 1
 
-    python_exe = detect_python_executable()
+    try:
+        image_path = _resolve_character_image(job_spec)
+        if job_spec.get("dry_run"):
+            audio_path, remove_preflight_audio = _preflight_audio(job_spec, job_id)
+            action = "dry-run"
+        else:
+            audio_path = _resolve_job_audio(job_spec, job_id)
+            remove_preflight_audio = False
+            action = "run"
+    except Exception as error:
+        message = str(error)
+        emit_log(f"[Preflight] {message}")
+        emit_event("job_failed", {"job_id": job_id, "error": message})
+        return 1
 
-    gpu = get_gpu_info()
-    vram = gpu.get("total_vram_mb", 0)
-    is_low_vram = vram > 0 and vram < 6000 and not job_spec.get("force_gpu", False)
-
-    # If dry_run is requested or running on low VRAM dev machine without force_gpu,
-    # provide a smooth, fast simulation generating real Edge-TTS audio + preview MP4 without GPU VRAM thrashing
-    if job_spec.get("dry_run") or is_low_vram:
-        mode_reason = "Chế độ Test (Máy hiện tại)" if job_spec.get("dry_run") else f"Tự động bảo vệ GPU ({gpu.get('name', 'NVIDIA')} {vram}MB VRAM < 6000MB yêu cầu)"
-        emit_log(f"💡 [{mode_reason}] Kích hoạt chế độ Thử nghiệm An toàn (0% tải GPU, test giao diện & batch mượt mà).")
-
-        script_text = job_spec.get("script") or "Xin chào các bạn, đây là video thử nghiệm giao diện Video Creative Studio."
-        voice = job_spec.get("voice") or "vi-VN-NamMinhNeural"
-        out_video = Path(job_spec.get("output", f"output/{job_id}.mp4")).resolve()
-        out_video.parent.mkdir(parents=True, exist_ok=True)
-        temp_audio = ROOT_DIR / "temp" / f"{job_id}_preview.mp3"
-        temp_audio.parent.mkdir(parents=True, exist_ok=True)
-
-        # Stage 1: Audio Synthesis
-        emit_progress("audio_tts", 15.0, f"Đang tổng hợp giọng nói ({voice})...")
-        emit_log(f"[TTS Pipeline] Đang tạo âm thanh cho kịch bản ({len(script_text)} ký tự)...")
-        dur = 3.0
-        try:
-            dur, voice_used = synthesize_voice(script_text, voice, temp_audio, gender_hint=job_spec.get("gender"))
-            emit_log(f"[TTS Pipeline] ✅ Đã tạo âm thanh ({voice_used}): {temp_audio.name} (thời lượng: {dur:.1f}s)")
-        except Exception as e:
-            emit_log(f"[TTS Pipeline] Lỗi tạo âm thanh: {e}")
-
-        time.sleep(0.6)
-
-        # Stage 2: LivePortrait
-        emit_progress("liveportrait", 40.0, f"LivePortrait: Mô phỏng pose cử động đầu (multiplier={job_spec.get('multiplier', 0.55)}x)...")
-        emit_log(f"[LivePortrait] Chuẩn hóa pose gốc & áp dụng driving template (pitch/yaw/roll)...")
-        time.sleep(0.6)
-
-        # Stage 3: Torso Kinematics
-        emit_progress("torso_motion", 60.0, "TorsoKinematics: Mô phỏng nhịp thở và ổn định cơ thể...")
-        emit_log("[TorsoKinematics] Điều phối biên độ vai tự nhiên...")
-        time.sleep(0.5)
-
-        # Stage 4: MuseTalk
-        emit_progress("musetalk", 80.0, "MuseTalk 1.5: Khớp khẩu hình âm vị tiếng Việt...")
-        emit_log("[MuseTalk] Đồng bộ biên độ môi theo dải âm thanh...")
-        time.sleep(0.6)
-
-        # Stage 5: Verifying & Generating Video via ffmpeg
-        emit_progress("verifying", 92.0, "Đang tạo video xuất bản thử nghiệm...")
-
-        # Find character image
-        # Find character image
-        char_img = None
-        if job_spec.get("source"):
-            sp = Path(job_spec["source"]).resolve()
-            if sp.is_file():
-                char_img = sp
-        if not char_img:
-            char_candidates = [
-                ROOT_DIR / "assets" / "characters" / "nhanvatnam" / "asian_male_office_1080p.png",
-                ROOT_DIR / "assets" / "characters" / "angle_front.jpg",
-            ]
-            for c in char_candidates:
-                if c.is_file():
-                    char_img = c
-                    break
-        if not char_img:
-            any_imgs = list((ROOT_DIR / "assets" / "characters").rglob("*.png")) + list((ROOT_DIR / "assets" / "characters").rglob("*.jpg"))
-            if any_imgs:
-                char_img = any_imgs[0]
-
-        if char_img and shutil.which("ffmpeg"):
-            if temp_audio.is_file() and temp_audio.stat().st_size > 0:
-                ff_cmd = [
-                    "ffmpeg", "-y", "-loop", "1", "-i", str(char_img),
-                    "-i", str(temp_audio),
-                    "-c:v", "libx264", "-tune", "stillimage",
-                    "-c:a", "aac", "-b:a", "192k",
-                    "-pix_fmt", "yuv420p", "-shortest",
-                    str(out_video)
-                ]
-            else:
-                ff_cmd = [
-                    "ffmpeg", "-y", "-loop", "1", "-i", str(char_img),
-                    "-t", "3",
-                    "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                    str(out_video)
-                ]
-            subprocess.run(ff_cmd, capture_output=True, creationflags=CREATE_NO_WINDOW)
-            if out_video.is_file():
-                emit_log(f"[FFmpeg] Đã xuất video thử nghiệm: {out_video.name}")
-
-        emit_progress("completed", 100.0, "Video thử nghiệm đã hoàn tất!")
-        emit_event("job_completed", {
-            "job_id": job_id,
-            "output": str(out_video),
-            "status": "success",
-        })
-        return 0
-
+    profile = str(job_spec.get("profile") or "A10")
+    if profile not in {"F10", "A10", "A10HQ"}:
+        message = f"Profile render không hợp lệ: {profile}"
+        emit_event("job_failed", {"job_id": job_id, "error": message})
+        return 1
+    safe_job_id = re.sub(r"[^a-zA-Z0-9_-]+", "_", job_id)[:80] or "job"
+    output_root = ROOT_DIR / "output" / "studio_jobs" / safe_job_id
+    output_root.mkdir(parents=True, exist_ok=True)
     cmd = [
-        python_exe,
-        "-u",
-        str(script_path),
+        detect_python_executable(), "-u", str(pipeline_script), action,
+        "--profile", profile,
+        "--image", str(image_path),
+        "--audio", str(audio_path),
+        "--output-root", str(output_root),
+        "--batch-size", str(max(1, min(4, int(job_spec.get("batch_size") or 2)))),
     ]
-
-    # Map job parameters to CLI flags
-    if job_spec.get("source"):
-        cmd.extend(["--source", str(job_spec["source"])])
-    elif job_spec.get("char"):
-        cmd.extend(["--char", str(job_spec["char"])])
-
-    if job_spec.get("driving"):
-        cmd.extend(["--driving", str(job_spec["driving"])])
-
-    audio_path = job_spec.get("audio")
-    if not audio_path and job_spec.get("script"):
-        voice = job_spec.get("voice") or "vi-VN-NamMinhNeural"
-        temp_audio = ROOT_DIR / "temp" / f"{job_id}_pipeline_speech.mp3"
-        temp_audio.parent.mkdir(parents=True, exist_ok=True)
-        emit_progress("audio_tts", 10.0, f"Đang tổng hợp giọng nói ({voice})...")
-        emit_log(f"[TTS Pipeline] Đang tạo âm thanh cho kịch bản với giọng '{voice}'...")
+    duration = job_spec.get("duration")
+    if duration is not None:
         try:
-            dur, voice_used = synthesize_voice(
-                job_spec["script"],
-                voice,
-                temp_audio,
-                gender_hint=job_spec.get("gender")
-            )
-            emit_log(f"[TTS Pipeline] ✅ Đã tạo âm thanh ({voice_used}): {temp_audio.name} ({dur:.1f}s)")
-            audio_path = str(temp_audio)
-        except Exception as e:
-            emit_log(f"[TTS Pipeline] ⚠️ Lỗi tổng hợp giọng nói tùy chọn ({e}), tiếp tục dùng kịch bản trực tiếp.")
+            duration_value = float(duration)
+        except (TypeError, ValueError):
+            duration_value = 0
+        if duration_value > 0:
+            cmd.extend(["--duration", str(duration_value)])
 
-    if audio_path:
-        cmd.extend(["--audio", str(audio_path)])
-    elif job_spec.get("script"):
-        cmd.extend(["--script", str(job_spec["script"])])
-
-    if job_spec.get("output"):
-        cmd.extend(["--output", str(job_spec["output"])])
-
-    if job_spec.get("duration"):
-        cmd.extend(["--duration", str(job_spec["duration"])])
-
-    if job_spec.get("fps"):
-        cmd.extend(["--fps", str(job_spec["fps"])])
-
-    if job_spec.get("multiplier"):
-        cmd.extend(["--multiplier", str(job_spec["multiplier"])])
-
-    if job_spec.get("driving_policy"):
-        cmd.extend(["--driving-policy", str(job_spec["driving_policy"])])
-
-    if job_spec.get("motion_mode"):
-        cmd.extend(["--motion-mode", str(job_spec["motion_mode"])])
-
-    if job_spec.get("batch_size"):
-        cmd.extend(["--batch-size", str(job_spec["batch_size"])])
-
-    if job_spec.get("offset_ms"):
-        cmd.extend(["--offset-ms", str(job_spec["offset_ms"])])
-
-    if job_spec.get("dry_run"):
-        cmd.append("--dry-run")
-
-    emit_log(f"Thực thi lệnh: {' '.join(cmd)}")
-
-    # Start child process with pipe
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(ROOT_DIR),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        encoding="utf-8",
-        errors="replace",
-        creationflags=CREATE_NO_WINDOW,
-    )
-
-    current_stage = "preparing"
-    current_percent = 5.0
-    output_video_path = None
+    emit_log(f"Pipeline ({action}): {json.dumps(cmd, ensure_ascii=False)}")
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(ROOT_DIR),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except OSError as error:
+        if remove_preflight_audio:
+            audio_path.unlink(missing_ok=True)
+        emit_event("job_failed", {"job_id": job_id, "error": f"Không khởi chạy được pipeline: {error}"})
+        return 1
+    log_lines: list[str] = []
+    current_stage = "preflight"
+    current_percent = 4.0
 
     try:
-        for raw_line in proc.stdout:
-            line = raw_line.strip()
-            if not line:
-                continue
+        if proc.stdout is not None:
+            for raw_line in proc.stdout:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                log_lines.append(line)
+                emit_log(line)
 
-            emit_log(line)
-
-            # Stage & Progress Parsing
-            if "Đang tổng hợp giọng đọc" in line or "[Edge-TTS]" in line:
-                current_stage = "audio_tts"
-                current_percent = 10.0
-                emit_progress(current_stage, current_percent, "Đang tổng hợp giọng nói AI...")
-
-            elif "LivePortrait" in line or "Making motion templates" in line or "Euler Pose" in line:
-                current_stage = "liveportrait"
-                current_percent = 25.0
-                emit_progress(current_stage, current_percent, "LivePortrait: Đang tạo cử động đầu 3D...")
-
-            elif "TorsoKinematics" in line or "nhip tho" in line:
-                current_stage = "torso_motion"
-                current_percent = 45.0
-                emit_progress(current_stage, current_percent, "Đang áp dụng nhịp thở và chuyển động thân...")
-
-            elif "MuseTalk" in line or "lip-sync" in line:
-                current_stage = "musetalk"
-                current_percent = 55.0
-                emit_progress(current_stage, current_percent, "MuseTalk 1.5 FP16: Đang khớp khẩu hình âm vị...")
-
-            elif "batch" in line.lower() or "it/s" in line:
-                # Slight bump during inference loop
-                if current_stage == "musetalk" and current_percent < 85.0:
-                    current_percent += 1.5
+                lowered = line.casefold()
+                if "echo" in lowered and any(token in lowered for token in ("motion base", "generation", "denois", "wan")):
+                    current_stage, current_percent = "motion_base", min(45.0, max(current_percent, 15.0))
+                    emit_progress(current_stage, current_percent, line)
+                elif "musetalk" in lowered or "avatar preprocessing" in lowered or "inference" in lowered:
+                    current_stage, current_percent = "musetalk", min(80.0, max(current_percent, 50.0))
+                    emit_progress(current_stage, current_percent, line)
+                elif "verified 1080x1920 output" in lowered or "hd export" in lowered:
+                    current_stage, current_percent = "verifying", 92.0
+                    emit_progress(current_stage, current_percent, line)
+                elif current_stage == "musetalk" and ("render " in lowered or "it/s" in lowered):
+                    current_percent = min(84.0, current_percent + 1.0)
                     emit_progress(current_stage, current_percent, line)
 
-            elif "Xác minh" in line or "ffprobe" in line:
-                current_stage = "verifying"
-                current_percent = 92.0
-                emit_progress(current_stage, current_percent, "Đang kiểm tra chất lượng và thời lượng video...")
-
-            elif "Video đầu ra:" in line:
-                match = re.search(r"Video đầu ra:\s*(.*)", line)
-                if match:
-                    output_video_path = match.group(1).strip()
-                current_percent = 98.0
-                emit_progress("finalizing", current_percent, "Hoàn tất xử lý video.")
-
         proc.wait()
-        rc = proc.returncode
+        if proc.returncode != 0:
+            message = next((line for line in reversed(log_lines) if "failed" in line.casefold() or "error" in line.casefold()),
+                           f"Pipeline kết thúc với mã lỗi {proc.returncode}.")
+            emit_event("job_failed", {"job_id": job_id, "returncode": proc.returncode, "error": message})
+            return proc.returncode or 1
 
-        if rc == 0:
-            emit_progress("completed", 100.0, "Video đã được tạo thành công!")
-            emit_event("job_completed", {
-                "job_id": job_id,
-                "output": output_video_path or job_spec.get("output"),
-                "status": "success",
-            })
+        if action == "dry-run":
+            emit_progress("validated", 100.0, "Preflight đạt; chưa tạo video và chưa chạy inference.")
+            emit_event("job_validated", {"job_id": job_id, "status": "validated", "output": None})
             return 0
-        else:
-            emit_event("job_failed", {
-                "job_id": job_id,
-                "returncode": rc,
-                "error": f"Tiến trình kết thúc với mã lỗi {rc}",
-            })
-            return rc
 
+        output_video = _verified_output_from_log(output_root, log_lines)
+        if output_video is None:
+            message = "Pipeline trả mã 0 nhưng không tìm thấy video 1080x1920 đã được xác minh; job không được đánh dấu hoàn tất."
+            emit_event("job_failed", {"job_id": job_id, "error": message})
+            return 1
+
+        emit_progress("completed", 100.0, "Video 9:16 đã được pipeline xác minh.")
+        emit_event("job_completed", {"job_id": job_id, "output": str(output_video), "status": "success"})
+        return 0
     except KeyboardInterrupt:
-        emit_log("Nhận tín hiệu dừng từ người dùng. Đang đóng các tiến trình con...")
+        emit_log("Nhận tín hiệu dừng từ người dùng. Đang đóng tiến trình pipeline...")
         if proc.poll() is None:
             if sys.platform == "win32":
                 subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, creationflags=CREATE_NO_WINDOW)
@@ -784,6 +725,9 @@ def run_pipeline_job(job_spec: Dict[str, Any]) -> int:
                 proc.terminate()
         emit_event("job_cancelled", {"job_id": job_id})
         return 130
+    finally:
+        if remove_preflight_audio:
+            audio_path.unlink(missing_ok=True)
 
 
 def main():

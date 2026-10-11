@@ -1,30 +1,23 @@
 # 🎬 Video Creative Studio
 
-> **Automated Multi-Angle Video Generation Engine**  
-> High-retention short-form video production from raw scripts and multi-angle character assets.
+> Desktop studio for rendering vertical avatar videos with Echo Flash motion generation and MuseTalk lip synchronization.
+
+The current production flow is available in the Tauri desktop app: choose one of the two front-facing sample characters (or upload a custom image), enter a script to synthesize speech, then render a verified 1080×1920 video. Browser preview cannot inspect the host GPU or run inference. Use **Settings → Model render Echo Flash + MuseTalk** to inspect and manage the local model assets.
 
 ---
 
-## ⚡ Quick Architecture Overview
+## ⚡ Current Render Flow
 
 ```
-[Raw Script (ES/EN/VI)] 
+[Script]
+       │
+       ├──► TTS audio (when script is provided)
        │
        ▼
-[1. Script Director] ──► Decomposes into 3-6s scenes (Hook, Explain, Punchline, CTA)
-       │                  Assigns Multi-Camera Angles (Front, 45°, Close-up) & B-Roll
-       ▼
-[2. Multilingual TTS] ──► Synthesizes natural audio (Edge-TTS / Pro Studio Workers)
-       │                  Generates word-level timestamps for subtitles
-       ▼
-[3. Lip-Sync Engine] ──► Runs MuseTalk / LivePortrait / LatentSync with GFPGAN enhancement
+[Echo Flash] ──► Motion base from the chosen character image and speech audio
        │
        ▼
-[4. Video Composer]  ──► Integrates Dynamic Background Video + Bokeh Blur + Camera Punch-in
-                          Adds B-roll cutaway + BGM Ducking + Word-level Karaoke Subtitles
-       │
-       ▼
-[Final 1080x1920 MP4 Video]
+[MuseTalk] ──► Lip synchronization ──► Verified 1080×1920 MP4
 ```
 
 ---
@@ -42,7 +35,7 @@ video-creative-studio/
 │   ├── lipsync_engine.py           # MuseTalk & ProStudio-AI adapter
 │   └── video_composer.py           # FFmpeg multi-layer compositor & audio ducking
 ├── assets/
-│   ├── characters/                 # Character angle photos (angle_front, angle_45, closeup)
+│   ├── characters/                 # Two canonical front-facing samples; custom images are runtime assets
 │   ├── backgrounds/                # Video background loops (studio, office, tech room)
 │   ├── brolls/                     # B-roll footage for cutaways
 │   └── audio/                      # Background music (BGM) & Sound Effects (SFX)
@@ -56,6 +49,8 @@ video-creative-studio/
 ---
 
 ## 🚀 How to Run on Cloud (RunPod RTX A4500 / RTX 4000 Ada)
+
+> **Legacy instructions:** this RunPod batch workflow predates the current desktop Echo Flash → MuseTalk flow. It is kept as historical material and does not describe the Studio render button.
 
 ### 1. Upload & Setup (1-Click)
 1. Deploy your Pod on RunPod (**RTX A4500 $0.26/h** or **RTX 4000 Ada $0.28/h**).
